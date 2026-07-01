@@ -24,8 +24,8 @@ docker build -t sam3d-clad:latest .
 For GitHub Container Registry:
 
 ```bash
-docker tag sam3d-clad:latest ghcr.io/YOUR_USERNAME/sam3d-clad:latest
-docker push ghcr.io/YOUR_USERNAME/sam3d-clad:latest
+docker tag sam3d-clad:latest ghcr.io/captainomar02/sam3d-clad:latest
+docker push ghcr.io/captainomar02/sam3d-clad:latest
 ```
 
 This repo also includes a GitHub Actions workflow at
@@ -33,7 +33,7 @@ This repo also includes a GitHub Actions workflow at
 the workflow manually, it publishes:
 
 ```text
-ghcr.io/YOUR_USERNAME/sam3d-clad:latest
+ghcr.io/captainomar02/sam3d-clad:latest
 ```
 
 ## Vast.ai Template
@@ -41,7 +41,7 @@ ghcr.io/YOUR_USERNAME/sam3d-clad:latest
 Use this Docker image:
 
 ```text
-ghcr.io/YOUR_USERNAME/sam3d-clad:latest
+ghcr.io/captainomar02/sam3d-clad:latest
 ```
 
 Recommended launch mode while editing:
