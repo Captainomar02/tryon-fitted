@@ -40,11 +40,7 @@ COPY requirements-vast.txt ./requirements-vast.txt
 RUN python -m pip install --upgrade pip setuptools wheel \
     && python -m pip install numpy cython \
     && python -m pip install xtcocotools --no-build-isolation \
-    && python -m pip install -r requirements-vast.txt \
-    && python -m pip install \
-        "git+https://github.com/facebookresearch/detectron2.git@a1ce2f956a1d2212ad672e3c47d53405c2fe4312" \
-        --no-build-isolation \
-        --no-deps
+    && python -m pip install -r requirements-vast.txt
 
 COPY sam_3d_body ./sam_3d_body
 COPY tools ./tools
