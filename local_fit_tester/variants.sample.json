@@ -1,0 +1,58 @@
+{
+  "variants": {
+    "variant_s": {
+      "garment_family": "top",
+      "garment_subtype": "tshirt",
+      "size_label": "S",
+      "fit_intent": "regular",
+      "measurement_basis": "flat",
+      "unit": "cm",
+      "flat": {
+        "chest_width": 52,
+        "body_length": 68,
+        "waist_width": 50,
+        "hem_width": 51,
+        "shoulder_width": 44,
+        "sleeve_length": 22,
+        "neck_width": 18,
+        "bicep_width": 18
+      }
+    },
+    "variant_m": {
+      "garment_family": "top",
+      "garment_subtype": "tshirt",
+      "size_label": "M",
+      "fit_intent": "regular",
+      "measurement_basis": "flat",
+      "unit": "cm",
+      "flat": {
+        "chest_width": 55,
+        "body_length": 70,
+        "waist_width": 53,
+        "hem_width": 54,
+        "shoulder_width": 46,
+        "sleeve_length": 23,
+        "neck_width": 19,
+        "bicep_width": 19
+      }
+    },
+    "variant_l": {
+      "garment_family": "top",
+      "garment_subtype": "tshirt",
+      "size_label": "L",
+      "fit_intent": "regular",
+      "measurement_basis": "flat",
+      "unit": "cm",
+      "flat": {
+        "chest_width": 58,
+        "body_length": 72,
+        "waist_width": 56,
+        "hem_width": 57,
+        "shoulder_width": 48,
+        "sleeve_length": 24,
+        "neck_width": 20,
+        "bicep_width": 20
+      }
+    }
+  }
+}

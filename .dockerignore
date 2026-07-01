@@ -1,0 +1,46 @@
+.git
+.agents
+.codex
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.cache/
+.venv/
+venv/
+env/
+ENV/
+
+# Large/local artifacts should be downloaded or generated on Vast.ai.
+checkpoints/
+local_fit_tester/runs/
+input/
+output/
+outputs/
+results/
+logs/
+debug/
+sandbox/
+*.ckpt
+*.pt
+*.pth
+*.npy
+*.npz
+*.obj
+*.ply
+*.mp4
+*.tar
+*.tar.gz
+*.zip
+
+# Private user media and generated render files.
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+
+# Keep vendored CLAD test data and docs if they are text/json.
+!clad-body/**/*.json
+!clad-body/**/*.md
