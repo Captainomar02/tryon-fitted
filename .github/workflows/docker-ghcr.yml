@@ -49,7 +49,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/captainomar02/sam3d-clad
+          images: ghcr.io/captainomar02/tryon-fitted
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=

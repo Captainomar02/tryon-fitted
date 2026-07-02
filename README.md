@@ -1,4 +1,4 @@
-# sam3d-clad runtime layout
+# tryon-fitted runtime layout
 
 This checkout is intended to be self-contained after cloning onto a new rental instance.
 
@@ -26,7 +26,21 @@ scripts/vast/download_checkpoints.sh
 ```
 
 The checkpoint download requires Hugging Face access to `facebook/sam-3d-body-dinov3`.
-Set `HF_TOKEN` first if the model is gated for your account.
+Set `HF_TOKEN` in the instance environment first if the model is gated for your
+account. Do not commit tokens into this repo.
+
+On Vast.ai, the recommended on-start command is:
+
+```bash
+APP_DIR="${APP_DIR:-/workspace/tryon-fitted}"
+APP_REPO_URL="${APP_REPO_URL:-https://github.com/Captainomar02/tryon-fitted.git}"
+APP_REF="${APP_REF:-main}"
+if [[ ! -d "${APP_DIR}/.git" ]]; then
+  rm -rf "${APP_DIR}"
+  git clone --branch "${APP_REF}" "${APP_REPO_URL}" "${APP_DIR}"
+fi
+"${APP_DIR}/scripts/vast/onstart.sh"
+```
 
 ## Run fusion and measurements
 

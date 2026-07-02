@@ -5,7 +5,7 @@ contains CUDA, Python, PyTorch, system packages, and Python dependencies. It doe
 not contain this repository's source code, user images, generated outputs, or SAM
 checkpoints.
 
-On each rental, clone this repo into `/workspace/sam3d-clad`. That keeps the
+On each rental, clone this repo into `/workspace/tryon-fitted`. That keeps the
 current code, `input/`, `output/`, and `checkpoints/` together in one folder you
 can push, pull, or replace independently of the Docker image.
 
@@ -14,14 +14,14 @@ can push, pull, or replace independently of the Docker image.
 From this repo:
 
 ```bash
-docker build -t sam3d-clad:latest .
+docker build -t tryon-fitted:latest .
 ```
 
 For GitHub Container Registry:
 
 ```bash
-docker tag sam3d-clad:latest ghcr.io/captainomar02/sam3d-clad:latest
-docker push ghcr.io/captainomar02/sam3d-clad:latest
+docker tag tryon-fitted:latest ghcr.io/captainomar02/tryon-fitted:latest
+docker push ghcr.io/captainomar02/tryon-fitted:latest
 ```
 
 This repo also includes a GitHub Actions workflow at
@@ -29,7 +29,7 @@ This repo also includes a GitHub Actions workflow at
 the workflow manually, it publishes:
 
 ```text
-ghcr.io/captainomar02/sam3d-clad:latest
+ghcr.io/captainomar02/tryon-fitted:latest
 ```
 
 ## Vast.ai Template
@@ -37,7 +37,7 @@ ghcr.io/captainomar02/sam3d-clad:latest
 Use this Docker image:
 
 ```text
-ghcr.io/captainomar02/sam3d-clad:latest
+ghcr.io/captainomar02/tryon-fitted:latest
 ```
 
 Recommended launch mode while editing:
@@ -50,16 +50,17 @@ Add account-level or template environment variables:
 
 ```text
 HF_TOKEN=your_huggingface_token
-APP_DIR=/workspace/sam3d-clad
+APP_DIR=/workspace/tryon-fitted
 APP_REPO_URL=https://github.com/Captainomar02/tryon-fitted.git
 APP_REF=main
+SAM3D_PREFETCH_RUNTIME_MODELS=1
 ```
 
 Use this on-start command:
 
 ```bash
 set -euo pipefail
-APP_DIR="${APP_DIR:-/workspace/sam3d-clad}"
+APP_DIR="${APP_DIR:-/workspace/tryon-fitted}"
 APP_REPO_URL="${APP_REPO_URL:-https://github.com/Captainomar02/tryon-fitted.git}"
 APP_REF="${APP_REF:-main}"
 if [[ ! -d "${APP_DIR}/.git" ]]; then
@@ -68,6 +69,9 @@ if [[ ! -d "${APP_DIR}/.git" ]]; then
 fi
 "${APP_DIR}/scripts/vast/onstart.sh"
 ```
+
+Keep `HF_TOKEN` as a Vast.ai secret or template environment variable. Do not
+commit it to the repository or bake it into the Docker image.
 
 Your Hugging Face account must already have access to:
 
@@ -80,35 +84,37 @@ facebook/sam-3d-body-dinov3
 Upload two images:
 
 ```text
-/workspace/sam3d-clad/input/front.jpg
-/workspace/sam3d-clad/input/side.jpg
+/workspace/tryon-fitted/input/front.jpg
+/workspace/tryon-fitted/input/side.jpg
 ```
 
 Then run:
 
 ```bash
-cd /workspace/sam3d-clad
+cd /workspace/tryon-fitted
 scripts/vast/run_fusion_and_measure.sh 178
 ```
 
 Outputs:
 
 ```text
-/workspace/sam3d-clad/output/front_fused_all_body_params_scaled.json
-/workspace/sam3d-clad/output/body_measurements.json
-/workspace/sam3d-clad/output/body_measurements.png
-/workspace/sam3d-clad/output/front_raw.jpg
-/workspace/sam3d-clad/output/side_raw.jpg
+/workspace/tryon-fitted/output/front_fused_all_body_params_scaled.json
+/workspace/tryon-fitted/output/body_measurements.json
+/workspace/tryon-fitted/output/body_measurements.png
+/workspace/tryon-fitted/output/front_raw.jpg
+/workspace/tryon-fitted/output/side_raw.jpg
 ```
 
 ## Useful Overrides
 
 ```bash
 SAM3D_MODEL_REPO=facebook/sam-3d-body-vith
-SAM3D_CHECKPOINT_DIR=/workspace/sam3d-clad/checkpoints/sam-3d-body-dinov3
-SAM3D_CHECKPOINT_PATH=/workspace/sam3d-clad/checkpoints/sam-3d-body-dinov3/model.ckpt
-SAM3D_MHR_PATH=/workspace/sam3d-clad/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+SAM3D_CHECKPOINT_DIR=/workspace/tryon-fitted/checkpoints/sam-3d-body-dinov3
+SAM3D_CHECKPOINT_PATH=/workspace/tryon-fitted/checkpoints/sam-3d-body-dinov3/model.ckpt
+SAM3D_MHR_PATH=/workspace/tryon-fitted/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
 SAM3D_DETECTOR=rtdetr
 SAM3D_FOV=moge2
+SAM3D_PREFETCH_RUNTIME_MODELS=1
+SAM3D_PREFETCH_DINOV3=1
 MEASURE_PRESET=all
 ```

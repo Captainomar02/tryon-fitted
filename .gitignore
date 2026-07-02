@@ -6,3 +6,10 @@ __pycache__/
 .venv/
 venv/
 ports.log
+
+# Runtime data and generated artifacts. Keep the README files tracked.
+checkpoints/sam-3d-body-dinov3/
+input/*
+output/*
+!input/README.md
+!output/README.md

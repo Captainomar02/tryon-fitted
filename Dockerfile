@@ -5,7 +5,7 @@
 FROM vastai/pytorch:2.6.0-cuda-12.6.3-py312
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    APP_DIR=/workspace/sam3d-clad \
+    APP_DIR=/workspace/tryon-fitted \
     APP_REPO_URL=https://github.com/Captainomar02/tryon-fitted.git \
     HF_HOME=/workspace/.cache/huggingface \
     TORCH_HOME=/workspace/.cache/torch \
