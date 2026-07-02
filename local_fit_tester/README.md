@@ -15,6 +15,33 @@ At the end, it can print either:
 
 It can also generate the Clad render image and include its path in the JSON output.
 
+## Body Measurements Only
+
+Use `extract_body_measurements.py` when you only want the fused SAM-3D body params, CLAD body measurements, and CLAD render, without garment sizing.
+
+```bash
+python /home/mizore/sam-3d-body/local_fit_tester/extract_body_measurements.py \
+  --front /path/to/front.jpg \
+  --side /path/to/side.jpg \
+  --height-cm 178
+```
+
+It writes a timestamped run folder under `local_fit_tester/runs/` and prints:
+
+- `front_fused_all_body_params_scaled.json`
+- `body_measurements.json`
+- `clad_body_render.png`
+
+For only paths on stdout:
+
+```bash
+python /home/mizore/sam-3d-body/local_fit_tester/extract_body_measurements.py \
+  --front /path/to/front.jpg \
+  --side /path/to/side.jpg \
+  --height-cm 178 \
+  --output-format paths
+```
+
 ## Inputs
 
 - `--front`: front image path
