@@ -1,47 +1,55 @@
-# SAM 3D Body + CLAD Body on Vast.ai
+# sam3d-clad runtime layout
 
-This repository packages SAM 3D Body and CLAD Body in one Docker image for
-front/side body reconstruction and measurement extraction on Vast.ai.
+This checkout is intended to be self-contained after cloning onto a new rental instance.
 
-The Docker image contains:
+## Folders
 
-- SAM 3D Body code
-- CLAD Body measurement code vendored in `clad-body/`
-- Python/CUDA runtime dependencies
-- Vast.ai startup and pipeline scripts
+- `input/` - put the two source photos here.
+- `output/` - fusion renders, params, measurements, and generated previews are written here.
+- `checkpoints/sam-3d-body-dinov3/` - SAM 3D Body model files live here.
 
-Large model checkpoints are not committed. They are downloaded on the Vast.ai
-instance with `scripts/vast/download_checkpoints.sh`.
-
-## Vast.ai
-
-See [VAST_DOCKER.md](VAST_DOCKER.md) for build, push, template, and run
-instructions.
-
-Quick local build:
-
-```bash
-docker build -t sam3d-clad:latest .
-```
-
-Quick run on a Vast.ai instance after the image is started:
-
-```bash
-cd /workspace/sam3d-clad
-scripts/vast/run_fusion_and_measure.sh /workspace/input /workspace/output 178
-```
-
-Expected input files:
+The fusion script expects these input names:
 
 ```text
-/workspace/input/front.jpg
-/workspace/input/side.jpg
+input/front.png  or input/front.jpg  or input/front.jpeg  or input/front.webp
+input/side.png   or input/side.jpg   or input/side.jpeg   or input/side.webp
 ```
 
-Main outputs:
+## First run on a new instance
+
+From the repo root:
+
+```bash
+python -m pip install -r requirements-vast.txt
+python -m pip install -e "./clad-body[mhr,render]" --no-build-isolation --no-deps
+scripts/vast/download_checkpoints.sh
+```
+
+The checkpoint download requires Hugging Face access to `facebook/sam-3d-body-dinov3`.
+Set `HF_TOKEN` first if the model is gated for your account.
+
+## Run fusion and measurements
+
+```bash
+scripts/vast/run_fusion_and_measure.sh ./input ./output 178
+```
+
+Replace `178` with the subject height in centimeters.
+
+The main fused params file will be:
 
 ```text
-/workspace/output/front_fused_all_body_params_scaled.json
-/workspace/output/body_measurements.json
-/workspace/output/body_measurements.png
+output/front_fused_all_body_params_scaled.json
 ```
+
+The measurement helper writes:
+
+```text
+output/body_measurements.json
+output/body_measurements.png
+```
+
+## Keeping large files in the repo
+
+Checkpoints and images are large, so this repo includes `.gitattributes` rules for Git LFS.
+If you want the actual input images, output images, and checkpoints to come back when you clone on the next rental, commit them with Git LFS enabled.

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-/workspace/sam3d-clad}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+APP_DIR="${APP_DIR:-${REPO_DIR}}"
 SAM3D_MODEL_REPO="${SAM3D_MODEL_REPO:-facebook/sam-3d-body-dinov3}"
 SAM3D_CHECKPOINT_DIR="${SAM3D_CHECKPOINT_DIR:-${APP_DIR}/checkpoints/sam-3d-body-dinov3}"
 

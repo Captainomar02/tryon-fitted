@@ -11,10 +11,10 @@ fi
 
 cd "${APP_DIR}"
 
-mkdir -p /workspace/input /workspace/output
+mkdir -p "${APP_DIR}/input" "${APP_DIR}/output" "${APP_DIR}/checkpoints"
 python -m pip install -e "./clad-body[mhr,render]" --no-build-isolation --no-deps
 scripts/vast/download_checkpoints.sh
 
 echo "SAM 3D Body + CLAD Body container is ready."
-echo "Put front.* and side.* in /workspace/input, then run:"
-echo "  scripts/vast/run_fusion_and_measure.sh /workspace/input /workspace/output 178"
+echo "Put front.* and side.* in ${APP_DIR}/input, then run:"
+echo "  scripts/vast/run_fusion_and_measure.sh ${APP_DIR}/input ${APP_DIR}/output 178"

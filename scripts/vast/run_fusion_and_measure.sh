@@ -1,22 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-/workspace/sam3d-clad}"
-INPUT_DIR="${1:-${INPUT_DIR:-/workspace/input}}"
-OUTPUT_DIR="${2:-${OUTPUT_DIR:-/workspace/output}}"
-TARGET_HEIGHT_CM="${3:-${TARGET_HEIGHT_CM:-}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+APP_DIR="${APP_DIR:-${REPO_DIR}}"
+INPUT_DIR="${INPUT_DIR:-${APP_DIR}/input}"
+OUTPUT_DIR="${OUTPUT_DIR:-${APP_DIR}/output}"
+TARGET_HEIGHT_CM="${TARGET_HEIGHT_CM:-}"
 MEASURE_PRESET="${MEASURE_PRESET:-all}"
 
+case "$#" in
+  0)
+    ;;
+  1)
+    TARGET_HEIGHT_CM="$1"
+    ;;
+  3)
+    INPUT_DIR="$1"
+    OUTPUT_DIR="$2"
+    TARGET_HEIGHT_CM="$3"
+    ;;
+  *)
+    echo "Usage: scripts/vast/run_fusion_and_measure.sh [TARGET_HEIGHT_CM]"
+    echo "   or: scripts/vast/run_fusion_and_measure.sh INPUT_DIR OUTPUT_DIR TARGET_HEIGHT_CM"
+    echo "Example: scripts/vast/run_fusion_and_measure.sh 178"
+    echo "Example: scripts/vast/run_fusion_and_measure.sh ./input ./output 178"
+    exit 2
+    ;;
+esac
+
 if [[ -z "${TARGET_HEIGHT_CM}" ]]; then
-  echo "Usage: scripts/vast/run_fusion_and_measure.sh INPUT_DIR OUTPUT_DIR TARGET_HEIGHT_CM"
-  echo "Example: scripts/vast/run_fusion_and_measure.sh /workspace/input /workspace/output 178"
+  echo "Usage: scripts/vast/run_fusion_and_measure.sh [TARGET_HEIGHT_CM]"
+  echo "   or: scripts/vast/run_fusion_and_measure.sh INPUT_DIR OUTPUT_DIR TARGET_HEIGHT_CM"
+  echo "Example: scripts/vast/run_fusion_and_measure.sh 178"
+  echo "Default input/output: <repo>/input and <repo>/output"
   exit 2
 fi
 
 cd "${APP_DIR}"
-mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${INPUT_DIR}" "${OUTPUT_DIR}"
 
-CHECKPOINT_DIR="${SAM3D_CHECKPOINT_DIR:-./checkpoints/sam-3d-body-dinov3}"
+export SAM3D_CHECKPOINT_DIR="${SAM3D_CHECKPOINT_DIR:-${APP_DIR}/checkpoints/sam-3d-body-dinov3}"
+CHECKPOINT_DIR="${SAM3D_CHECKPOINT_DIR}"
 CHECKPOINT_PATH="${SAM3D_CHECKPOINT_PATH:-${CHECKPOINT_DIR}/model.ckpt}"
 MHR_PATH="${SAM3D_MHR_PATH:-${CHECKPOINT_DIR}/assets/mhr_model.pt}"
 

@@ -154,7 +154,10 @@ def clear_output_dir(output_dir):
     if not os.path.isdir(output_dir):
         return
 
+    keep_names = {".gitkeep", "README.md"}
     for name in os.listdir(output_dir):
+        if name in keep_names:
+            continue
         path = os.path.join(output_dir, name)
         if os.path.isfile(path) or os.path.islink(path):
             os.remove(path)
