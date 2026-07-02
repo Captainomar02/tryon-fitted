@@ -1,13 +1,12 @@
 # syntax=docker/dockerfile:1
 
-# Vast.ai supports any public Docker image. This base keeps CUDA, PyTorch,
-# Jupyter/SSH integration, and the /venv/main Python environment aligned with
-# Vast's recommended PyTorch templates.
+# Environment-only image for Vast.ai. The project source is cloned at rental
+# startup so code, inputs, outputs, and checkpoints all live in one repo folder.
 FROM vastai/pytorch:2.6.0-cuda-12.6.3-py312
 
 ENV DEBIAN_FRONTEND=noninteractive \
     APP_DIR=/workspace/sam3d-clad \
-    IMAGE_APP_DIR=/opt/workspace-internal/sam3d-clad \
+    APP_REPO_URL=https://github.com/Captainomar02/tryon-fitted.git \
     HF_HOME=/workspace/.cache/huggingface \
     TORCH_HOME=/workspace/.cache/torch \
     PYOPENGL_PLATFORM=egl \
@@ -16,7 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PATH="/venv/main/bin:${PATH}"
 
-WORKDIR ${IMAGE_APP_DIR}
+WORKDIR /workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -35,22 +34,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements-vast.txt ./requirements-vast.txt
+COPY requirements-vast.txt /tmp/requirements-vast.txt
 
 RUN python -m pip install --upgrade pip setuptools wheel \
     && python -m pip install numpy cython \
     && python -m pip install xtcocotools --no-build-isolation \
-    && python -m pip install -r requirements-vast.txt
-
-COPY sam_3d_body ./sam_3d_body
-COPY tools ./tools
-COPY local_fit_tester ./local_fit_tester
-COPY clad-body ./clad-body
-COPY scripts ./scripts
-COPY run_front_side_fusion.py ./run_front_side_fusion.py
-
-RUN python -m pip install -e "./clad-body[mhr,render]" --no-build-isolation \
-    && chmod +x scripts/vast/*.sh
+    && python -m pip install -r /tmp/requirements-vast.txt \
+    && rm /tmp/requirements-vast.txt
 
 RUN mkdir -p \
     /workspace/input \

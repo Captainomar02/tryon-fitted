@@ -2,11 +2,16 @@
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/workspace/sam3d-clad}"
-IMAGE_APP_DIR="${IMAGE_APP_DIR:-/opt/workspace-internal/sam3d-clad}"
+APP_REPO_URL="${APP_REPO_URL:-https://github.com/Captainomar02/tryon-fitted.git}"
+APP_REF="${APP_REF:-main}"
 
-if [[ ! -d "${APP_DIR}/sam_3d_body" ]]; then
-  mkdir -p "${APP_DIR}"
-  cp -a "${IMAGE_APP_DIR}/." "${APP_DIR}/"
+if [[ ! -d "${APP_DIR}/.git" ]]; then
+  rm -rf "${APP_DIR}"
+  git clone --branch "${APP_REF}" "${APP_REPO_URL}" "${APP_DIR}"
+else
+  git -C "${APP_DIR}" fetch origin "${APP_REF}"
+  git -C "${APP_DIR}" checkout "${APP_REF}"
+  git -C "${APP_DIR}" pull --ff-only origin "${APP_REF}"
 fi
 
 cd "${APP_DIR}"
