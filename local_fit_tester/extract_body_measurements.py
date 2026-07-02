@@ -45,6 +45,40 @@ def _image_destination(input_dir: Path, stem: str, src: Path) -> Path:
     return input_dir / f"{stem}{suffix}"
 
 
+def _resolve_input_image(path_arg: str) -> Path:
+    path = Path(path_arg).expanduser()
+
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+
+    path = path.resolve()
+    if path.exists():
+        return path
+
+    stale_roots = (Path("/opt/tryon-fitted"), Path("/workspace/sam3d-clad"))
+    for stale_root in stale_roots:
+        try:
+            rel_path = path.relative_to(stale_root)
+        except ValueError:
+            continue
+
+        repo_path = (REPO_ROOT / rel_path).resolve()
+        if repo_path.exists():
+            return repo_path
+
+        path = repo_path
+        break
+
+    if path.parent.exists():
+        supported_exts = (".jpg", ".jpeg", ".png", ".webp")
+        for ext in supported_exts:
+            candidate = path.with_suffix(ext)
+            if candidate.exists():
+                return candidate
+
+    return path
+
+
 def _resolve_conda_exe(conda_arg: str) -> Path | None:
     """Return a conda executable, or None when the current Python should be used."""
     if conda_arg.strip():
@@ -148,8 +182,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    front_path = Path(args.front).expanduser().resolve()
-    side_path = Path(args.side).expanduser().resolve()
+    front_path = _resolve_input_image(args.front)
+    side_path = _resolve_input_image(args.side)
     work_root = Path(args.work_dir).expanduser().resolve()
     conda_exe = _resolve_conda_exe(args.conda_exe)
 

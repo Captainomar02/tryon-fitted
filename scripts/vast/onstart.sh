@@ -20,6 +20,7 @@ cd "${APP_DIR}"
 mkdir -p "${APP_DIR}/input" "${APP_DIR}/output" "${APP_DIR}/checkpoints"
 python -m pip install -e "./clad-body[mhr,render]" --no-build-isolation --no-deps
 scripts/vast/download_checkpoints.sh
+scripts/vast/download_mhr_assets.sh
 
 if [[ "${SAM3D_PREFETCH_RUNTIME_MODELS}" == "1" ]]; then
   python scripts/vast/prefetch_runtime_models.py

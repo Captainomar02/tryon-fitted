@@ -2,6 +2,7 @@
 
 import os
 import warnings
+from pathlib import Path
 from typing import Optional
 
 import roma
@@ -18,7 +19,7 @@ from ..modules.mhr_utils import (
 
 from ..modules.transformer import FFN
 
-MOMENTUM_ENABLED = os.environ.get("MOMENTUM_ENABLED") is None
+MOMENTUM_ENABLED = os.environ.get("MOMENTUM_ENABLED") == "1"
 try:
     if MOMENTUM_ENABLED:
         from mhr.mhr import MHR
@@ -106,7 +107,13 @@ class MHRHead(nn.Module):
 
         # Load MHR itself
         if MOMENTUM_ENABLED:
+            repo_root = Path(__file__).resolve().parents[3]
+            default_mhr_assets_dir = repo_root / "checkpoints" / "mhr-assets" / "assets"
+            mhr_assets_dir = Path(
+                os.environ.get("MHR_ASSETS_DIR", str(default_mhr_assets_dir))
+            ).expanduser().resolve()
             self.mhr = MHR.from_files(
+                folder=mhr_assets_dir,
                 device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                 lod=1,
             )

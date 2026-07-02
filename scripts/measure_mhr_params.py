@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import trimesh
 
 from clad_body.load import load_mhr_from_params
 from clad_body.measure import measure
@@ -19,11 +20,25 @@ def to_jsonable(value: Any) -> Any:
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, trimesh.Trimesh):
+        return None
     if isinstance(value, dict):
-        return {str(k): to_jsonable(v) for k, v in value.items()}
+        result = {}
+        for key, item in value.items():
+            json_item = to_jsonable(item)
+            if json_item is not None:
+                result[str(key)] = json_item
+        return result
     if isinstance(value, (list, tuple)):
-        return [to_jsonable(v) for v in value]
-    return value
+        result = []
+        for item in value:
+            json_item = to_jsonable(item)
+            if json_item is not None:
+                result.append(json_item)
+        return result
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return None
 
 
 def main() -> None:

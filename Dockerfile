@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     ninja-build \
+    unzip \
     wget \
     && rm -rf /var/lib/apt/lists/*
 

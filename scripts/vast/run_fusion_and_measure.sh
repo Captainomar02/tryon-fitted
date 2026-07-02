@@ -50,6 +50,8 @@ if [[ ! -f "${CHECKPOINT_PATH}" || ! -f "${MHR_PATH}" ]]; then
   scripts/vast/download_checkpoints.sh
 fi
 
+scripts/vast/download_mhr_assets.sh
+
 python run_front_side_fusion.py \
   --target-height "${TARGET_HEIGHT_CM}" \
   --input-dir "${INPUT_DIR}" \

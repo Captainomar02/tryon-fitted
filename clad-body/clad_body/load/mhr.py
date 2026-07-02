@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -168,9 +169,14 @@ def load_mhr_from_params(
         if _torch_lib not in _ld:
             os.environ["LD_LIBRARY_PATH"] = f"{_torch_lib}:{_ld}" if _ld else _torch_lib
 
+    repo_root = Path(__file__).resolve().parents[3]
+    default_mhr_assets_dir = repo_root / "checkpoints" / "mhr-assets" / "assets"
+    mhr_assets_dir = Path(os.environ.get("MHR_ASSETS_DIR", str(default_mhr_assets_dir))).expanduser().resolve()
+
     # Subprocess script — pymomentum.geometry MUST import before torch
     script = f"""\
 import sys, os
+from pathlib import Path
 import pymomentum.geometry  # noqa: F401 — MUST come before torch
 import pymomentum.skel_state as pym_skel_state
 import json, torch, numpy as np
@@ -181,7 +187,8 @@ with open({params_json!r}) as f:
 
 shape_t = torch.tensor(params["shape_params"], dtype=torch.float32).unsqueeze(0)
 
-model = MHR.from_files(device="cpu", wants_pose_correctives=False)
+asset_dir = Path({str(mhr_assets_dir)!r})
+model = MHR.from_files(folder=asset_dir, device="cpu", wants_pose_correctives=False)
 
 # Rest pose: zero translation/rotation/pose, keep scale from model output.
 # Layout: [trans(3)|rot(3)|pose(130)|scale(68)] = 204

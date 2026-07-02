@@ -1,5 +1,10 @@
 # SAM 3D Body runtime dependencies for the Vast.ai Docker image.
 # The base image supplies CUDA-enabled torch/torchvision.
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+pymomentum-cpu==0.1.108.post0
+mhr==1.0.1
 pytorch-lightning
 pyrender
 opencv-python-headless

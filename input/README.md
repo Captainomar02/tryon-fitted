@@ -3,8 +3,8 @@
 Place the source images here before running fusion:
 
 ```text
-front.jpg
-side.jpg
+front.jpeg
+side.jpeg
 ```
 
 Supported extensions are `.png`, `.jpg`, `.jpeg`, and `.webp`.

@@ -20,9 +20,9 @@ It can also generate the Clad render image and include its path in the JSON outp
 Use `extract_body_measurements.py` when you only want the fused SAM-3D body params, CLAD body measurements, and CLAD render, without garment sizing.
 
 ```bash
-python /home/mizore/sam-3d-body/local_fit_tester/extract_body_measurements.py \
-  --front /path/to/front.jpg \
-  --side /path/to/side.jpg \
+python /workspace/tryon-fitted/local_fit_tester/extract_body_measurements.py \
+  --front /workspace/tryon-fitted/input/front.jpeg \
+  --side /workspace/tryon-fitted/input/side.jpeg \
   --height-cm 178
 ```
 
@@ -35,9 +35,9 @@ It writes a timestamped run folder under `local_fit_tester/runs/` and prints:
 For only paths on stdout:
 
 ```bash
-python /home/mizore/sam-3d-body/local_fit_tester/extract_body_measurements.py \
-  --front /path/to/front.jpg \
-  --side /path/to/side.jpg \
+python /workspace/tryon-fitted/local_fit_tester/extract_body_measurements.py \
+  --front /workspace/tryon-fitted/input/front.jpeg \
+  --side /workspace/tryon-fitted/input/side.jpeg \
   --height-cm 178 \
   --output-format paths
 ```
@@ -54,11 +54,11 @@ The variants JSON can use the same structure as the app's fit pipeline. A sample
 ## Run
 
 ```bash
-python /home/mizore/sam-3d-body/local_fit_tester/recommend_size.py \
-  --front /path/to/front.jpg \
-  --side /path/to/side.jpg \
+python /workspace/tryon-fitted/local_fit_tester/recommend_size.py \
+  --front /workspace/tryon-fitted/input/front.jpeg \
+  --side /workspace/tryon-fitted/input/side.jpeg \
   --height-cm 178 \
-  --variants-json /home/mizore/sam-3d-body/local_fit_tester/variants.sample.json \
+  --variants-json /workspace/tryon-fitted/local_fit_tester/variants.sample.json \
   --render
 ```
 
@@ -72,18 +72,18 @@ Default output is JSON:
     "chest_circumference": 97.5
   },
   "recommended_size": "M",
-  "render_path": "/home/mizore/sam-3d-body/local_fit_tester/runs/fit_20260606_184200/clad_render.png"
+  "render_path": "/workspace/tryon-fitted/local_fit_tester/runs/fit_20260606_184200/clad_render.png"
 }
 ```
 
 If you want only the final size label:
 
 ```bash
-python /home/mizore/sam-3d-body/local_fit_tester/recommend_size.py \
-  --front /path/to/front.jpg \
-  --side /path/to/side.jpg \
+python /workspace/tryon-fitted/local_fit_tester/recommend_size.py \
+  --front /workspace/tryon-fitted/input/front.jpeg \
+  --side /workspace/tryon-fitted/input/side.jpeg \
   --height-cm 178 \
-  --variants-json /home/mizore/sam-3d-body/local_fit_tester/variants.sample.json \
+  --variants-json /workspace/tryon-fitted/local_fit_tester/variants.sample.json \
   --output-format size
 ```
 
