@@ -2,8 +2,9 @@
 
 This repository builds an environment-only Docker image for Vast.ai. The image
 contains CUDA, Python, PyTorch, system packages, and Python dependencies. It does
-not contain this repository's source code, user images, generated outputs, or SAM
-checkpoints.
+not contain this repository's source code, user images, generated outputs, SAM
+3D checkpoints, or the SAM2 checkpoint. The on-start script downloads/clones those
+runtime assets into the repo folder.
 
 On each rental, clone this repo into `/workspace/tryon-fitted`. That keeps the
 current code, `input/`, `output/`, and `checkpoints/` together in one folder you
@@ -54,6 +55,10 @@ APP_DIR=/workspace/tryon-fitted
 APP_REPO_URL=https://github.com/Captainomar02/tryon-fitted.git
 APP_REF=main
 SAM3D_PREFETCH_RUNTIME_MODELS=1
+SAM3D_SEGMENTOR=sam2
+SAM3D_SEGMENTOR_PATH=/workspace/tryon-fitted/external/sam2
+FUSION_SIDE_SDF_CHEST_MODE=apex_lobe
+FUSION_SIDE_SDF_CHEST_LOBE_GAIN=2.4
 ```
 
 Use this on-start command:
@@ -103,6 +108,9 @@ Outputs:
 /workspace/tryon-fitted/output/body_measurements.png
 /workspace/tryon-fitted/output/front_raw.jpg
 /workspace/tryon-fitted/output/side_raw.jpg
+/workspace/tryon-fitted/output/side_mask.png
+/workspace/tryon-fitted/output/side_sdf_profile_edited.jpg
+/workspace/tryon-fitted/output/side_sdf_profile_edited.obj
 ```
 
 ## Useful Overrides
@@ -116,5 +124,29 @@ SAM3D_DETECTOR=rtdetr
 SAM3D_FOV=moge2
 SAM3D_PREFETCH_RUNTIME_MODELS=1
 SAM3D_PREFETCH_DINOV3=1
+SAM3D_SEGMENTOR=sam2
+SAM3D_SEGMENTOR_PATH=/workspace/tryon-fitted/external/sam2
+SAM2_DIR=/workspace/tryon-fitted/external/sam2
+SAM2_REF=main
+SAM2_BUILD_CUDA=0
+FUSION_SIDE_SDF_CHEST_MODE=apex_lobe
+FUSION_SIDE_SDF_CHEST_LOBE_GAIN=2.4
+FUSION_SIDE_SDF_PROFILE_STRENGTH=0.65
+FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM=7.0
 MEASURE_PRESET=all
+```
+
+## SAM2 Segmentation
+
+The Vast startup script runs `scripts/vast/setup_sam2.sh`. That script clones
+`facebookresearch/sam2` into `external/sam2`, downloads
+`sam2.1_hiera_large.pt`, and installs SAM2 editable into the active Python
+environment. `scripts/vast/run_fusion_and_measure.sh` exports SAM2 as the
+default segmentor before calling `run_front_side_fusion.py`.
+
+If you need to refresh SAM2 manually:
+
+```bash
+cd /workspace/tryon-fitted
+scripts/vast/setup_sam2.sh
 ```

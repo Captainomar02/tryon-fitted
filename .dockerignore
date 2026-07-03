@@ -14,6 +14,7 @@ ENV/
 
 # Large/local artifacts should be downloaded or generated on Vast.ai.
 checkpoints/
+external/
 local_fit_tester/runs/
 input/
 output/

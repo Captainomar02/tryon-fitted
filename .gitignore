@@ -13,3 +13,7 @@ input/*
 output/*
 !input/README.md
 !output/README.md
+# Runtime downloads created by Vast/local setup.
+external/
+checkpoints/mhr-assets/
+local_fit_tester/runs/

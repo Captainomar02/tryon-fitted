@@ -50,3 +50,5 @@ accelerate
 hatchling
 editables
 git+https://github.com/microsoft/MoGe.git
+iopath
+tqdm

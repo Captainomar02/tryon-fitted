@@ -31,9 +31,21 @@ pip install 'git+https://github.com/facebookresearch/detectron2.git@a1ce2f9' --n
 pip install git+https://github.com/microsoft/MoGe.git
 ```
 
-### 6. Install SAM3 (Optional)
+### 6. Install SAM2 for mask-guided fusion
+
+The front/side fusion script uses SAM2 masks by default. From the repo root:
+
 ```bash
-# this is a minimal installation of sam3 only to support its inference 
+scripts/vast/setup_sam2.sh
+```
+
+This clones SAM2 into `external/sam2`, downloads `sam2.1_hiera_large.pt`, and
+installs SAM2 editable. To point at a different checkout, set
+`SAM3D_SEGMENTOR_PATH` or pass `--segmentor-path`.
+
+### 7. Install SAM3 (Optional)
+```bash
+# this is a minimal installation of sam3 only to support its inference
 git clone https://github.com/facebookresearch/sam3.git
 cd sam3
 pip install -e .

@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+import os
 import torch
+from contextlib import nullcontext
 import numpy as np
 from PIL import Image
 
@@ -21,15 +23,33 @@ class HumanSegmentor:
             raise NotImplementedError
     
     def run_sam(self, img, boxes, **kwargs):
-        return self.sam_func(self.sam, img, boxes)
+        return self.sam_func(self.sam, img, boxes, device=self.device)
         
 
 def load_sam2(device, path):
-    checkpoint = f"{path}/checkpoints/sam2.1_hiera_large.pt"
+    if not path:
+        raise FileNotFoundError(
+            "SAM2 segmentor path is empty. Set SAM3D_SEGMENTOR_PATH or pass "
+            "--segmentor-path, usually external/sam2."
+        )
+
+    checkpoint = os.path.join(path, "checkpoints", "sam2.1_hiera_large.pt")
     model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"SAM2 repo not found at {path}. Run scripts/vast/setup_sam2.sh "
+            "or set SAM3D_SEGMENTOR_PATH to an existing SAM2 checkout."
+        )
+    if not os.path.isfile(checkpoint):
+        raise FileNotFoundError(
+            f"SAM2 checkpoint not found at {checkpoint}. Run scripts/vast/setup_sam2.sh "
+            "or set SAM2_CHECKPOINT_PATH/SAM3D_SEGMENTOR_PATH correctly."
+        )
+
     import sys
-    sys.path.append(path)
+    if path not in sys.path:
+        sys.path.append(path)
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -48,8 +68,14 @@ def load_sam3(device, path):
     return predictor
 
 
-def run_sam2(sam_predictor, img, boxes):
-    with torch.autocast("cuda", dtype=torch.bfloat16):
+def run_sam2(sam_predictor, img, boxes, device="cuda"):
+    device_type = torch.device(device).type
+    autocast_ctx = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if device_type == "cuda" and torch.cuda.is_available()
+        else nullcontext()
+    )
+    with autocast_ctx:
         sam_predictor.set_image(img)
         all_masks, all_scores = [], []
         for i in range(boxes.shape[0]):
@@ -77,7 +103,7 @@ def run_sam2(sam_predictor, img, boxes):
     return all_masks, all_scores
 
 
-def run_sam3(sam_predictor, img, boxes):
+def run_sam3(sam_predictor, img, boxes, device="cuda"):
     # switch bgr to rgb 
     img = img[:, :, ::-1].copy()
     img = Image.fromarray(img.astype('uint8'), 'RGB')

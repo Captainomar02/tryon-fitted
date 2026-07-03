@@ -4,6 +4,7 @@ import os
 import re
 import argparse
 import shutil
+import sys
 
 import cv2
 import numpy as np
@@ -311,6 +312,581 @@ def fuse_front_xy_with_side_z(front_vertices, side_vertices_aligned):
     return fused
 
 
+def _smooth_band_weight(height_pct, center, half_width):
+    distance = np.abs(height_pct - float(center))
+    weight = np.clip(1.0 - (distance / float(half_width)), 0.0, 1.0)
+    return weight * weight * (3.0 - 2.0 * weight)
+
+
+def _band_extent(vertices, height_pct, low_pct, high_pct):
+    mask = (height_pct >= low_pct) & (height_pct <= high_pct)
+    band = vertices[mask]
+    if band.shape[0] < 10:
+        return 0.0, 0.0
+    x_extent = float(band[:, 0].max() - band[:, 0].min())
+    z_extent = float(band[:, 2].max() - band[:, 2].min())
+    return x_extent, z_extent
+
+
+def enhance_profile_depth_from_front_width(vertices, strength=0.35, max_scale=1.22):
+    """
+    Conservative depth correction for cases where the MHR prior flattens very
+    curvy profiles. It uses front-view lateral width as a sanity bound for the
+    side-derived depth, then smoothly expands depth in bust and hip/glute bands.
+    """
+    if strength <= 0.0:
+        return vertices.astype(np.float32), {
+            "enabled": np.array(False),
+            "strength": np.array(float(strength), dtype=np.float64),
+            "bust_scale": np.array(1.0, dtype=np.float64),
+            "hip_scale": np.array(1.0, dtype=np.float64),
+        }
+
+    v = vertices.astype(np.float64).copy()
+    y_min = float(v[:, 1].min())
+    height = float(v[:, 1].max() - y_min)
+    if height <= 1e-8:
+        return vertices.astype(np.float32), {
+            "enabled": np.array(False),
+            "strength": np.array(float(strength), dtype=np.float64),
+            "bust_scale": np.array(1.0, dtype=np.float64),
+            "hip_scale": np.array(1.0, dtype=np.float64),
+        }
+
+    pct = (v[:, 1] - y_min) / height
+    corrections = [
+        {
+            "name": "bust",
+            "low": 0.66,
+            "high": 0.79,
+            "center": 0.725,
+            "half_width": 0.075,
+            "min_depth_to_width": 0.72,
+        },
+        {
+            "name": "hip",
+            "low": 0.42,
+            "high": 0.58,
+            "center": 0.50,
+            "half_width": 0.09,
+            "min_depth_to_width": 0.70,
+        },
+    ]
+
+    scale_by_name = {}
+    total_weight = np.zeros(v.shape[0], dtype=np.float64)
+    for correction in corrections:
+        x_extent, z_extent = _band_extent(v, pct, correction["low"], correction["high"])
+        if z_extent <= 1e-8 or x_extent <= 1e-8:
+            band_scale = 1.0
+        else:
+            target_depth = x_extent * correction["min_depth_to_width"]
+            raw_scale = target_depth / z_extent
+            band_scale = 1.0 + float(strength) * max(0.0, raw_scale - 1.0)
+            band_scale = float(np.clip(band_scale, 1.0, max_scale))
+
+        scale_by_name[correction["name"]] = band_scale
+        total_weight += _smooth_band_weight(
+            pct,
+            correction["center"],
+            correction["half_width"],
+        ) * (band_scale - 1.0)
+
+    if np.max(total_weight) > 0.0:
+        # Scale depth around each horizontal slice center so global alignment is
+        # preserved while local torso thickness can increase.
+        unique_bins = np.floor(pct * 200).astype(np.int32)
+        z_center = np.zeros(v.shape[0], dtype=np.float64)
+        for bin_id in np.unique(unique_bins):
+            bin_mask = unique_bins == bin_id
+            z_center[bin_mask] = np.median(v[bin_mask, 2])
+        v[:, 2] = z_center + (v[:, 2] - z_center) * (1.0 + total_weight)
+
+    return v.astype(np.float32), {
+        "enabled": np.array(True),
+        "strength": np.array(float(strength), dtype=np.float64),
+        "max_scale": np.array(float(max_scale), dtype=np.float64),
+        "bust_scale": np.array(float(scale_by_name.get("bust", 1.0)), dtype=np.float64),
+        "hip_scale": np.array(float(scale_by_name.get("hip", 1.0)), dtype=np.float64),
+    }
+
+
+def sam_upright_vertices_to_clad_canonical(vertices):
+    """
+    Convert fusion-space vertices (X lateral, Y up, Z profile depth) to the
+    CLAD/MHR convention (X lateral, Z up, +Y front/back profile axis).
+    """
+    src = vertices.astype(np.float64)
+    dst = np.zeros_like(src, dtype=np.float64)
+    dst[:, 0] = src[:, 0]
+    dst[:, 1] = -src[:, 2]
+    dst[:, 2] = src[:, 1]
+    dst[:, 2] -= dst[:, 2].min()
+    center_xy = (dst[:, :2].max(axis=0) + dst[:, :2].min(axis=0)) * 0.5
+    dst[:, 0] -= center_xy[0]
+    dst[:, 1] -= center_xy[1]
+    return dst.astype(np.float32)
+
+
+def load_binary_mask(mask_path, expected_shape=None):
+    if not mask_path:
+        return None
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise FileNotFoundError(f"Could not read mask: {mask_path}")
+    if expected_shape is not None and mask.shape[:2] != tuple(expected_shape[:2]):
+        mask = cv2.resize(
+            mask,
+            (int(expected_shape[1]), int(expected_shape[0])),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return mask > 127
+
+
+def result_mask_to_binary(result, expected_shape=None):
+    mask = result.get("mask") if isinstance(result, dict) else None
+    if mask is None:
+        return None
+    mask = _to_numpy(mask)
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    mask = mask.astype(np.float32)
+    if expected_shape is not None and mask.shape[:2] != tuple(expected_shape[:2]):
+        mask = cv2.resize(
+            mask,
+            (int(expected_shape[1]), int(expected_shape[0])),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    return mask > 0.5
+
+
+def mask_to_sdf(mask):
+    mask_u8 = (mask.astype(np.uint8) * 255)
+    inside = cv2.distanceTransform(mask_u8, cv2.DIST_L2, 5)
+    outside = cv2.distanceTransform(255 - mask_u8, cv2.DIST_L2, 5)
+    return outside.astype(np.float32) - inside.astype(np.float32)
+
+
+def sample_image_bilinear(image, xy):
+    h, w = image.shape[:2]
+    x = np.clip(xy[:, 0].astype(np.float64), 0.0, w - 1.0)
+    y = np.clip(xy[:, 1].astype(np.float64), 0.0, h - 1.0)
+    x0 = np.floor(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    x1 = np.clip(x0 + 1, 0, w - 1)
+    y1 = np.clip(y0 + 1, 0, h - 1)
+    wx = x - x0
+    wy = y - y0
+    top = image[y0, x0] * (1.0 - wx) + image[y0, x1] * wx
+    bottom = image[y1, x0] * (1.0 - wx) + image[y1, x1] * wx
+    return top * (1.0 - wy) + bottom * wy
+
+
+def save_mask_and_sdf(mask, output_dir, stem):
+    if mask is None:
+        return None, None, None
+    mask_u8 = (mask.astype(np.uint8) * 255)
+    mask_path = os.path.join(output_dir, f"{stem}_mask.png")
+    cv2.imwrite(mask_path, mask_u8)
+
+    sdf = mask_to_sdf(mask)
+    sdf_path = os.path.join(output_dir, f"{stem}_sdf.npy")
+    np.save(sdf_path, sdf)
+
+    sdf_vis = np.clip((sdf / 32.0) * 127.0 + 128.0, 0, 255).astype(np.uint8)
+    sdf_vis_path = os.path.join(output_dir, f"{stem}_sdf.png")
+    cv2.imwrite(sdf_vis_path, sdf_vis)
+    return mask_path, sdf_path, sdf_vis_path
+
+
+def project_vertices_to_image(vertices, cam_t, focal_length, image_shape):
+    v = vertices.astype(np.float64)
+    cam_t = np.asarray(cam_t, dtype=np.float64).reshape(3)
+    pts = v + cam_t[None, :]
+    z = pts[:, 2].copy()
+    z_safe = np.where(np.abs(z) < 1e-6, np.sign(z) * 1e-6 + (z == 0) * 1e-6, z)
+    h, w = image_shape[:2]
+    u = float(focal_length) * (pts[:, 0] / z_safe) + (w / 2.0)
+    vv = float(focal_length) * (pts[:, 1] / z_safe) + (h / 2.0)
+    return np.column_stack([u, vv]), z
+
+
+def row_bounds_from_mask(mask, row_radius=4):
+    h, _ = mask.shape[:2]
+    left = np.full(h, np.nan, dtype=np.float64)
+    right = np.full(h, np.nan, dtype=np.float64)
+    for y in range(h):
+        y0 = max(0, y - row_radius)
+        y1 = min(h, y + row_radius + 1)
+        xs = np.nonzero(mask[y0:y1].any(axis=0))[0]
+        if xs.size > 0:
+            left[y] = float(xs.min())
+            right[y] = float(xs.max())
+    return left, right
+
+
+def load_measurement_anchor_pcts(anchor_json_path):
+    anchors = {}
+    if not anchor_json_path:
+        return anchors
+    try:
+        with open(anchor_json_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[fusion] Warning: could not read measurement anchors {anchor_json_path}: {e}")
+        return anchors
+    for src_key, dst_key in (("_bust_pct", "chest"), ("_hip_pct", "butt")):
+        try:
+            value = float(data[src_key]) / 100.0
+        except Exception:
+            continue
+        if 0.0 < value < 1.0:
+            anchors[dst_key] = value
+    return anchors
+
+
+def bounded_anchor_pct(anchor_pcts, key, default, low, high):
+    try:
+        value = float((anchor_pcts or {}).get(key, default))
+    except Exception:
+        return float(default), True
+    if low <= value <= high:
+        return value, False
+    return float(default), True
+
+
+def direct_anchor_pct(anchor_pcts, key, default):
+    try:
+        value = float((anchor_pcts or {}).get(key, default))
+    except Exception:
+        return float(default), True
+    if 0.0 < value < 1.0:
+        return value, key not in (anchor_pcts or {})
+    return float(default), True
+
+
+def infer_side_anterior_sign(side_result, image_shape):
+    """Return -1 if the person faces image-left, +1 if image-right."""
+    keypoints = side_result.get("pred_keypoints_2d") if isinstance(side_result, dict) else None
+    if keypoints is not None:
+        try:
+            kps = _to_numpy(keypoints).astype(np.float64)
+            if kps.ndim == 2 and kps.shape[0] >= 70 and kps.shape[1] >= 2:
+                nose_x = float(kps[0, 0])
+                torso_ids = [5, 6, 9, 10, 69]
+                torso_xs = [float(kps[i, 0]) for i in torso_ids if np.isfinite(kps[i, 0])]
+                if torso_xs and np.isfinite(nose_x):
+                    torso_x = float(np.median(torso_xs))
+                    if abs(nose_x - torso_x) > max(3.0, image_shape[1] * 0.01):
+                        return -1 if nose_x < torso_x else 1, "nose_vs_torso_keypoints"
+        except Exception:
+            pass
+    return -1, "default_facing_left"
+
+
+def smooth_rows(values, valid, sigma_px):
+    values = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool)
+    if values.size == 0:
+        return values
+    if sigma_px <= 0:
+        return np.where(valid, values, 0.0)
+    k = int(max(3, round(float(sigma_px) * 6.0)))
+    if k % 2 == 0:
+        k += 1
+    weights = valid.astype(np.float64)
+    weighted = np.where(valid, values, 0.0).reshape(-1, 1)
+    weights_2d = weights.reshape(-1, 1)
+    smooth_num = cv2.GaussianBlur(weighted, (1, k), float(sigma_px), borderType=cv2.BORDER_REPLICATE).reshape(-1)
+    smooth_den = cv2.GaussianBlur(weights_2d, (1, k), float(sigma_px), borderType=cv2.BORDER_REPLICATE).reshape(-1)
+    out = np.zeros_like(values, dtype=np.float64)
+    good = smooth_den > 1e-6
+    out[good] = smooth_num[good] / smooth_den[good]
+    return out
+
+
+def compute_torso_core_mask(vertices, side_result):
+    """Approximate torso/core vertices using 3D shoulder/hip left-right axis."""
+    default = np.ones(vertices.shape[0], dtype=bool)
+    keypoints = side_result.get("pred_keypoints_3d") if isinstance(side_result, dict) else None
+    if keypoints is None:
+        return default, {
+            "enabled": np.array(False),
+            "reason": np.array("missing_keypoints_3d", dtype=object),
+            "threshold_m": np.array(0.0, dtype=np.float64),
+        }
+    try:
+        kps = _to_numpy(keypoints).astype(np.float64)
+        if kps.ndim != 2 or kps.shape[0] < 11 or kps.shape[1] < 3:
+            raise ValueError("bad keypoint shape")
+        left_shoulder, right_shoulder = kps[5], kps[6]
+        left_hip, right_hip = kps[9], kps[10]
+        pairs = []
+        for a, b in ((left_shoulder, right_shoulder), (left_hip, right_hip)):
+            axis = a - b
+            norm = float(np.linalg.norm(axis))
+            if norm > 1e-5:
+                pairs.append((axis / norm, norm))
+        if not pairs:
+            raise ValueError("bad shoulder/hip width")
+        lateral_axis = normalize_vector(np.mean([p[0] for p in pairs], axis=0))
+        width = float(np.median([p[1] for p in pairs]))
+        center = np.mean([left_shoulder, right_shoulder, left_hip, right_hip], axis=0)
+        lateral = (vertices.astype(np.float64) - center[None, :]) @ lateral_axis
+        threshold = max(0.10, min(0.32, width * 0.85))
+        mask = np.abs(lateral) <= threshold
+        if mask.sum() < vertices.shape[0] * 0.20:
+            threshold = max(threshold, np.quantile(np.abs(lateral), 0.55))
+            mask = np.abs(lateral) <= threshold
+        return mask, {
+            "enabled": np.array(True),
+            "reason": np.array("ok", dtype=object),
+            "threshold_m": np.array(float(threshold), dtype=np.float64),
+            "vertex_count": np.array(int(mask.sum()), dtype=np.int64),
+        }
+    except Exception as e:
+        return default, {
+            "enabled": np.array(False),
+            "reason": np.array(f"failed: {e}", dtype=object),
+            "threshold_m": np.array(0.0, dtype=np.float64),
+        }
+
+
+def deform_side_mesh_to_mask_profile(
+    vertices,
+    side_result,
+    side_mask,
+    image_shape,
+    anchor_pcts=None,
+    strength=0.65,
+    max_push_cm=7.0,
+    row_radius=6,
+    chest_mode="apex_lobe",
+    chest_lobe_gain=2.4,
+):
+    """Smoothly expand chest/front and butt/back side-profile lobes toward the mask."""
+    chest_mode = str(chest_mode or "apex_lobe").strip().lower()
+    if chest_mode not in {"apex_lobe", "row_sdf"}:
+        chest_mode = "apex_lobe"
+    meta = {
+        "enabled": np.array(False),
+        "reason": np.array("disabled_or_no_mask", dtype=object),
+        "chest_mode": np.array(chest_mode, dtype=object),
+        "chest_lobe_gain": np.array(float(chest_lobe_gain), dtype=np.float64),
+        "strength": np.array(float(strength), dtype=np.float64),
+        "max_push_cm": np.array(float(max_push_cm), dtype=np.float64),
+        "mean_abs_push_cm": np.array(0.0, dtype=np.float64),
+        "max_abs_push_cm": np.array(0.0, dtype=np.float64),
+        "mean_selected_sdf_px": np.array(0.0, dtype=np.float64),
+        "moved_vertex_count": np.array(0, dtype=np.int64),
+    }
+    if strength <= 0.0:
+        meta["reason"] = np.array("strength_zero", dtype=object)
+        return vertices.astype(np.float32), meta
+    if side_mask is None:
+        return vertices.astype(np.float32), meta
+
+    focal_length = side_result.get("focal_length")
+    cam_t = side_result.get("pred_cam_t")
+    if focal_length is None or cam_t is None:
+        meta["reason"] = np.array("missing_camera", dtype=object)
+        return vertices.astype(np.float32), meta
+
+    v = vertices.astype(np.float64).copy()
+    proj, depth = project_vertices_to_image(v, cam_t, float(focal_length), image_shape)
+    sdf = mask_to_sdf(side_mask)
+    sdf_values = sample_image_bilinear(sdf, proj)
+    h, w = image_shape[:2]
+    in_front = depth > 1e-5
+    in_image = (
+        (proj[:, 0] >= 0) & (proj[:, 0] < w) &
+        (proj[:, 1] >= 0) & (proj[:, 1] < h) &
+        in_front
+    )
+
+    up_dir = estimate_up_direction_from_mesh(v)
+    height_coord = v @ up_dir
+    height_min = float(height_coord.min())
+    height_span = float(height_coord.max() - height_min)
+    if height_span <= 1e-8:
+        meta["reason"] = np.array("bad_height", dtype=object)
+        return v.astype(np.float32), meta
+    pct = (height_coord - height_min) / height_span
+
+    anchor_pcts = anchor_pcts or {}
+    chest_center, chest_used_default = direct_anchor_pct(anchor_pcts, "chest", 0.725)
+    butt_center, butt_used_default = direct_anchor_pct(anchor_pcts, "butt", 0.500)
+    chest_weight = _smooth_band_weight(pct, chest_center, 0.105)
+    butt_weight = _smooth_band_weight(pct, butt_center, 0.135)
+    torso_core, torso_core_meta = compute_torso_core_mask(v, side_result)
+    selected = in_image & torso_core & ((chest_weight > 1e-4) | (butt_weight > 1e-4))
+    if not selected.any():
+        meta["reason"] = np.array("no_selected_vertices", dtype=object)
+        return v.astype(np.float32), meta
+
+    anterior_sign, anterior_source = infer_side_anterior_sign(side_result, image_shape)
+    posterior_sign = -int(anterior_sign)
+    rows = np.clip(np.rint(proj[:, 1]).astype(np.int32), 0, h - 1)
+    mask_left, mask_right = row_bounds_from_mask(side_mask, row_radius=row_radius)
+
+    row_center = np.full(h, np.nan, dtype=np.float64)
+    row_half = np.full(h, np.nan, dtype=np.float64)
+    row_left = np.full(h, np.nan, dtype=np.float64)
+    row_right = np.full(h, np.nan, dtype=np.float64)
+    for y in range(h):
+        near = selected & (np.abs(rows - y) <= row_radius)
+        if near.any():
+            row_left[y] = float(np.quantile(proj[near, 0], 0.03))
+            row_right[y] = float(np.quantile(proj[near, 0], 0.97))
+            row_center[y] = 0.5 * (row_left[y] + row_right[y])
+            row_half[y] = max(1.0, 0.5 * (row_right[y] - row_left[y]))
+
+    def target_shift_by_row(side_sign):
+        shift = np.zeros(h, dtype=np.float64)
+        valid = np.zeros(h, dtype=bool)
+        for y in range(h):
+            if not (
+                np.isfinite(mask_left[y]) and np.isfinite(mask_right[y]) and
+                np.isfinite(row_left[y]) and np.isfinite(row_right[y])
+            ):
+                continue
+            if side_sign < 0:
+                missing = max(0.0, row_left[y] - mask_left[y])
+                shift[y] = -missing
+            else:
+                missing = max(0.0, mask_right[y] - row_right[y])
+                shift[y] = missing
+            valid[y] = missing > 0.0
+        sigma_px = max(float(row_radius) * 2.5, 10.0)
+        return smooth_rows(shift, valid, sigma_px), valid
+
+    def chest_apex_lobe_shift_by_row():
+        shift = np.zeros(h, dtype=np.float64)
+        valid = np.zeros(h, dtype=bool)
+        # The row-SDF method uses the outside mesh edge. For busts, the visible
+        # apex can sit inside that edge band, so use a front-surface percentile.
+        front_quantile = 0.18 if anterior_sign < 0 else 0.82
+        chest_candidates = selected & (chest_weight > 0.08)
+        for y in range(h):
+            if not (np.isfinite(mask_left[y]) and np.isfinite(mask_right[y])):
+                continue
+            near = chest_candidates & (np.abs(rows - y) <= row_radius)
+            if near.sum() < 4:
+                continue
+            front_x = float(np.quantile(proj[near, 0], front_quantile))
+            if anterior_sign < 0:
+                missing = max(0.0, front_x - (mask_left[y] + 1.0))
+                shift[y] = -missing
+            else:
+                missing = max(0.0, (mask_right[y] - 1.0) - front_x)
+                shift[y] = missing
+            valid[y] = missing > 0.0
+        sigma_px = max(float(row_radius) * 3.0, 12.0)
+        return smooth_rows(shift, valid, sigma_px), valid, front_quantile
+
+    chest_shift_row, chest_valid_row = target_shift_by_row(anterior_sign)
+    butt_shift_row, butt_valid_row = target_shift_by_row(posterior_sign)
+    chest_lobe_shift_row, chest_lobe_valid_row, chest_lobe_quantile = chest_apex_lobe_shift_by_row()
+
+    max_push_m = max(0.0, float(max_push_cm)) / 100.0
+    max_push_px = np.maximum(1.0, max_push_m * float(focal_length) / np.maximum(depth, 1e-5))
+    du_chest = np.zeros(v.shape[0], dtype=np.float64)
+    du_butt = np.zeros(v.shape[0], dtype=np.float64)
+
+    for idx in np.nonzero(selected)[0]:
+        y = rows[idx]
+        center = row_center[y]
+        half = row_half[y]
+        if not (np.isfinite(center) and np.isfinite(half)):
+            continue
+        signed_side = (proj[idx, 0] - center) / half
+        inside_sdf_px = max(0.0, -float(sdf_values[idx]))
+        sdf_weight = float(np.clip(inside_sdf_px / max(1.0, float(row_radius)), 0.20, 1.0)) if inside_sdf_px > 0 else 0.20
+
+        chest_side = anterior_sign * signed_side
+        if chest_weight[idx] > 1e-4:
+            if chest_mode == "row_sdf" and chest_side > 0.02:
+                side_weight = float(np.clip((chest_side - 0.02) / 0.98, 0.0, 1.0)) ** 0.55
+                raw = chest_shift_row[y] * float(strength) * float(chest_weight[idx]) * side_weight * sdf_weight
+                du_chest[idx] += float(np.clip(raw, -max_push_px[idx], max_push_px[idx]))
+            elif chest_mode == "apex_lobe" and chest_side > -0.10:
+                lobe_weight = float(np.clip((chest_side + 0.10) / 1.10, 0.0, 1.0)) ** 0.55
+                raw = (
+                    chest_lobe_shift_row[y]
+                    * float(strength)
+                    * float(chest_lobe_gain)
+                    * float(chest_weight[idx])
+                    * lobe_weight
+                    * max(0.50, sdf_weight)
+                )
+                du_chest[idx] += float(np.clip(raw, -max_push_px[idx], max_push_px[idx]))
+
+        butt_side = posterior_sign * signed_side
+        if butt_weight[idx] > 1e-4 and butt_side > 0.02:
+            side_weight = float(np.clip((butt_side - 0.02) / 0.98, 0.0, 1.0)) ** 0.45
+            raw = butt_shift_row[y] * float(strength) * float(butt_weight[idx]) * side_weight * sdf_weight
+            du_butt[idx] += float(np.clip(raw, -max_push_px[idx], max_push_px[idx]))
+
+    def smooth_vertex_du(du_region):
+        if not np.any(np.abs(du_region) > 1e-6):
+            return du_region
+        bins = np.floor(pct * 180).astype(np.int32)
+        smoothed = du_region.copy()
+        for bin_id in np.unique(bins[np.abs(du_region) > 1e-6]):
+            bin_mask = bins == bin_id
+            active = bin_mask & (np.abs(du_region) > 1e-6)
+            if active.sum() >= 6:
+                blend = float(np.median(du_region[active]))
+                smoothed[active] = 0.55 * du_region[active] + 0.45 * blend
+        return smoothed
+
+    # Lightly smooth displacement by height bins to avoid row stair-steps and lumpy glute artifacts.
+    du_chest = smooth_vertex_du(du_chest)
+    du_butt = smooth_vertex_du(du_butt)
+    du = du_chest + du_butt
+
+    dx_chest = du_chest * depth / float(focal_length)
+    dx_butt = du_butt * depth / float(focal_length)
+    dx = du * depth / float(focal_length)
+    dx = np.clip(dx, -max_push_m, max_push_m)
+    v[:, 0] += dx
+
+    moved = np.abs(dx) > 1e-6
+    chest_moved = np.abs(dx_chest) > 1e-6
+    butt_moved = np.abs(dx_butt) > 1e-6
+    meta.update({
+        "enabled": np.array(True),
+        "reason": np.array("ok", dtype=object),
+        "chest_center_pct": np.array(chest_center * 100.0, dtype=np.float64),
+        "butt_center_pct": np.array(butt_center * 100.0, dtype=np.float64),
+        "chest_anchor_used_default": np.array(bool(chest_used_default)),
+        "butt_anchor_used_default": np.array(bool(butt_used_default)),
+        "anterior_sign": np.array(int(anterior_sign), dtype=np.int64),
+        "anterior_source": np.array(anterior_source, dtype=object),
+        "torso_core_enabled": torso_core_meta.get("enabled", np.array(False)),
+        "torso_core_reason": torso_core_meta.get("reason", np.array("unknown", dtype=object)),
+        "torso_core_threshold_m": torso_core_meta.get("threshold_m", np.array(0.0, dtype=np.float64)),
+        "torso_core_vertex_count": torso_core_meta.get("vertex_count", np.array(int(torso_core.sum()), dtype=np.int64)),
+        "chest_mode": np.array(chest_mode, dtype=object),
+        "chest_lobe_gain": np.array(float(chest_lobe_gain), dtype=np.float64),
+        "chest_valid_row_count": np.array(int(chest_valid_row.sum()), dtype=np.int64),
+        "chest_lobe_valid_row_count": np.array(int(chest_lobe_valid_row.sum()), dtype=np.int64),
+        "chest_lobe_front_quantile": np.array(float(chest_lobe_quantile), dtype=np.float64),
+        "butt_valid_row_count": np.array(int(butt_valid_row.sum()), dtype=np.int64),
+        "chest_moved_vertex_count": np.array(int(chest_moved.sum()), dtype=np.int64),
+        "butt_moved_vertex_count": np.array(int(butt_moved.sum()), dtype=np.int64),
+        "chest_mean_abs_push_cm": np.array(float(np.mean(np.abs(dx_chest[chest_moved])) * 100.0) if chest_moved.any() else 0.0, dtype=np.float64),
+        "butt_mean_abs_push_cm": np.array(float(np.mean(np.abs(dx_butt[butt_moved])) * 100.0) if butt_moved.any() else 0.0, dtype=np.float64),
+        "chest_max_abs_push_cm": np.array(float(np.max(np.abs(dx_chest)) * 100.0) if dx_chest.size else 0.0, dtype=np.float64),
+        "butt_max_abs_push_cm": np.array(float(np.max(np.abs(dx_butt)) * 100.0) if dx_butt.size else 0.0, dtype=np.float64),
+        "mean_abs_push_cm": np.array(float(np.mean(np.abs(dx[moved])) * 100.0) if moved.any() else 0.0, dtype=np.float64),
+        "max_abs_push_cm": np.array(float(np.max(np.abs(dx)) * 100.0) if dx.size else 0.0, dtype=np.float64),
+        "mean_selected_sdf_px": np.array(float(np.mean(sdf_values[selected])) if selected.any() else 0.0, dtype=np.float64),
+        "moved_vertex_count": np.array(int(moved.sum()), dtype=np.int64),
+    })
+    return v.astype(np.float32), meta
+
+
 def scale_mesh_to_target_height(vertices, target_height, axis=np.array([0.0, 1.0, 0.0], dtype=np.float64)):
     current_height = compute_height_along_axis(vertices, axis)
     if current_height <= 1e-8:
@@ -438,6 +1014,117 @@ def scale_result_params(result, scale_factor):
     return scaled
 
 
+
+def _jsonable_measurement_value(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): _jsonable_measurement_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_measurement_value(v) for v in value]
+    if value.__class__.__name__ == "Trimesh":
+        return None
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return None
+
+
+def save_measurements_json(measurements, output_json_path):
+    json_dict = {}
+    for key, value in measurements.items():
+        json_value = _jsonable_measurement_value(value)
+        if json_value is not None:
+            json_dict[str(key)] = json_value
+    with open(output_json_path, "w") as f:
+        json.dump(json_dict, f, indent=2, sort_keys=True)
+    return output_json_path
+
+
+def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target_height_m, output_dir):
+    """Use CLAD on the un-SDF-ed side mesh to locate bust and butt height bands."""
+    meta = {
+        "enabled": np.array(False),
+        "reason": np.array("not_run", dtype=object),
+        "bust_pct": np.array(0.0, dtype=np.float64),
+        "hip_pct": np.array(0.0, dtype=np.float64),
+    }
+    paths = {
+        "params_json": None,
+        "measurements_json": None,
+        "clad_obj": None,
+    }
+
+    try:
+        side_oriented = center_and_orient_mesh(side_vertices)
+        side_scaled, side_scale_factor, _, _ = scale_mesh_to_target_height(
+            side_oriented["vertices_oriented"],
+            target_height_m,
+        )
+        side_clad_vertices = sam_upright_vertices_to_clad_canonical(side_scaled)
+
+        side_anchor_params = scale_result_params(
+            _copy_result_dict(side_result),
+            float(side_scale_factor),
+        )
+        side_anchor_params["pred_vertices"] = side_scaled.astype(np.float32)
+        side_anchor_params["fusion_target_height"] = np.array(float(target_height_m * 100.0), dtype=np.float64)
+        side_anchor_params["fusion_target_height_cm"] = np.array(float(target_height_m * 100.0), dtype=np.float64)
+        side_anchor_params["fusion_prefer_vertices_for_clad"] = np.array(True)
+        side_anchor_params["fusion_rule"] = np.array("side_untouched_clad_anchor_mesh", dtype=object)
+        side_anchor_params["fusion_vertices_clad"] = side_clad_vertices.astype(np.float32)
+        side_anchor_params["fusion_vertices_clad_coordinate_system"] = np.array(
+            "x_lateral_y_profile_z_up_meters",
+            dtype=object,
+        )
+
+        paths["params_json"] = os.path.join(output_dir, "side_untouched_clad_anchor_params.json")
+        paths["clad_obj"] = os.path.join(output_dir, "side_untouched_clad_anchor.obj")
+        save_result_json(side_anchor_params, paths["params_json"])
+        save_mesh_obj(side_clad_vertices, faces, paths["clad_obj"])
+
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        clad_root = os.path.join(repo_root, "clad-body")
+        if os.path.isdir(clad_root) and clad_root not in sys.path:
+            sys.path.insert(0, clad_root)
+
+        from clad_body.load import load_mhr_from_params
+        from clad_body.measure import measure
+
+        body = load_mhr_from_params(paths["params_json"])
+        measurements = measure(body, only=["bust_cm", "hip_cm"])
+        paths["measurements_json"] = os.path.join(output_dir, "side_untouched_clad_anchor_measurements.json")
+        save_measurements_json(measurements, paths["measurements_json"])
+
+        anchors = {}
+        try:
+            bust_pct = float(measurements.get("_bust_pct", 0.0))
+            if 0.0 < bust_pct < 100.0:
+                anchors["chest"] = bust_pct / 100.0
+                meta["bust_pct"] = np.array(bust_pct, dtype=np.float64)
+        except Exception:
+            pass
+        try:
+            hip_pct = float(measurements.get("_hip_pct", 0.0))
+            if 0.0 < hip_pct < 100.0:
+                anchors["butt"] = hip_pct / 100.0
+                meta["hip_pct"] = np.array(hip_pct, dtype=np.float64)
+        except Exception:
+            pass
+
+        if not anchors:
+            meta["reason"] = np.array("missing_bust_hip_pct", dtype=object)
+            return {}, meta, paths
+
+        meta["enabled"] = np.array(True)
+        meta["reason"] = np.array("ok", dtype=object)
+        return anchors, meta, paths
+    except Exception as e:
+        meta["reason"] = np.array(f"failed: {e}", dtype=object)
+        print(f"[fusion] Warning: side CLAD anchor measurement failed: {e}")
+        return {}, meta, paths
+
 def _copy_result_dict(result):
     copied = {}
     for k, v in result.items():
@@ -545,6 +1232,94 @@ def main():
         default="./output",
         help="Directory to write fusion outputs.",
     )
+    parser.add_argument(
+        "--profile-depth-correction-strength",
+        type=float,
+        default=float(os.environ.get("FUSION_PROFILE_DEPTH_CORRECTION", "0.35")),
+        help=(
+            "Smoothly expand bust and hip/glute profile depth when side depth "
+            "is implausibly flat relative to front width. Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--profile-depth-correction-max-scale",
+        type=float,
+        default=float(os.environ.get("FUSION_PROFILE_DEPTH_MAX_SCALE", "1.22")),
+        help="Maximum local depth expansion from profile correction.",
+    )
+    parser.add_argument(
+        "--side-mask",
+        type=str,
+        default=os.environ.get("FUSION_SIDE_MASK", ""),
+        help=(
+            "Optional side-view binary or grayscale person mask. If omitted, the SAM3D "
+            "segmentor mask from side inference is used."
+        ),
+    )
+    parser.add_argument(
+        "--segmentor-name",
+        type=str,
+        default=os.environ.get("SAM3D_SEGMENTOR", "sam2"),
+        help="Human segmentation model used when SAM mask generation is enabled.",
+    )
+    parser.add_argument(
+        "--segmentor-path",
+        type=str,
+        default=os.environ.get("SAM3D_SEGMENTOR_PATH", "external/sam2"),
+        help="Path to human segmentation model folder. Defaults to external/sam2 for SAM2.",
+    )
+    parser.add_argument(
+        "--no-sam-mask",
+        action="store_true",
+        help="Disable automatic SAM mask generation and rely only on --side-mask if provided.",
+    )
+    parser.add_argument(
+        "--measurement-anchors-json",
+        type=str,
+        default=os.environ.get("FUSION_MEASUREMENT_ANCHORS_JSON", ""),
+        help="Optional CLAD/body_measurements JSON containing _bust_pct and _hip_pct anchors.",
+    )
+    parser.add_argument(
+        "--side-sdf-profile-strength",
+        type=float,
+        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_STRENGTH", "0.65")),
+        help="Strength for side-mask silhouette expansion in chest/butt bands. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--side-sdf-profile-max-push-cm",
+        type=float,
+        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM", "7.0")),
+        help="Maximum side-profile displacement per vertex, in centimeters.",
+    )
+    parser.add_argument(
+        "--side-sdf-row-radius",
+        type=int,
+        default=int(os.environ.get("FUSION_SIDE_SDF_ROW_RADIUS", "6")),
+        help="Vertical pixel radius used when matching side mesh rows to mask/SDF rows.",
+    )
+    parser.add_argument(
+        "--side-sdf-chest-mode",
+        choices=("apex_lobe", "row_sdf"),
+        default=os.environ.get("FUSION_SIDE_SDF_CHEST_MODE", "apex_lobe"),
+        help=(
+            "Chest correction mode. apex_lobe expands a smooth bust lobe from the "
+            "CLAD bust plane toward the side mask; row_sdf preserves the older row-edge SDF method."
+        ),
+    )
+    parser.add_argument(
+        "--side-sdf-chest-lobe-gain",
+        type=float,
+        default=float(os.environ.get("FUSION_SIDE_SDF_CHEST_LOBE_GAIN", "2.4")),
+        help="Extra gain for apex_lobe chest correction only; row_sdf is unchanged.",
+    )
+    parser.add_argument(
+        "--no-fused-vertex-override",
+        action="store_true",
+        help=(
+            "Opt out of using the fused SAM mesh as CLAD's measurement/render mesh. "
+            "When set, CLAD falls back to MHR rest-pose reconstruction plus profile correction."
+        ),
+    )
     args = parser.parse_args()
 
     input_dir = args.input_dir
@@ -572,9 +1347,14 @@ def main():
     front_image_path = find_image(input_dir, "front")
     side_image_path = find_image(input_dir, "side")
 
+    target_height_cm = float(args.target_height)
+    target_height_m = target_height_cm / 100.0
+    use_sam_mask = not bool(args.no_sam_mask)
+
     print(f"Front image: {front_image_path}")
     print(f"Side image : {side_image_path}")
-    print(f"Target fused mesh height: {args.target_height}")
+    print(f"Target fused mesh height: {target_height_cm}")
+    print(f"SAM mask generation      : {'enabled' if use_sam_mask else 'disabled'}")
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -592,6 +1372,21 @@ def main():
             name=detector_name,
             device=device,
             path=detector_path,
+        )
+
+    if use_sam_mask:
+        if not args.segmentor_name:
+            raise RuntimeError("SAM mask generation is enabled, but --segmentor-name is empty.")
+        if args.segmentor_name == "sam2" and not args.segmentor_path:
+            raise RuntimeError(
+                "SAM mask generation with sam2 requires --segmentor-path or SAM3D_SEGMENTOR_PATH. "
+                "Set SAM3D_SEGMENTOR_PATH or pass --no-sam-mask to disable."
+            )
+        from tools.build_sam import HumanSegmentor
+        human_segmentor = HumanSegmentor(
+            name=args.segmentor_name,
+            device=device,
+            path=args.segmentor_path,
         )
 
     if fov_name:
@@ -615,7 +1410,7 @@ def main():
     front_outputs = estimator.process_one_image(
         front_image_path,
         bbox_thr=0.8,
-        use_mask=False,
+        use_mask=use_sam_mask,
     )
     if not (isinstance(front_outputs, list) and len(front_outputs) > 0 and isinstance(front_outputs[0], dict)):
         raise RuntimeError("Front inference did not return expected outputs[0] dict")
@@ -626,11 +1421,27 @@ def main():
     side_outputs = estimator.process_one_image(
         side_image_path,
         bbox_thr=0.8,
-        use_mask=False,
+        use_mask=use_sam_mask,
     )
     if not (isinstance(side_outputs, list) and len(side_outputs) > 0 and isinstance(side_outputs[0], dict)):
         raise RuntimeError("Side inference did not return expected outputs[0] dict")
     side_result = side_outputs[0]
+
+    side_image_bgr = cv2.imread(side_image_path)
+    if side_image_bgr is None:
+        raise FileNotFoundError(f"Could not read side image: {side_image_path}")
+
+    side_mask = (
+        load_binary_mask(args.side_mask, side_image_bgr.shape)
+        if args.side_mask
+        else result_mask_to_binary(side_result, side_image_bgr.shape)
+    )
+    side_mask_path, side_sdf_path, side_sdf_vis_path = save_mask_and_sdf(
+        side_mask,
+        output_dir,
+        "side",
+    )
+    manual_measurement_anchor_pcts = load_measurement_anchor_pcts(args.measurement_anchors_json)
 
     front_raw_render = render_and_save(
         front_image_path,
@@ -658,6 +1469,70 @@ def main():
 
     front_vertices = front_vertices.astype(np.float32)
     side_vertices = side_vertices.astype(np.float32)
+
+    side_anchor_pcts, side_anchor_meta, side_anchor_paths = measure_untouched_side_anchor_pcts(
+        side_result,
+        side_vertices,
+        estimator.faces,
+        target_height_m,
+        output_dir,
+    )
+    measurement_anchor_pcts = dict(side_anchor_pcts)
+    measurement_anchor_pcts.update(manual_measurement_anchor_pcts)
+
+    side_anchor_reason = np.asarray(side_anchor_meta.get("reason", "unknown")).item()
+    print("\nUntouched side CLAD anchors:")
+    print(f"  reason       : {side_anchor_reason}")
+    print(f"  bust pct     : {float(np.asarray(side_anchor_meta.get('bust_pct', 0.0)).item()):.4f}")
+    print(f"  hip pct      : {float(np.asarray(side_anchor_meta.get('hip_pct', 0.0)).item()):.4f}")
+
+    side_vertices, side_sdf_profile_meta = deform_side_mesh_to_mask_profile(
+        side_vertices,
+        side_result,
+        side_mask,
+        side_image_bgr.shape,
+        anchor_pcts=measurement_anchor_pcts,
+        strength=float(args.side_sdf_profile_strength),
+        max_push_cm=float(args.side_sdf_profile_max_push_cm),
+        row_radius=int(args.side_sdf_row_radius),
+        chest_mode=str(args.side_sdf_chest_mode),
+        chest_lobe_gain=float(args.side_sdf_chest_lobe_gain),
+    )
+    side_result["pred_vertices"] = side_vertices.astype(np.float32)
+
+    side_sdf_edited_obj = None
+    side_sdf_edited_render = None
+    if bool(np.asarray(side_sdf_profile_meta.get("enabled", False)).item()):
+        side_sdf_edited_obj = os.path.join(output_dir, "side_sdf_profile_edited.obj")
+        save_mesh_obj(side_vertices, estimator.faces, side_sdf_edited_obj)
+        side_sdf_edited_render = render_and_save(
+            side_image_path,
+            [side_result],
+            estimator.faces,
+            output_dir,
+            "side_sdf_profile_edited.jpg",
+        )
+
+    side_sdf_reason = np.asarray(side_sdf_profile_meta.get("reason", "unknown")).item()
+    side_sdf_moved_count = int(np.asarray(side_sdf_profile_meta.get("moved_vertex_count", 0)).item())
+    side_sdf_mean_push_cm = float(np.asarray(side_sdf_profile_meta.get("mean_abs_push_cm", 0.0)).item())
+    side_sdf_max_push_cm = float(np.asarray(side_sdf_profile_meta.get("max_abs_push_cm", 0.0)).item())
+    side_sdf_chest_mode = np.asarray(side_sdf_profile_meta.get("chest_mode", args.side_sdf_chest_mode)).item()
+    side_sdf_chest_count = int(np.asarray(side_sdf_profile_meta.get("chest_moved_vertex_count", 0)).item())
+    side_sdf_chest_mean_cm = float(np.asarray(side_sdf_profile_meta.get("chest_mean_abs_push_cm", 0.0)).item())
+    side_sdf_chest_max_cm = float(np.asarray(side_sdf_profile_meta.get("chest_max_abs_push_cm", 0.0)).item())
+    side_sdf_butt_count = int(np.asarray(side_sdf_profile_meta.get("butt_moved_vertex_count", 0)).item())
+    side_sdf_butt_mean_cm = float(np.asarray(side_sdf_profile_meta.get("butt_mean_abs_push_cm", 0.0)).item())
+    side_sdf_butt_max_cm = float(np.asarray(side_sdf_profile_meta.get("butt_max_abs_push_cm", 0.0)).item())
+
+    print("\nSide SDF/profile correction:")
+    print(f"  chest mode          : {side_sdf_chest_mode}")
+    print(f"  reason              : {side_sdf_reason}")
+    print(f"  moved vertices      : {side_sdf_moved_count}")
+    print(f"  mean abs push       : {side_sdf_mean_push_cm:.4f} cm")
+    print(f"  max abs push        : {side_sdf_max_push_cm:.4f} cm")
+    print(f"  chest moved/max     : {side_sdf_chest_count} / {side_sdf_chest_max_cm:.4f} cm mean {side_sdf_chest_mean_cm:.4f} cm")
+    print(f"  butt moved/max      : {side_sdf_butt_count} / {side_sdf_butt_max_cm:.4f} cm mean {side_sdf_butt_mean_cm:.4f} cm")
 
     # ---- orient both meshes into canonical upright space ----
     front_oriented = center_and_orient_mesh(front_vertices)
@@ -691,6 +1566,11 @@ def main():
 
     # ---- fuse: keep front x,y ; take z from aligned side ----
     fused_vertices = fuse_front_xy_with_side_z(front_upright, side_aligned)
+    fused_vertices, profile_depth_meta = enhance_profile_depth_from_front_width(
+        fused_vertices,
+        strength=float(args.profile_depth_correction_strength),
+        max_scale=float(args.profile_depth_correction_max_scale),
+    )
 
     dist_fused_to_front = np.linalg.norm(fused_vertices - front_upright, axis=1)
     dist_fused_to_side = np.linalg.norm(fused_vertices - side_aligned, axis=1)
@@ -698,6 +1578,11 @@ def main():
     print("\nFusion stats:")
     print(f"  mean fused->front distance : {float(np.mean(dist_fused_to_front)):.6f}")
     print(f"  mean fused->side distance  : {float(np.mean(dist_fused_to_side)):.6f}")
+    print(
+        "  profile depth correction : "
+        f"bust x{float(profile_depth_meta['bust_scale']):.3f}, "
+        f"hip x{float(profile_depth_meta['hip_scale']):.3f}"
+    )
 
     # ---- scale fused mesh to requested height ----
     target_height_cm = float(args.target_height)
@@ -717,6 +1602,60 @@ def main():
     fused_result_scaled = scale_result_params(fused_result_unscaled, float(scale_factor))
     fused_result_scaled["pred_vertices"] = fused_vertices_scaled.astype(np.float32)
     fused_result_scaled["fusion_applied_scale_factor"] = np.array(float(scale_factor), dtype=np.float64)
+    for key, value in profile_depth_meta.items():
+        fused_result_scaled[f"fusion_profile_depth_{key}"] = value
+    for key, value in side_sdf_profile_meta.items():
+        fused_result_scaled[f"fusion_side_sdf_profile_{key}"] = value
+    for key, value in side_anchor_meta.items():
+        fused_result_scaled[f"fusion_side_anchor_{key}"] = value
+    for key, value in side_anchor_paths.items():
+        if value:
+            fused_result_scaled[f"fusion_side_anchor_{key}_path"] = np.array(value, dtype=object)
+    fused_result_scaled["fusion_side_anchor_source"] = np.array(
+        "untouched_side_clad_mesh",
+        dtype=object,
+    )
+    if manual_measurement_anchor_pcts:
+        fused_result_scaled["fusion_side_anchor_manual_override"] = np.array(True)
+    if side_mask_path:
+        fused_result_scaled["fusion_side_mask_path"] = np.array(side_mask_path, dtype=object)
+    if side_sdf_path:
+        fused_result_scaled["fusion_side_sdf_path"] = np.array(side_sdf_path, dtype=object)
+    if side_sdf_vis_path:
+        fused_result_scaled["fusion_side_sdf_visualization_path"] = np.array(side_sdf_vis_path, dtype=object)
+    if side_sdf_edited_obj:
+        fused_result_scaled["fusion_side_sdf_edited_obj_path"] = np.array(side_sdf_edited_obj, dtype=object)
+    if side_sdf_edited_render:
+        fused_result_scaled["fusion_side_sdf_edited_render_path"] = np.array(side_sdf_edited_render, dtype=object)
+
+    fused_clad_vertices = sam_upright_vertices_to_clad_canonical(fused_vertices_scaled)
+    fused_clad_obj = os.path.join(output_dir, "front_fused_clad_geometry.obj")
+    save_mesh_obj(fused_clad_vertices, estimator.faces, fused_clad_obj)
+    fused_result_scaled["fusion_apply_profile_depth_to_mhr"] = np.array(
+        bool(args.no_fused_vertex_override and float(args.profile_depth_correction_strength) > 0.0),
+    )
+    fused_result_scaled["fusion_vertices_clad"] = fused_clad_vertices.astype(np.float32)
+    fused_result_scaled["fusion_vertices_clad_coordinate_system"] = np.array(
+        "x_lateral_y_profile_z_up_meters",
+        dtype=object,
+    )
+    side_sdf_rule_part = (
+        "side_sdf_profile_"
+        if bool(np.asarray(side_sdf_profile_meta.get("enabled", False)).item())
+        else ""
+    )
+    if args.no_fused_vertex_override:
+        fused_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(False)
+        fused_result_scaled["fusion_rule"] = np.array(
+            f"front_xy_{side_sdf_rule_part}side_z_profile_depth_mhr_restpose",
+            dtype=object,
+        )
+    else:
+        fused_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(True)
+        fused_result_scaled["fusion_rule"] = np.array(
+            f"front_xy_{side_sdf_rule_part}side_z_profile_depth_fused_vertex_mesh",
+            dtype=object,
+        )
 
     fused_params_json = os.path.join(output_dir, "front_fused_all_body_params_scaled.json")
     save_result_json(fused_result_scaled, fused_params_json)
@@ -728,8 +1667,22 @@ def main():
 
     print("\nDone.")
     print(f"Saved fused params JSON     : {fused_params_json}")
+    print(f"Saved fused CLAD OBJ        : {fused_clad_obj}")
     print(f"Saved front render          : {front_raw_render}")
     print(f"Saved side render           : {side_raw_render}")
+    if side_mask_path:
+        print(f"Saved side mask             : {side_mask_path}")
+    if side_sdf_path:
+        print(f"Saved side SDF              : {side_sdf_path}")
+    if side_sdf_vis_path:
+        print(f"Saved side SDF visualization: {side_sdf_vis_path}")
+    if side_sdf_edited_obj:
+        print(f"Saved side edited OBJ       : {side_sdf_edited_obj}")
+    for key, value in side_anchor_paths.items():
+        if value:
+            print(f"Saved side anchor {key:<12}: {value}")
+    if side_sdf_edited_render:
+        print(f"Saved side edited render    : {side_sdf_edited_render}")
 
 
 if __name__ == "__main__":

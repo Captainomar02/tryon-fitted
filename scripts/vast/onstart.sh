@@ -21,11 +21,12 @@ mkdir -p "${APP_DIR}/input" "${APP_DIR}/output" "${APP_DIR}/checkpoints"
 python -m pip install -e "./clad-body[mhr,render]" --no-build-isolation --no-deps
 scripts/vast/download_checkpoints.sh
 scripts/vast/download_mhr_assets.sh
+scripts/vast/setup_sam2.sh
 
 if [[ "${SAM3D_PREFETCH_RUNTIME_MODELS}" == "1" ]]; then
   python scripts/vast/prefetch_runtime_models.py
 fi
 
-echo "SAM 3D Body + CLAD Body container is ready."
+echo "SAM 3D Body + CLAD Body + SAM2 container is ready."
 echo "Put front.* and side.* in ${APP_DIR}/input, then run:"
 echo "  scripts/vast/run_fusion_and_measure.sh ${APP_DIR}/input ${APP_DIR}/output 178"

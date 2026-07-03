@@ -172,7 +172,14 @@ def measure_stomach(torso_mesh, waist_z, hip_anchor_z, height):
     return stomach_cm, stomach_z, stomach_pct, belly_front_y
 
 
-def body_signature(mesh, step=0.002, low_pct=0.30, high_pct=0.85):
+def body_signature(
+    mesh,
+    step=0.002,
+    low_pct=0.30,
+    high_pct=0.85,
+    max_x_extent=MAX_TORSO_X_EXTENT,
+    combine_fragments=False,
+):
     """Compute body signature: circumference vs height.
 
     Returns:
@@ -182,7 +189,14 @@ def body_signature(mesh, step=0.002, low_pct=0.30, high_pct=0.85):
     height = mesh.vertices[:, 2].max()
     zs = np.arange(height * low_pct, height * high_pct, step)
     slicer = MeshSlicer(mesh)
-    circs = np.array([slicer.circumference_at_z(z) for z in zs])
+    circs = np.array([
+        slicer.circumference_at_z(
+            z,
+            max_x_extent=max_x_extent,
+            combine_fragments=combine_fragments,
+        )
+        for z in zs
+    ])
     return zs, circs
 
 

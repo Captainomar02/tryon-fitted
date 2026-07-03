@@ -46,16 +46,29 @@ CHECKPOINT_DIR="${SAM3D_CHECKPOINT_DIR}"
 CHECKPOINT_PATH="${SAM3D_CHECKPOINT_PATH:-${CHECKPOINT_DIR}/model.ckpt}"
 MHR_PATH="${SAM3D_MHR_PATH:-${CHECKPOINT_DIR}/assets/mhr_model.pt}"
 
+export SAM3D_SEGMENTOR="${SAM3D_SEGMENTOR:-sam2}"
+export SAM3D_SEGMENTOR_PATH="${SAM3D_SEGMENTOR_PATH:-${APP_DIR}/external/sam2}"
+export SAM2_DIR="${SAM2_DIR:-${SAM3D_SEGMENTOR_PATH}}"
+
 if [[ ! -f "${CHECKPOINT_PATH}" || ! -f "${MHR_PATH}" ]]; then
   scripts/vast/download_checkpoints.sh
 fi
 
 scripts/vast/download_mhr_assets.sh
 
+if [[ "${SAM3D_SEGMENTOR}" == "sam2" ]]; then
+  SAM2_CHECKPOINT_PATH="${SAM2_CHECKPOINT_PATH:-${SAM3D_SEGMENTOR_PATH}/checkpoints/sam2.1_hiera_large.pt}"
+  if [[ ! -f "${SAM2_CHECKPOINT_PATH}" || ! -f "${SAM3D_SEGMENTOR_PATH}/setup.py" ]]; then
+    scripts/vast/setup_sam2.sh
+  fi
+fi
+
 python run_front_side_fusion.py \
   --target-height "${TARGET_HEIGHT_CM}" \
   --input-dir "${INPUT_DIR}" \
-  --output-dir "${OUTPUT_DIR}"
+  --output-dir "${OUTPUT_DIR}" \
+  --segmentor-name "${SAM3D_SEGMENTOR}" \
+  --segmentor-path "${SAM3D_SEGMENTOR_PATH}"
 
 python scripts/measure_mhr_params.py \
   --params "${OUTPUT_DIR}/front_fused_all_body_params_scaled.json" \
