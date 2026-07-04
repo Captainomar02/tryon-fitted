@@ -235,7 +235,10 @@ def estimate_up_direction_from_mesh(vertices):
         low_center = low_pts.mean(axis=0)
         high_center = high_pts.mean(axis=0)
 
-    up_dir = high_center - low_center
+    # SAM-3D body vertices use image-like vertical polarity here: smaller Y is
+    # closer to the head and larger Y is closer to the feet. Physical "up" is
+    # therefore low-Y minus high-Y.
+    up_dir = low_center - high_center
     return normalize_vector(up_dir)
 
 
@@ -316,6 +319,41 @@ def _smooth_band_weight(height_pct, center, half_width):
     distance = np.abs(height_pct - float(center))
     weight = np.clip(1.0 - (distance / float(half_width)), 0.0, 1.0)
     return weight * weight * (3.0 - 2.0 * weight)
+
+
+SIDE_SDF_BAND_HALF_WIDTH = 0.02953125
+SIDE_SDF_BAND_FEATHER_WIDTH = SIDE_SDF_BAND_HALF_WIDTH
+SIDE_SDF_BAND_CORE_WEIGHT = 1.0
+SIDE_SDF_OUTER_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 0.8
+SIDE_SDF_OUTER_SMOOTH_GAIN = 0.25
+
+
+def _flat_band_with_feather(height_pct, center, half_width, feather_width):
+    distance = np.abs(height_pct - float(center))
+    weight = np.zeros_like(distance, dtype=np.float64)
+    weight[distance <= float(half_width)] = SIDE_SDF_BAND_CORE_WEIGHT
+
+    if feather_width > 0.0:
+        feather = (distance > float(half_width)) & (distance <= float(half_width + feather_width))
+        t = (distance[feather] - float(half_width)) / float(feather_width)
+        smooth = t * t * (3.0 - 2.0 * t)
+        weight[feather] = SIDE_SDF_BAND_CORE_WEIGHT * (1.0 - smooth)
+
+    return weight
+
+
+def _outside_band_smooth_weight(height_pct, center, half_width, feather_width, outer_width):
+    distance = np.abs(height_pct - float(center))
+    start = float(half_width + feather_width)
+    weight = np.zeros_like(distance, dtype=np.float64)
+    if outer_width <= 0.0:
+        return weight
+
+    outer = (distance > start) & (distance <= start + float(outer_width))
+    t = (distance[outer] - start) / float(outer_width)
+    smooth = t * t * (3.0 - 2.0 * t)
+    weight[outer] = 1.0 - smooth
+    return weight
 
 
 def _band_extent(vertices, height_pct, low_pct, high_pct):
@@ -499,6 +537,105 @@ def save_mask_and_sdf(mask, output_dir, stem):
     return mask_path, sdf_path, sdf_vis_path
 
 
+def save_side_anchor_debug_mask(
+    side_mask,
+    side_image_bgr,
+    vertices,
+    side_result,
+    anchor_pcts,
+    output_dir,
+    out_name="side_anchor_debug_mask.png",
+):
+    if side_mask is None:
+        return None
+
+    focal_length = side_result.get("focal_length")
+    cam_t = side_result.get("pred_cam_t")
+    if focal_length is None or cam_t is None:
+        return None
+
+    h, w = side_mask.shape[:2]
+    mask_u8 = side_mask.astype(np.uint8) * 255
+    overlay = cv2.cvtColor(mask_u8, cv2.COLOR_GRAY2BGR)
+
+    if side_image_bgr is not None:
+        image = side_image_bgr
+        if image.shape[:2] != (h, w):
+            image = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
+        tinted = image.copy()
+        tinted[side_mask] = (
+            0.45 * tinted[side_mask].astype(np.float32) +
+            0.55 * np.array([40.0, 190.0, 80.0], dtype=np.float32)
+        ).astype(np.uint8)
+        overlay = tinted
+
+    v = vertices.astype(np.float64)
+    proj, depth = project_vertices_to_image(v, cam_t, float(focal_length), (h, w))
+    in_image = (
+        (depth > 1e-5) &
+        (proj[:, 0] >= 0) & (proj[:, 0] < w) &
+        (proj[:, 1] >= 0) & (proj[:, 1] < h)
+    )
+
+    up_dir = estimate_up_direction_from_mesh(v)
+    height_coord = v @ up_dir
+    height_span = float(height_coord.max() - height_coord.min())
+    if height_span <= 1e-8:
+        return None
+    pct = (height_coord - float(height_coord.min())) / height_span
+
+    def pct_to_row(target_pct):
+        window = 0.006
+        row = np.nan
+        for _ in range(5):
+            near = in_image & (np.abs(pct - float(target_pct)) <= window)
+            if near.sum() >= 6:
+                row = float(np.median(proj[near, 1]))
+                break
+            window *= 1.8
+        return row
+
+    def draw_anchor(name, center, half_width, color, label_y_offset):
+        center_row = pct_to_row(center)
+        low_row = pct_to_row(max(0.0, center - half_width))
+        high_row = pct_to_row(min(1.0, center + half_width))
+
+        band_rows = [r for r in (low_row, high_row) if np.isfinite(r)]
+        if len(band_rows) == 2:
+            y0 = int(np.clip(round(min(band_rows)), 0, h - 1))
+            y1 = int(np.clip(round(max(band_rows)), 0, h - 1))
+            band = overlay.copy()
+            cv2.rectangle(band, (0, y0), (w - 1, y1), color, thickness=-1)
+            overlay[:] = cv2.addWeighted(band, 0.18, overlay, 0.82, 0.0)
+            cv2.line(overlay, (0, y0), (w - 1, y0), color, 1, cv2.LINE_AA)
+            cv2.line(overlay, (0, y1), (w - 1, y1), color, 1, cv2.LINE_AA)
+
+        if np.isfinite(center_row):
+            y = int(np.clip(round(center_row), 0, h - 1))
+            cv2.line(overlay, (0, y), (w - 1, y), color, 3, cv2.LINE_AA)
+            label = f"{name} {center * 100.0:.2f}%"
+            text_y = int(np.clip(y + label_y_offset, 16, h - 8))
+            cv2.putText(
+                overlay,
+                label,
+                (8, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+    chest_center = required_anchor_pct(anchor_pcts, "chest")
+    butt_center = required_anchor_pct(anchor_pcts, "butt")
+    draw_anchor("bust", chest_center, SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH, (0, 80, 255), -8)
+    draw_anchor("butt", butt_center, SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH, (255, 80, 0), 20)
+
+    out_path = os.path.join(output_dir, out_name)
+    cv2.imwrite(out_path, overlay)
+    return out_path
+
+
 def project_vertices_to_image(vertices, cam_t, focal_length, image_shape):
     v = vertices.astype(np.float64)
     cam_t = np.asarray(cam_t, dtype=np.float64).reshape(3)
@@ -525,44 +662,14 @@ def row_bounds_from_mask(mask, row_radius=4):
     return left, right
 
 
-def load_measurement_anchor_pcts(anchor_json_path):
-    anchors = {}
-    if not anchor_json_path:
-        return anchors
+def required_anchor_pct(anchor_pcts, key):
     try:
-        with open(anchor_json_path) as f:
-            data = json.load(f)
+        value = float((anchor_pcts or {})[key])
     except Exception as e:
-        print(f"[fusion] Warning: could not read measurement anchors {anchor_json_path}: {e}")
-        return anchors
-    for src_key, dst_key in (("_bust_pct", "chest"), ("_hip_pct", "butt")):
-        try:
-            value = float(data[src_key]) / 100.0
-        except Exception:
-            continue
-        if 0.0 < value < 1.0:
-            anchors[dst_key] = value
-    return anchors
-
-
-def bounded_anchor_pct(anchor_pcts, key, default, low, high):
-    try:
-        value = float((anchor_pcts or {}).get(key, default))
-    except Exception:
-        return float(default), True
-    if low <= value <= high:
-        return value, False
-    return float(default), True
-
-
-def direct_anchor_pct(anchor_pcts, key, default):
-    try:
-        value = float((anchor_pcts or {}).get(key, default))
-    except Exception:
-        return float(default), True
-    if 0.0 < value < 1.0:
-        return value, key not in (anchor_pcts or {})
-    return float(default), True
+        raise ValueError(f"Missing required CLAD anchor: {key}") from e
+    if not (0.0 < value < 1.0):
+        raise ValueError(f"Invalid required CLAD anchor {key}: {value}")
+    return value
 
 
 def infer_side_anterior_sign(side_result, image_shape):
@@ -659,20 +766,19 @@ def deform_side_mesh_to_mask_profile(
     image_shape,
     anchor_pcts=None,
     strength=0.65,
-    max_push_cm=7.0,
+    max_push_cm=15.0,
     row_radius=6,
-    chest_mode="apex_lobe",
+    chest_mode="row_sdf",
     chest_lobe_gain=2.4,
 ):
     """Smoothly expand chest/front and butt/back side-profile lobes toward the mask."""
-    chest_mode = str(chest_mode or "apex_lobe").strip().lower()
-    if chest_mode not in {"apex_lobe", "row_sdf"}:
-        chest_mode = "apex_lobe"
+    # Keep the old option accepted, but use the same row-edge SDF rule for
+    # chest that butt uses.
+    chest_mode = "row_sdf"
     meta = {
         "enabled": np.array(False),
         "reason": np.array("disabled_or_no_mask", dtype=object),
         "chest_mode": np.array(chest_mode, dtype=object),
-        "chest_lobe_gain": np.array(float(chest_lobe_gain), dtype=np.float64),
         "strength": np.array(float(strength), dtype=np.float64),
         "max_push_cm": np.array(float(max_push_cm), dtype=np.float64),
         "mean_abs_push_cm": np.array(0.0, dtype=np.float64),
@@ -714,10 +820,16 @@ def deform_side_mesh_to_mask_profile(
     pct = (height_coord - height_min) / height_span
 
     anchor_pcts = anchor_pcts or {}
-    chest_center, chest_used_default = direct_anchor_pct(anchor_pcts, "chest", 0.725)
-    butt_center, butt_used_default = direct_anchor_pct(anchor_pcts, "butt", 0.500)
-    chest_weight = _smooth_band_weight(pct, chest_center, 0.105)
-    butt_weight = _smooth_band_weight(pct, butt_center, 0.135)
+    chest_center = required_anchor_pct(anchor_pcts, "chest")
+    butt_center = required_anchor_pct(anchor_pcts, "butt")
+    chest_weight = _flat_band_with_feather(pct, chest_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH)
+    butt_weight = _flat_band_with_feather(pct, butt_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH)
+    chest_outer_weight = _outside_band_smooth_weight(
+        pct, chest_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH, SIDE_SDF_OUTER_SMOOTH_WIDTH
+    )
+    butt_outer_weight = _outside_band_smooth_weight(
+        pct, butt_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH, SIDE_SDF_OUTER_SMOOTH_WIDTH
+    )
     torso_core, torso_core_meta = compute_torso_core_mask(v, side_result)
     selected = in_image & torso_core & ((chest_weight > 1e-4) | (butt_weight > 1e-4))
     if not selected.any():
@@ -741,6 +853,14 @@ def deform_side_mesh_to_mask_profile(
             row_center[y] = 0.5 * (row_left[y] + row_right[y])
             row_half[y] = max(1.0, 0.5 * (row_right[y] - row_left[y]))
 
+    row_center_at_vertex = row_center[rows]
+    row_half_at_vertex = row_half[rows]
+    valid_profile_row = np.isfinite(row_center_at_vertex) & np.isfinite(row_half_at_vertex) & (row_half_at_vertex > 1e-6)
+    signed_side_all = np.zeros(v.shape[0], dtype=np.float64)
+    signed_side_all[valid_profile_row] = (proj[valid_profile_row, 0] - row_center_at_vertex[valid_profile_row]) / row_half_at_vertex[valid_profile_row]
+    chest_side_mask = in_image & torso_core & valid_profile_row & ((anterior_sign * signed_side_all) > 0.02)
+    butt_side_mask = in_image & torso_core & valid_profile_row & ((posterior_sign * signed_side_all) > 0.02)
+
     def target_shift_by_row(side_sign):
         shift = np.zeros(h, dtype=np.float64)
         valid = np.zeros(h, dtype=bool)
@@ -760,33 +880,8 @@ def deform_side_mesh_to_mask_profile(
         sigma_px = max(float(row_radius) * 2.5, 10.0)
         return smooth_rows(shift, valid, sigma_px), valid
 
-    def chest_apex_lobe_shift_by_row():
-        shift = np.zeros(h, dtype=np.float64)
-        valid = np.zeros(h, dtype=bool)
-        # The row-SDF method uses the outside mesh edge. For busts, the visible
-        # apex can sit inside that edge band, so use a front-surface percentile.
-        front_quantile = 0.18 if anterior_sign < 0 else 0.82
-        chest_candidates = selected & (chest_weight > 0.08)
-        for y in range(h):
-            if not (np.isfinite(mask_left[y]) and np.isfinite(mask_right[y])):
-                continue
-            near = chest_candidates & (np.abs(rows - y) <= row_radius)
-            if near.sum() < 4:
-                continue
-            front_x = float(np.quantile(proj[near, 0], front_quantile))
-            if anterior_sign < 0:
-                missing = max(0.0, front_x - (mask_left[y] + 1.0))
-                shift[y] = -missing
-            else:
-                missing = max(0.0, (mask_right[y] - 1.0) - front_x)
-                shift[y] = missing
-            valid[y] = missing > 0.0
-        sigma_px = max(float(row_radius) * 3.0, 12.0)
-        return smooth_rows(shift, valid, sigma_px), valid, front_quantile
-
     chest_shift_row, chest_valid_row = target_shift_by_row(anterior_sign)
     butt_shift_row, butt_valid_row = target_shift_by_row(posterior_sign)
-    chest_lobe_shift_row, chest_lobe_valid_row, chest_lobe_quantile = chest_apex_lobe_shift_by_row()
 
     max_push_m = max(0.0, float(max_push_cm)) / 100.0
     max_push_px = np.maximum(1.0, max_push_m * float(focal_length) / np.maximum(depth, 1e-5))
@@ -799,50 +894,63 @@ def deform_side_mesh_to_mask_profile(
         half = row_half[y]
         if not (np.isfinite(center) and np.isfinite(half)):
             continue
-        signed_side = (proj[idx, 0] - center) / half
-        inside_sdf_px = max(0.0, -float(sdf_values[idx]))
-        sdf_weight = float(np.clip(inside_sdf_px / max(1.0, float(row_radius)), 0.20, 1.0)) if inside_sdf_px > 0 else 0.20
+        signed_side = signed_side_all[idx]
+
+        # Build at most one edit per vertex. Within a selected row/side, every
+        # vertex receives the same row shift instead of a per-vertex ramp.
+        candidates = []
 
         chest_side = anterior_sign * signed_side
-        if chest_weight[idx] > 1e-4:
-            if chest_mode == "row_sdf" and chest_side > 0.02:
-                side_weight = float(np.clip((chest_side - 0.02) / 0.98, 0.0, 1.0)) ** 0.55
-                raw = chest_shift_row[y] * float(strength) * float(chest_weight[idx]) * side_weight * sdf_weight
-                du_chest[idx] += float(np.clip(raw, -max_push_px[idx], max_push_px[idx]))
-            elif chest_mode == "apex_lobe" and chest_side > -0.10:
-                lobe_weight = float(np.clip((chest_side + 0.10) / 1.10, 0.0, 1.0)) ** 0.55
-                raw = (
-                    chest_lobe_shift_row[y]
-                    * float(strength)
-                    * float(chest_lobe_gain)
-                    * float(chest_weight[idx])
-                    * lobe_weight
-                    * max(0.50, sdf_weight)
-                )
-                du_chest[idx] += float(np.clip(raw, -max_push_px[idx], max_push_px[idx]))
+        if chest_weight[idx] > 1e-4 and chest_side > 0.02:
+            raw = chest_shift_row[y] * float(strength) * float(chest_weight[idx])
+            candidates.append((abs(raw), "chest", raw))
 
         butt_side = posterior_sign * signed_side
         if butt_weight[idx] > 1e-4 and butt_side > 0.02:
-            side_weight = float(np.clip((butt_side - 0.02) / 0.98, 0.0, 1.0)) ** 0.45
-            raw = butt_shift_row[y] * float(strength) * float(butt_weight[idx]) * side_weight * sdf_weight
-            du_butt[idx] += float(np.clip(raw, -max_push_px[idx], max_push_px[idx]))
+            raw = butt_shift_row[y] * float(strength) * float(butt_weight[idx])
+            candidates.append((abs(raw), "butt", raw))
 
-    def smooth_vertex_du(du_region):
+        if not candidates:
+            continue
+
+        _, region_name, raw = max(candidates, key=lambda item: item[0])
+        clipped = float(np.clip(raw, -max_push_px[idx], max_push_px[idx]))
+        if region_name == "chest":
+            du_chest[idx] = clipped
+        else:
+            du_butt[idx] = clipped
+
+    def smooth_vertex_du(du_region, region_weight, outer_weight, side_mask):
         if not np.any(np.abs(du_region) > 1e-6):
             return du_region
         bins = np.floor(pct * 180).astype(np.int32)
         smoothed = du_region.copy()
-        for bin_id in np.unique(bins[np.abs(du_region) > 1e-6]):
+        movable = np.abs(du_region) > 1e-6
+        edge = movable & (region_weight > 1e-4) & (region_weight < 0.999)
+        outside = side_mask & (outer_weight > 1e-4) & ~movable
+
+        for bin_id in np.unique(bins[edge]) if edge.any() else []:
             bin_mask = bins == bin_id
-            active = bin_mask & (np.abs(du_region) > 1e-6)
-            if active.sum() >= 6:
-                blend = float(np.median(du_region[active]))
-                smoothed[active] = 0.55 * du_region[active] + 0.45 * blend
+            source = bin_mask & movable
+            active = bin_mask & edge
+            if active.sum() >= 3 and source.sum() >= 6:
+                blend = float(np.median(du_region[source]))
+                edge_blend = np.clip(0.25 + 0.65 * (1.0 - region_weight[active]), 0.0, 0.9)
+                smoothed[active] = (1.0 - edge_blend) * du_region[active] + edge_blend * blend
+
+        outer_radius_bins = max(2, int(np.ceil(SIDE_SDF_OUTER_SMOOTH_WIDTH * 180.0)) + 2)
+        for bin_id in np.unique(bins[outside]) if outside.any() else []:
+            active = outside & (bins == bin_id)
+            source = movable & (np.abs(bins - bin_id) <= outer_radius_bins)
+            if active.sum() >= 1 and source.sum() >= 6:
+                blend = float(np.median(du_region[source]))
+                raw = blend * SIDE_SDF_OUTER_SMOOTH_GAIN * outer_weight[active]
+                smoothed[active] = np.clip(raw, -max_push_px[active], max_push_px[active])
         return smoothed
 
-    # Lightly smooth displacement by height bins to avoid row stair-steps and lumpy glute artifacts.
-    du_chest = smooth_vertex_du(du_chest)
-    du_butt = smooth_vertex_du(du_butt)
+    # Keep the full-strength core on target, smooth the feather, and add a slight outside tail.
+    du_chest = smooth_vertex_du(du_chest, chest_weight, chest_outer_weight, chest_side_mask)
+    du_butt = smooth_vertex_du(du_butt, butt_weight, butt_outer_weight, butt_side_mask)
     du = du_chest + du_butt
 
     dx_chest = du_chest * depth / float(focal_length)
@@ -859,8 +967,6 @@ def deform_side_mesh_to_mask_profile(
         "reason": np.array("ok", dtype=object),
         "chest_center_pct": np.array(chest_center * 100.0, dtype=np.float64),
         "butt_center_pct": np.array(butt_center * 100.0, dtype=np.float64),
-        "chest_anchor_used_default": np.array(bool(chest_used_default)),
-        "butt_anchor_used_default": np.array(bool(butt_used_default)),
         "anterior_sign": np.array(int(anterior_sign), dtype=np.int64),
         "anterior_source": np.array(anterior_source, dtype=object),
         "torso_core_enabled": torso_core_meta.get("enabled", np.array(False)),
@@ -868,10 +974,7 @@ def deform_side_mesh_to_mask_profile(
         "torso_core_threshold_m": torso_core_meta.get("threshold_m", np.array(0.0, dtype=np.float64)),
         "torso_core_vertex_count": torso_core_meta.get("vertex_count", np.array(int(torso_core.sum()), dtype=np.int64)),
         "chest_mode": np.array(chest_mode, dtype=object),
-        "chest_lobe_gain": np.array(float(chest_lobe_gain), dtype=np.float64),
         "chest_valid_row_count": np.array(int(chest_valid_row.sum()), dtype=np.int64),
-        "chest_lobe_valid_row_count": np.array(int(chest_lobe_valid_row.sum()), dtype=np.int64),
-        "chest_lobe_front_quantile": np.array(float(chest_lobe_quantile), dtype=np.float64),
         "butt_valid_row_count": np.array(int(butt_valid_row.sum()), dtype=np.int64),
         "chest_moved_vertex_count": np.array(int(chest_moved.sum()), dtype=np.int64),
         "butt_moved_vertex_count": np.array(int(butt_moved.sum()), dtype=np.int64),
@@ -1049,6 +1152,8 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         "reason": np.array("not_run", dtype=object),
         "bust_pct": np.array(0.0, dtype=np.float64),
         "hip_pct": np.array(0.0, dtype=np.float64),
+        "bust_anchor_pct": np.array(0.0, dtype=np.float64),
+        "hip_anchor_pct": np.array(0.0, dtype=np.float64),
     }
     paths = {
         "params_json": None,
@@ -1101,15 +1206,19 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         try:
             bust_pct = float(measurements.get("_bust_pct", 0.0))
             if 0.0 < bust_pct < 100.0:
-                anchors["chest"] = bust_pct / 100.0
+                chest_pct = bust_pct / 100.0
+                anchors["chest"] = chest_pct
                 meta["bust_pct"] = np.array(bust_pct, dtype=np.float64)
+                meta["bust_anchor_pct"] = np.array(chest_pct * 100.0, dtype=np.float64)
         except Exception:
             pass
         try:
             hip_pct = float(measurements.get("_hip_pct", 0.0))
             if 0.0 < hip_pct < 100.0:
-                anchors["butt"] = hip_pct / 100.0
+                butt_pct = hip_pct / 100.0
+                anchors["butt"] = butt_pct
                 meta["hip_pct"] = np.array(hip_pct, dtype=np.float64)
+                meta["hip_anchor_pct"] = np.array(butt_pct * 100.0, dtype=np.float64)
         except Exception:
             pass
 
@@ -1274,21 +1383,15 @@ def main():
         help="Disable automatic SAM mask generation and rely only on --side-mask if provided.",
     )
     parser.add_argument(
-        "--measurement-anchors-json",
-        type=str,
-        default=os.environ.get("FUSION_MEASUREMENT_ANCHORS_JSON", ""),
-        help="Optional CLAD/body_measurements JSON containing _bust_pct and _hip_pct anchors.",
-    )
-    parser.add_argument(
         "--side-sdf-profile-strength",
         type=float,
-        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_STRENGTH", "0.65")),
+        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_STRENGTH", "0.1")),
         help="Strength for side-mask silhouette expansion in chest/butt bands. Use 0 to disable.",
     )
     parser.add_argument(
         "--side-sdf-profile-max-push-cm",
         type=float,
-        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM", "7.0")),
+        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM", "15.0")),
         help="Maximum side-profile displacement per vertex, in centimeters.",
     )
     parser.add_argument(
@@ -1300,17 +1403,17 @@ def main():
     parser.add_argument(
         "--side-sdf-chest-mode",
         choices=("apex_lobe", "row_sdf"),
-        default=os.environ.get("FUSION_SIDE_SDF_CHEST_MODE", "apex_lobe"),
+        default=os.environ.get("FUSION_SIDE_SDF_CHEST_MODE", "row_sdf"),
         help=(
-            "Chest correction mode. apex_lobe expands a smooth bust lobe from the "
-            "CLAD bust plane toward the side mask; row_sdf preserves the older row-edge SDF method."
+            "Chest correction mode. Bust now always uses the same row-edge SDF "
+            "method as butt; apex_lobe is accepted only for backward compatibility."
         ),
     )
     parser.add_argument(
         "--side-sdf-chest-lobe-gain",
         type=float,
         default=float(os.environ.get("FUSION_SIDE_SDF_CHEST_LOBE_GAIN", "2.4")),
-        help="Extra gain for apex_lobe chest correction only; row_sdf is unchanged.",
+        help="Legacy option kept for compatibility; bust uses the butt-style row-edge SDF path.",
     )
     parser.add_argument(
         "--no-fused-vertex-override",
@@ -1441,8 +1544,6 @@ def main():
         output_dir,
         "side",
     )
-    manual_measurement_anchor_pcts = load_measurement_anchor_pcts(args.measurement_anchors_json)
-
     front_raw_render = render_and_save(
         front_image_path,
         [front_result],
@@ -1478,13 +1579,30 @@ def main():
         output_dir,
     )
     measurement_anchor_pcts = dict(side_anchor_pcts)
-    measurement_anchor_pcts.update(manual_measurement_anchor_pcts)
+    missing_anchor_names = [name for name in ("chest", "butt") if name not in measurement_anchor_pcts]
+    if missing_anchor_names:
+        reason = np.asarray(side_anchor_meta.get("reason", "unknown")).item()
+        raise RuntimeError(
+            "CLAD anchor measurement is required for side SDF/profile correction, "
+            f"but missing {missing_anchor_names}. CLAD reason: {reason}"
+        )
 
     side_anchor_reason = np.asarray(side_anchor_meta.get("reason", "unknown")).item()
     print("\nUntouched side CLAD anchors:")
     print(f"  reason       : {side_anchor_reason}")
-    print(f"  bust pct     : {float(np.asarray(side_anchor_meta.get('bust_pct', 0.0)).item()):.4f}")
-    print(f"  hip pct      : {float(np.asarray(side_anchor_meta.get('hip_pct', 0.0)).item()):.4f}")
+    print(f"  bust pct     : {float(np.asarray(side_anchor_meta.get('bust_pct', 0.0)).item()):.4f} (CLAD)")
+    print(f"  hip pct      : {float(np.asarray(side_anchor_meta.get('hip_pct', 0.0)).item()):.4f} (CLAD)")
+    print(f"  bust anchor  : {float(np.asarray(side_anchor_meta.get('bust_anchor_pct', 0.0)).item()):.4f} (SDF)")
+    print(f"  hip anchor   : {float(np.asarray(side_anchor_meta.get('hip_anchor_pct', 0.0)).item()):.4f} (SDF)")
+
+    side_anchor_debug_mask_path = save_side_anchor_debug_mask(
+        side_mask,
+        side_image_bgr,
+        side_vertices,
+        side_result,
+        measurement_anchor_pcts,
+        output_dir,
+    )
 
     side_vertices, side_sdf_profile_meta = deform_side_mesh_to_mask_profile(
         side_vertices,
@@ -1615,14 +1733,14 @@ def main():
         "untouched_side_clad_mesh",
         dtype=object,
     )
-    if manual_measurement_anchor_pcts:
-        fused_result_scaled["fusion_side_anchor_manual_override"] = np.array(True)
     if side_mask_path:
         fused_result_scaled["fusion_side_mask_path"] = np.array(side_mask_path, dtype=object)
     if side_sdf_path:
         fused_result_scaled["fusion_side_sdf_path"] = np.array(side_sdf_path, dtype=object)
     if side_sdf_vis_path:
         fused_result_scaled["fusion_side_sdf_visualization_path"] = np.array(side_sdf_vis_path, dtype=object)
+    if side_anchor_debug_mask_path:
+        fused_result_scaled["fusion_side_anchor_debug_mask_path"] = np.array(side_anchor_debug_mask_path, dtype=object)
     if side_sdf_edited_obj:
         fused_result_scaled["fusion_side_sdf_edited_obj_path"] = np.array(side_sdf_edited_obj, dtype=object)
     if side_sdf_edited_render:
@@ -1676,6 +1794,8 @@ def main():
         print(f"Saved side SDF              : {side_sdf_path}")
     if side_sdf_vis_path:
         print(f"Saved side SDF visualization: {side_sdf_vis_path}")
+    if side_anchor_debug_mask_path:
+        print(f"Saved side anchor debug mask: {side_anchor_debug_mask_path}")
     if side_sdf_edited_obj:
         print(f"Saved side edited OBJ       : {side_sdf_edited_obj}")
     for key, value in side_anchor_paths.items():
