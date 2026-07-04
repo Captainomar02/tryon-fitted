@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SAM2_DIR=/workspace/tryon-fitted/external/sam2 \
     SAM2_REF=main \
     SAM2_BUILD_CUDA=0 \
-    FUSION_SIDE_SDF_CHEST_MODE=apex_lobe \
+    FUSION_SIDE_SDF_CHEST_MODE=row_sdf \
     FUSION_SIDE_SDF_CHEST_LOBE_GAIN=2.4 \
     PYOPENGL_PLATFORM=egl \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -50,6 +50,8 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && python -m pip install --no-cache-dir xtcocotools --no-build-isolation \
     && python -m pip install --no-cache-dir -r /tmp/requirements-vast.txt \
     && rm /tmp/requirements-vast.txt
+
+RUN python -c 'import torch, torchvision; import pymomentum.geometry; import mhr; print(f"CLAD deps ok: torch {torch.__version__}, torchvision {torchvision.__version__}")'
 
 RUN mkdir -p \
     /workspace/input \
