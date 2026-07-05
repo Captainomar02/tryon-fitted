@@ -326,6 +326,13 @@ SIDE_SDF_BAND_FEATHER_WIDTH = SIDE_SDF_BAND_HALF_WIDTH
 SIDE_SDF_BAND_CORE_WEIGHT = 1.0
 SIDE_SDF_OUTER_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 0.8
 SIDE_SDF_OUTER_SMOOTH_GAIN = 0.25
+SIDE_SDF_CONTAINMENT_PASSES = 5
+SIDE_SDF_CONTAINMENT_GAIN = 1.0
+SIDE_SDF_CONTAINMENT_MARGIN_PX = 4.0
+SIDE_SDF_CONTAINMENT_MAX_STEP_PX = 24.0
+SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS = 8
+SIDE_SDF_DISPLACEMENT_SMOOTH_ALPHA = 0.45
+SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND = 0.70
 
 
 def _flat_band_with_feather(height_pct, center, half_width, feather_width):
@@ -636,6 +643,103 @@ def save_side_anchor_debug_mask(
     return out_path
 
 
+def save_side_projection_alignment_debug(
+    side_mask,
+    side_image_bgr,
+    vertices,
+    side_result,
+    output_dir,
+    out_name="side_projection_alignment_debug.png",
+):
+    if side_mask is None or side_image_bgr is None:
+        return None
+
+    focal_length = side_result.get("focal_length") if isinstance(side_result, dict) else None
+    cam_t = side_result.get("pred_cam_t") if isinstance(side_result, dict) else None
+    if focal_length is None or cam_t is None:
+        return None
+
+    h, w = side_mask.shape[:2]
+    image = side_image_bgr
+    if image.shape[:2] != (h, w):
+        image = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
+
+    overlay = image.copy()
+    mask_u8 = side_mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2, cv2.LINE_AA)
+
+    bbox = side_result.get("bbox") if isinstance(side_result, dict) else None
+    if bbox is not None:
+        try:
+            x0, y0, x1, y1 = np.asarray(bbox, dtype=np.float64).reshape(-1)[:4]
+            cv2.rectangle(
+                overlay,
+                (int(round(x0)), int(round(y0))),
+                (int(round(x1)), int(round(y1))),
+                (255, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        except Exception:
+            pass
+
+    v = vertices.astype(np.float64)
+    proj, depth = project_vertices_to_image(v, cam_t, float(focal_length), (h, w))
+    in_image = (
+        (depth > 1e-5) &
+        (proj[:, 0] >= 0) & (proj[:, 0] < w) &
+        (proj[:, 1] >= 0) & (proj[:, 1] < h)
+    )
+
+    points = np.rint(proj[in_image]).astype(np.int32)
+    # Draw a sparse projected vertex cloud in cyan. Dense enough to reveal offset,
+    # sparse enough to keep the mask contour readable.
+    if points.shape[0] > 0:
+        step = max(1, points.shape[0] // 3500)
+        sampled = points[::step]
+        overlay[sampled[:, 1], sampled[:, 0]] = (255, 220, 0)
+
+    rows = np.clip(np.rint(proj[:, 1]).astype(np.int32), 0, h - 1)
+    torso_core, _ = compute_torso_core_mask(v, side_result)
+    row_left = np.full(h, np.nan, dtype=np.float64)
+    row_right = np.full(h, np.nan, dtype=np.float64)
+    for y in range(h):
+        near = in_image & torso_core & (np.abs(rows - y) <= 3)
+        if near.any():
+            row_left[y] = float(np.quantile(proj[near, 0], 0.03))
+            row_right[y] = float(np.quantile(proj[near, 0], 0.97))
+
+    for y in range(0, h, 2):
+        if np.isfinite(row_left[y]):
+            cv2.circle(overlay, (int(round(row_left[y])), y), 1, (255, 255, 0), -1, cv2.LINE_AA)
+        if np.isfinite(row_right[y]):
+            cv2.circle(overlay, (int(round(row_right[y])), y), 1, (0, 255, 255), -1, cv2.LINE_AA)
+
+    kps = side_result.get("pred_keypoints_2d") if isinstance(side_result, dict) else None
+    if kps is not None:
+        try:
+            kps = _to_numpy(kps).astype(np.float64)
+            for x, y in kps[:, :2]:
+                if np.isfinite(x) and np.isfinite(y) and 0 <= x < w and 0 <= y < h:
+                    cv2.circle(overlay, (int(round(x)), int(round(y))), 3, (0, 165, 255), -1, cv2.LINE_AA)
+        except Exception:
+            pass
+
+    legend = [
+        ("red: mask", (0, 0, 255)),
+        ("magenta: bbox", (255, 0, 255)),
+        ("cyan/yellow: mesh row edges", (255, 255, 0)),
+        ("orange: 2D keypoints", (0, 165, 255)),
+    ]
+    for i, (text, color) in enumerate(legend):
+        cv2.putText(overlay, text, (12, 24 + i * 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+    out_path = os.path.join(output_dir, out_name)
+    cv2.imwrite(out_path, overlay)
+    return out_path
+
+
 def project_vertices_to_image(vertices, cam_t, focal_length, image_shape):
     v = vertices.astype(np.float64)
     cam_t = np.asarray(cam_t, dtype=np.float64).reshape(3)
@@ -770,8 +874,9 @@ def deform_side_mesh_to_mask_profile(
     row_radius=6,
     chest_mode="row_sdf",
     chest_lobe_gain=2.4,
+    faces=None,
 ):
-    """Smoothly expand chest/front and butt/back side-profile lobes toward the mask."""
+    """Smoothly move chest/front and butt/back side-profile lobes toward the mask."""
     # Keep the old option accepted, but use the same row-edge SDF rule for
     # chest that butt uses.
     chest_mode = "row_sdf"
@@ -822,13 +927,15 @@ def deform_side_mesh_to_mask_profile(
     anchor_pcts = anchor_pcts or {}
     chest_center = required_anchor_pct(anchor_pcts, "chest")
     butt_center = required_anchor_pct(anchor_pcts, "butt")
+    chest_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH * 2.0
+    butt_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH * 2.0
     chest_weight = _flat_band_with_feather(pct, chest_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH)
     butt_weight = _flat_band_with_feather(pct, butt_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH)
     chest_outer_weight = _outside_band_smooth_weight(
-        pct, chest_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH, SIDE_SDF_OUTER_SMOOTH_WIDTH
+        pct, chest_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH, chest_outer_smooth_width
     )
     butt_outer_weight = _outside_band_smooth_weight(
-        pct, butt_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH, SIDE_SDF_OUTER_SMOOTH_WIDTH
+        pct, butt_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH, butt_outer_smooth_width
     )
     torso_core, torso_core_meta = compute_torso_core_mask(v, side_result)
     selected = in_image & torso_core & ((chest_weight > 1e-4) | (butt_weight > 1e-4))
@@ -871,17 +978,25 @@ def deform_side_mesh_to_mask_profile(
             ):
                 continue
             if side_sign < 0:
-                missing = max(0.0, row_left[y] - mask_left[y])
-                shift[y] = -missing
+                shift[y] = mask_left[y] - row_left[y]
             else:
-                missing = max(0.0, mask_right[y] - row_right[y])
-                shift[y] = missing
-            valid[y] = missing > 0.0
-        sigma_px = max(float(row_radius) * 2.5, 10.0)
-        return smooth_rows(shift, valid, sigma_px), valid
+                shift[y] = mask_right[y] - row_right[y]
+            valid[y] = abs(shift[y]) > 1e-6
 
-    chest_shift_row, chest_valid_row = target_shift_by_row(anterior_sign)
-    butt_shift_row, butt_valid_row = target_shift_by_row(posterior_sign)
+        raw_shift = shift.copy()
+        sigma_px = max(float(row_radius) * 2.5, 10.0)
+        smoothed = smooth_rows(raw_shift, valid, sigma_px)
+        sign_flip = (
+            valid &
+            (np.abs(raw_shift) > 1e-6) &
+            (np.abs(smoothed) > 1e-6) &
+            (np.sign(raw_shift) != np.sign(smoothed))
+        )
+        smoothed[sign_flip] = raw_shift[sign_flip]
+        return smoothed, valid, raw_shift, sign_flip
+
+    chest_shift_row, chest_valid_row, chest_raw_shift_row, chest_shift_sign_flip_row = target_shift_by_row(anterior_sign)
+    butt_shift_row, butt_valid_row, butt_raw_shift_row, butt_shift_sign_flip_row = target_shift_by_row(posterior_sign)
 
     max_push_m = max(0.0, float(max_push_cm)) / 100.0
     max_push_px = np.maximum(1.0, max_push_m * float(focal_length) / np.maximum(depth, 1e-5))
@@ -920,25 +1035,15 @@ def deform_side_mesh_to_mask_profile(
         else:
             du_butt[idx] = clipped
 
-    def smooth_vertex_du(du_region, region_weight, outer_weight, side_mask):
+    def smooth_vertex_du(du_region, region_weight, outer_weight, side_mask, outer_width):
         if not np.any(np.abs(du_region) > 1e-6):
             return du_region
         bins = np.floor(pct * 180).astype(np.int32)
         smoothed = du_region.copy()
         movable = np.abs(du_region) > 1e-6
-        edge = movable & (region_weight > 1e-4) & (region_weight < 0.999)
         outside = side_mask & (outer_weight > 1e-4) & ~movable
 
-        for bin_id in np.unique(bins[edge]) if edge.any() else []:
-            bin_mask = bins == bin_id
-            source = bin_mask & movable
-            active = bin_mask & edge
-            if active.sum() >= 3 and source.sum() >= 6:
-                blend = float(np.median(du_region[source]))
-                edge_blend = np.clip(0.25 + 0.65 * (1.0 - region_weight[active]), 0.0, 0.9)
-                smoothed[active] = (1.0 - edge_blend) * du_region[active] + edge_blend * blend
-
-        outer_radius_bins = max(2, int(np.ceil(SIDE_SDF_OUTER_SMOOTH_WIDTH * 180.0)) + 2)
+        outer_radius_bins = max(2, int(np.ceil(float(outer_width) * 180.0)) + 2)
         for bin_id in np.unique(bins[outside]) if outside.any() else []:
             active = outside & (bins == bin_id)
             source = movable & (np.abs(bins - bin_id) <= outer_radius_bins)
@@ -948,9 +1053,9 @@ def deform_side_mesh_to_mask_profile(
                 smoothed[active] = np.clip(raw, -max_push_px[active], max_push_px[active])
         return smoothed
 
-    # Keep the full-strength core on target, smooth the feather, and add a slight outside tail.
-    du_chest = smooth_vertex_du(du_chest, chest_weight, chest_outer_weight, chest_side_mask)
-    du_butt = smooth_vertex_du(du_butt, butt_weight, butt_outer_weight, butt_side_mask)
+    # Keep in-band vertices on target and add smoothing only outside the active band.
+    du_chest = smooth_vertex_du(du_chest, chest_weight, chest_outer_weight, chest_side_mask, chest_outer_smooth_width)
+    du_butt = smooth_vertex_du(du_butt, butt_weight, butt_outer_weight, butt_side_mask, butt_outer_smooth_width)
     du = du_chest + du_butt
 
     dx_chest = du_chest * depth / float(focal_length)
@@ -958,6 +1063,234 @@ def deform_side_mesh_to_mask_profile(
     dx = du * depth / float(focal_length)
     dx = np.clip(dx, -max_push_m, max_push_m)
     v[:, 0] += dx
+
+    containment_dx_chest = np.zeros(v.shape[0], dtype=np.float64)
+    containment_dx_butt = np.zeros(v.shape[0], dtype=np.float64)
+    containment_active_chest = np.zeros(v.shape[0], dtype=bool)
+    containment_active_butt = np.zeros(v.shape[0], dtype=bool)
+
+    def containment_du_for_side(proj_cur, depth_cur, sdf_cur, side_region_mask, region_weight, side_sign):
+        corr_px = np.zeros(v.shape[0], dtype=np.float64)
+        rows_cur = np.clip(np.rint(proj_cur[:, 1]).astype(np.int32), 0, h - 1)
+        in_image_cur = (
+            (depth_cur > 1e-5) &
+            (proj_cur[:, 0] >= 0) & (proj_cur[:, 0] < w) &
+            (proj_cur[:, 1] >= 0) & (proj_cur[:, 1] < h)
+        )
+        if side_sign < 0:
+            target = mask_left[rows_cur] + SIDE_SDF_CONTAINMENT_MARGIN_PX
+            spill = target - proj_cur[:, 0]
+            outside_side = proj_cur[:, 0] < target
+        else:
+            target = mask_right[rows_cur] - SIDE_SDF_CONTAINMENT_MARGIN_PX
+            spill = target - proj_cur[:, 0]
+            outside_side = proj_cur[:, 0] > target
+
+        valid_target = np.isfinite(target)
+        active = (
+            side_region_mask &
+            (region_weight > 1e-4) &
+            in_image_cur &
+            valid_target &
+            outside_side &
+            ((sdf_cur > 0.25) | (np.abs(spill) > SIDE_SDF_CONTAINMENT_MARGIN_PX))
+        )
+        if active.any():
+            raw = spill[active] * SIDE_SDF_CONTAINMENT_GAIN * region_weight[active]
+            corr_px[active] = np.clip(
+                raw,
+                -SIDE_SDF_CONTAINMENT_MAX_STEP_PX,
+                SIDE_SDF_CONTAINMENT_MAX_STEP_PX,
+            )
+        return corr_px, active
+
+    def build_neighbor_lists(mesh_faces, vertex_count):
+        if mesh_faces is None:
+            return None
+        try:
+            f = np.asarray(mesh_faces, dtype=np.int64).reshape(-1, 3)
+        except Exception:
+            return None
+        if f.size == 0:
+            return None
+        valid_faces = np.all((f >= 0) & (f < vertex_count), axis=1)
+        f = f[valid_faces]
+        if f.size == 0:
+            return None
+        neighbors = [set() for _ in range(vertex_count)]
+        for a, b, c in f:
+            neighbors[a].add(b); neighbors[a].add(c)
+            neighbors[b].add(a); neighbors[b].add(c)
+            neighbors[c].add(a); neighbors[c].add(b)
+        return [np.fromiter(n, dtype=np.int64) if n else np.empty(0, dtype=np.int64) for n in neighbors]
+
+    mesh_neighbors = build_neighbor_lists(faces, v.shape[0])
+
+    def smooth_displacement_over_mesh(dx_region, side_region_mask, region_weight, outer_weight):
+        if mesh_neighbors is None or SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS <= 0:
+            return dx_region.copy(), np.zeros(v.shape[0], dtype=bool)
+        active = side_region_mask & (
+            (region_weight > 1e-4) |
+            (outer_weight > 1e-4) |
+            (np.abs(dx_region) > 1e-6)
+        )
+        source = active & (np.abs(dx_region) > 1e-6)
+        if source.sum() < 8:
+            return dx_region.copy(), np.zeros(v.shape[0], dtype=bool)
+
+        smoothed = dx_region.astype(np.float64).copy()
+        active_idx = np.nonzero(active)[0]
+        for _ in range(int(SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS)):
+            nxt = smoothed.copy()
+            for idx in active_idx:
+                nbr = mesh_neighbors[idx]
+                if nbr.size < 3:
+                    continue
+                nbr = nbr[active[nbr]]
+                if nbr.size < 3:
+                    continue
+                local_weight = max(float(region_weight[idx]), float(outer_weight[idx]) * 0.5)
+                local_alpha = float(SIDE_SDF_DISPLACEMENT_SMOOTH_ALPHA) * np.clip(0.35 + local_weight, 0.35, 1.0)
+                nxt[idx] = (1.0 - local_alpha) * smoothed[idx] + local_alpha * float(np.mean(smoothed[nbr]))
+            smoothed = nxt
+
+        blended = dx_region.copy()
+        changed = active & (np.abs(smoothed - dx_region) > 1e-7)
+        blend = float(SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND)
+        blended[active] = (1.0 - blend) * dx_region[active] + blend * smoothed[active]
+        return blended, changed
+
+    containment_weight_chest = np.maximum(chest_weight, chest_outer_weight * 0.5)
+    containment_weight_butt = np.maximum(butt_weight, butt_outer_weight * 0.5)
+    for _ in range(SIDE_SDF_CONTAINMENT_PASSES):
+        proj_cur, depth_cur = project_vertices_to_image(v, cam_t, float(focal_length), image_shape)
+        sdf_cur = sample_image_bilinear(sdf, proj_cur)
+        du_contain_chest, active_chest = containment_du_for_side(
+            proj_cur,
+            depth_cur,
+            sdf_cur,
+            chest_side_mask,
+            containment_weight_chest,
+            anterior_sign,
+        )
+        du_contain_butt, active_butt = containment_du_for_side(
+            proj_cur,
+            depth_cur,
+            sdf_cur,
+            butt_side_mask,
+            containment_weight_butt,
+            posterior_sign,
+        )
+        du_contain = du_contain_chest + du_contain_butt
+        if not np.any(np.abs(du_contain) > 1e-6):
+            break
+
+        dx_step_chest = du_contain_chest * depth_cur / float(focal_length)
+        dx_step_butt = du_contain_butt * depth_cur / float(focal_length)
+        dx_step = dx_step_chest + dx_step_butt
+        total_before = dx_chest + dx_butt + containment_dx_chest + containment_dx_butt
+        dx_step = np.clip(total_before + dx_step, -max_push_m, max_push_m) - total_before
+
+        requested_step = dx_step_chest + dx_step_butt
+        scale = np.ones(v.shape[0], dtype=np.float64)
+        requested_abs = np.abs(requested_step)
+        nonzero = requested_abs > 1e-8
+        scale[nonzero] = dx_step[nonzero] / requested_step[nonzero]
+        dx_step_chest *= scale
+        dx_step_butt *= scale
+
+        v[:, 0] += dx_step
+        containment_dx_chest += dx_step_chest
+        containment_dx_butt += dx_step_butt
+        containment_active_chest |= active_chest & (np.abs(dx_step_chest) > 1e-8)
+        containment_active_butt |= active_butt & (np.abs(dx_step_butt) > 1e-8)
+
+    dx_chest = dx_chest + containment_dx_chest
+    dx_butt = dx_butt + containment_dx_butt
+    dx = dx_chest + dx_butt
+
+    pre_smooth_dx_chest = dx_chest.copy()
+    pre_smooth_dx_butt = dx_butt.copy()
+    dx_chest_smoothed, chest_smooth_changed = smooth_displacement_over_mesh(
+        dx_chest,
+        chest_side_mask,
+        containment_weight_chest,
+        chest_outer_weight,
+    )
+    dx_butt_smoothed, butt_smooth_changed = smooth_displacement_over_mesh(
+        dx_butt,
+        butt_side_mask,
+        containment_weight_butt,
+        butt_outer_weight,
+    )
+    smooth_delta_chest = dx_chest_smoothed - dx_chest
+    smooth_delta_butt = dx_butt_smoothed - dx_butt
+    smooth_delta = smooth_delta_chest + smooth_delta_butt
+    if np.any(np.abs(smooth_delta) > 1e-8):
+        total_before = dx_chest + dx_butt
+        total_after = np.clip(total_before + smooth_delta, -max_push_m, max_push_m)
+        smooth_delta = total_after - total_before
+        requested = smooth_delta_chest + smooth_delta_butt
+        scale = np.ones(v.shape[0], dtype=np.float64)
+        requested_abs = np.abs(requested)
+        nonzero = requested_abs > 1e-8
+        scale[nonzero] = smooth_delta[nonzero] / requested[nonzero]
+        smooth_delta_chest *= scale
+        smooth_delta_butt *= scale
+        v[:, 0] += smooth_delta
+        dx_chest = dx_chest + smooth_delta_chest
+        dx_butt = dx_butt + smooth_delta_butt
+
+        # Smoothing improves surface quality, then this pulls any newly exposed
+        # silhouette spill back inside the mask contour.
+        for _ in range(SIDE_SDF_CONTAINMENT_PASSES):
+            proj_cur, depth_cur = project_vertices_to_image(v, cam_t, float(focal_length), image_shape)
+            sdf_cur = sample_image_bilinear(sdf, proj_cur)
+            du_contain_chest, active_chest = containment_du_for_side(
+                proj_cur,
+                depth_cur,
+                sdf_cur,
+                chest_side_mask,
+                containment_weight_chest,
+                anterior_sign,
+            )
+            du_contain_butt, active_butt = containment_du_for_side(
+                proj_cur,
+                depth_cur,
+                sdf_cur,
+                butt_side_mask,
+                containment_weight_butt,
+                posterior_sign,
+            )
+            du_contain = du_contain_chest + du_contain_butt
+            if not np.any(np.abs(du_contain) > 1e-6):
+                break
+
+            dx_step_chest = du_contain_chest * depth_cur / float(focal_length)
+            dx_step_butt = du_contain_butt * depth_cur / float(focal_length)
+            dx_step = dx_step_chest + dx_step_butt
+            total_before = dx_chest + dx_butt
+            dx_step = np.clip(total_before + dx_step, -max_push_m, max_push_m) - total_before
+
+            requested_step = dx_step_chest + dx_step_butt
+            scale = np.ones(v.shape[0], dtype=np.float64)
+            requested_abs = np.abs(requested_step)
+            nonzero = requested_abs > 1e-8
+            scale[nonzero] = dx_step[nonzero] / requested_step[nonzero]
+            dx_step_chest *= scale
+            dx_step_butt *= scale
+
+            v[:, 0] += dx_step
+            dx_chest += dx_step_chest
+            dx_butt += dx_step_butt
+            containment_dx_chest += dx_step_chest
+            containment_dx_butt += dx_step_butt
+            containment_active_chest |= active_chest & (np.abs(dx_step_chest) > 1e-8)
+            containment_active_butt |= active_butt & (np.abs(dx_step_butt) > 1e-8)
+
+    displacement_smooth_delta_chest = dx_chest - pre_smooth_dx_chest
+    displacement_smooth_delta_butt = dx_butt - pre_smooth_dx_butt
+    dx = dx_chest + dx_butt
 
     moved = np.abs(dx) > 1e-6
     chest_moved = np.abs(dx_chest) > 1e-6
@@ -976,10 +1309,42 @@ def deform_side_mesh_to_mask_profile(
         "chest_mode": np.array(chest_mode, dtype=object),
         "chest_valid_row_count": np.array(int(chest_valid_row.sum()), dtype=np.int64),
         "butt_valid_row_count": np.array(int(butt_valid_row.sum()), dtype=np.int64),
+        "chest_raw_negative_row_count": np.array(int(np.sum(chest_valid_row & (chest_raw_shift_row < -1e-6))), dtype=np.int64),
+        "chest_raw_positive_row_count": np.array(int(np.sum(chest_valid_row & (chest_raw_shift_row > 1e-6))), dtype=np.int64),
+        "butt_raw_negative_row_count": np.array(int(np.sum(butt_valid_row & (butt_raw_shift_row < -1e-6))), dtype=np.int64),
+        "butt_raw_positive_row_count": np.array(int(np.sum(butt_valid_row & (butt_raw_shift_row > 1e-6))), dtype=np.int64),
+        "chest_smoothed_negative_row_count": np.array(int(np.sum(chest_valid_row & (chest_shift_row < -1e-6))), dtype=np.int64),
+        "chest_smoothed_positive_row_count": np.array(int(np.sum(chest_valid_row & (chest_shift_row > 1e-6))), dtype=np.int64),
+        "butt_smoothed_negative_row_count": np.array(int(np.sum(butt_valid_row & (butt_shift_row < -1e-6))), dtype=np.int64),
+        "butt_smoothed_positive_row_count": np.array(int(np.sum(butt_valid_row & (butt_shift_row > 1e-6))), dtype=np.int64),
+        "chest_shift_sign_flip_row_count": np.array(int(np.sum(chest_shift_sign_flip_row)), dtype=np.int64),
+        "butt_shift_sign_flip_row_count": np.array(int(np.sum(butt_shift_sign_flip_row)), dtype=np.int64),
         "chest_moved_vertex_count": np.array(int(chest_moved.sum()), dtype=np.int64),
         "butt_moved_vertex_count": np.array(int(butt_moved.sum()), dtype=np.int64),
+        "displacement_smooth_enabled": np.array(mesh_neighbors is not None, dtype=bool),
+        "displacement_smooth_iterations": np.array(int(SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS), dtype=np.int64),
+        "displacement_smooth_alpha": np.array(float(SIDE_SDF_DISPLACEMENT_SMOOTH_ALPHA), dtype=np.float64),
+        "displacement_smooth_blend": np.array(float(SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND), dtype=np.float64),
+        "chest_displacement_smooth_vertex_count": np.array(int(chest_smooth_changed.sum()), dtype=np.int64),
+        "butt_displacement_smooth_vertex_count": np.array(int(butt_smooth_changed.sum()), dtype=np.int64),
+        "chest_displacement_smooth_mean_abs_delta_cm": np.array(float(np.mean(np.abs(displacement_smooth_delta_chest[chest_smooth_changed])) * 100.0) if chest_smooth_changed.any() else 0.0, dtype=np.float64),
+        "butt_displacement_smooth_mean_abs_delta_cm": np.array(float(np.mean(np.abs(displacement_smooth_delta_butt[butt_smooth_changed])) * 100.0) if butt_smooth_changed.any() else 0.0, dtype=np.float64),
+        "chest_displacement_smooth_max_abs_delta_cm": np.array(float(np.max(np.abs(displacement_smooth_delta_chest))) * 100.0 if displacement_smooth_delta_chest.size else 0.0, dtype=np.float64),
+        "butt_displacement_smooth_max_abs_delta_cm": np.array(float(np.max(np.abs(displacement_smooth_delta_butt))) * 100.0 if displacement_smooth_delta_butt.size else 0.0, dtype=np.float64),
+        "chest_containment_moved_vertex_count": np.array(int(containment_active_chest.sum()), dtype=np.int64),
+        "butt_containment_moved_vertex_count": np.array(int(containment_active_butt.sum()), dtype=np.int64),
+        "chest_containment_mean_abs_push_cm": np.array(float(np.mean(np.abs(containment_dx_chest[containment_active_chest])) * 100.0) if containment_active_chest.any() else 0.0, dtype=np.float64),
+        "butt_containment_mean_abs_push_cm": np.array(float(np.mean(np.abs(containment_dx_butt[containment_active_butt])) * 100.0) if containment_active_butt.any() else 0.0, dtype=np.float64),
+        "chest_containment_max_abs_push_cm": np.array(float(np.max(np.abs(containment_dx_chest))) * 100.0 if containment_dx_chest.size else 0.0, dtype=np.float64),
+        "butt_containment_max_abs_push_cm": np.array(float(np.max(np.abs(containment_dx_butt))) * 100.0 if containment_dx_butt.size else 0.0, dtype=np.float64),
+        "chest_negative_moved_vertex_count": np.array(int(np.sum(dx_chest < -1e-6)), dtype=np.int64),
+        "chest_positive_moved_vertex_count": np.array(int(np.sum(dx_chest > 1e-6)), dtype=np.int64),
+        "butt_negative_moved_vertex_count": np.array(int(np.sum(dx_butt < -1e-6)), dtype=np.int64),
+        "butt_positive_moved_vertex_count": np.array(int(np.sum(dx_butt > 1e-6)), dtype=np.int64),
         "chest_mean_abs_push_cm": np.array(float(np.mean(np.abs(dx_chest[chest_moved])) * 100.0) if chest_moved.any() else 0.0, dtype=np.float64),
         "butt_mean_abs_push_cm": np.array(float(np.mean(np.abs(dx_butt[butt_moved])) * 100.0) if butt_moved.any() else 0.0, dtype=np.float64),
+        "chest_mean_signed_push_cm": np.array(float(np.mean(dx_chest[chest_moved]) * 100.0) if chest_moved.any() else 0.0, dtype=np.float64),
+        "butt_mean_signed_push_cm": np.array(float(np.mean(dx_butt[butt_moved]) * 100.0) if butt_moved.any() else 0.0, dtype=np.float64),
         "chest_max_abs_push_cm": np.array(float(np.max(np.abs(dx_chest)) * 100.0) if dx_chest.size else 0.0, dtype=np.float64),
         "butt_max_abs_push_cm": np.array(float(np.max(np.abs(dx_butt)) * 100.0) if dx_butt.size else 0.0, dtype=np.float64),
         "mean_abs_push_cm": np.array(float(np.mean(np.abs(dx[moved])) * 100.0) if moved.any() else 0.0, dtype=np.float64),
@@ -1385,8 +1750,8 @@ def main():
     parser.add_argument(
         "--side-sdf-profile-strength",
         type=float,
-        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_STRENGTH", "0.1")),
-        help="Strength for side-mask silhouette expansion in chest/butt bands. Use 0 to disable.",
+        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_STRENGTH", "0.9")),
+        help="Strength for bidirectional side-mask silhouette correction in chest/butt bands. Use 0 to disable.",
     )
     parser.add_argument(
         "--side-sdf-profile-max-push-cm",
@@ -1603,6 +1968,13 @@ def main():
         measurement_anchor_pcts,
         output_dir,
     )
+    side_projection_alignment_debug_path = save_side_projection_alignment_debug(
+        side_mask,
+        side_image_bgr,
+        side_vertices,
+        side_result,
+        output_dir,
+    )
 
     side_vertices, side_sdf_profile_meta = deform_side_mesh_to_mask_profile(
         side_vertices,
@@ -1615,6 +1987,7 @@ def main():
         row_radius=int(args.side_sdf_row_radius),
         chest_mode=str(args.side_sdf_chest_mode),
         chest_lobe_gain=float(args.side_sdf_chest_lobe_gain),
+        faces=estimator.faces,
     )
     side_result["pred_vertices"] = side_vertices.astype(np.float32)
 
@@ -1639,9 +2012,17 @@ def main():
     side_sdf_chest_count = int(np.asarray(side_sdf_profile_meta.get("chest_moved_vertex_count", 0)).item())
     side_sdf_chest_mean_cm = float(np.asarray(side_sdf_profile_meta.get("chest_mean_abs_push_cm", 0.0)).item())
     side_sdf_chest_max_cm = float(np.asarray(side_sdf_profile_meta.get("chest_max_abs_push_cm", 0.0)).item())
+    side_sdf_chest_contain_count = int(np.asarray(side_sdf_profile_meta.get("chest_containment_moved_vertex_count", 0)).item())
+    side_sdf_chest_contain_max_cm = float(np.asarray(side_sdf_profile_meta.get("chest_containment_max_abs_push_cm", 0.0)).item())
+    side_sdf_chest_smooth_count = int(np.asarray(side_sdf_profile_meta.get("chest_displacement_smooth_vertex_count", 0)).item())
+    side_sdf_chest_smooth_max_cm = float(np.asarray(side_sdf_profile_meta.get("chest_displacement_smooth_max_abs_delta_cm", 0.0)).item())
     side_sdf_butt_count = int(np.asarray(side_sdf_profile_meta.get("butt_moved_vertex_count", 0)).item())
     side_sdf_butt_mean_cm = float(np.asarray(side_sdf_profile_meta.get("butt_mean_abs_push_cm", 0.0)).item())
     side_sdf_butt_max_cm = float(np.asarray(side_sdf_profile_meta.get("butt_max_abs_push_cm", 0.0)).item())
+    side_sdf_butt_contain_count = int(np.asarray(side_sdf_profile_meta.get("butt_containment_moved_vertex_count", 0)).item())
+    side_sdf_butt_contain_max_cm = float(np.asarray(side_sdf_profile_meta.get("butt_containment_max_abs_push_cm", 0.0)).item())
+    side_sdf_butt_smooth_count = int(np.asarray(side_sdf_profile_meta.get("butt_displacement_smooth_vertex_count", 0)).item())
+    side_sdf_butt_smooth_max_cm = float(np.asarray(side_sdf_profile_meta.get("butt_displacement_smooth_max_abs_delta_cm", 0.0)).item())
 
     print("\nSide SDF/profile correction:")
     print(f"  chest mode          : {side_sdf_chest_mode}")
@@ -1650,7 +2031,11 @@ def main():
     print(f"  mean abs push       : {side_sdf_mean_push_cm:.4f} cm")
     print(f"  max abs push        : {side_sdf_max_push_cm:.4f} cm")
     print(f"  chest moved/max     : {side_sdf_chest_count} / {side_sdf_chest_max_cm:.4f} cm mean {side_sdf_chest_mean_cm:.4f} cm")
+    print(f"  chest smooth/max    : {side_sdf_chest_smooth_count} / {side_sdf_chest_smooth_max_cm:.4f} cm")
+    print(f"  chest contain/max   : {side_sdf_chest_contain_count} / {side_sdf_chest_contain_max_cm:.4f} cm")
     print(f"  butt moved/max      : {side_sdf_butt_count} / {side_sdf_butt_max_cm:.4f} cm mean {side_sdf_butt_mean_cm:.4f} cm")
+    print(f"  butt smooth/max     : {side_sdf_butt_smooth_count} / {side_sdf_butt_smooth_max_cm:.4f} cm")
+    print(f"  butt contain/max    : {side_sdf_butt_contain_count} / {side_sdf_butt_contain_max_cm:.4f} cm")
 
     # ---- orient both meshes into canonical upright space ----
     front_oriented = center_and_orient_mesh(front_vertices)
@@ -1741,6 +2126,8 @@ def main():
         fused_result_scaled["fusion_side_sdf_visualization_path"] = np.array(side_sdf_vis_path, dtype=object)
     if side_anchor_debug_mask_path:
         fused_result_scaled["fusion_side_anchor_debug_mask_path"] = np.array(side_anchor_debug_mask_path, dtype=object)
+    if side_projection_alignment_debug_path:
+        fused_result_scaled["fusion_side_projection_alignment_debug_path"] = np.array(side_projection_alignment_debug_path, dtype=object)
     if side_sdf_edited_obj:
         fused_result_scaled["fusion_side_sdf_edited_obj_path"] = np.array(side_sdf_edited_obj, dtype=object)
     if side_sdf_edited_render:
@@ -1796,6 +2183,8 @@ def main():
         print(f"Saved side SDF visualization: {side_sdf_vis_path}")
     if side_anchor_debug_mask_path:
         print(f"Saved side anchor debug mask: {side_anchor_debug_mask_path}")
+    if side_projection_alignment_debug_path:
+        print(f"Saved side projection debug  : {side_projection_alignment_debug_path}")
     if side_sdf_edited_obj:
         print(f"Saved side edited OBJ       : {side_sdf_edited_obj}")
     for key, value in side_anchor_paths.items():
