@@ -324,15 +324,24 @@ def _smooth_band_weight(height_pct, center, half_width):
 SIDE_SDF_BAND_HALF_WIDTH = 0.02953125
 SIDE_SDF_BAND_FEATHER_WIDTH = SIDE_SDF_BAND_HALF_WIDTH
 SIDE_SDF_BAND_CORE_WEIGHT = 1.0
-SIDE_SDF_OUTER_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 0.8
-SIDE_SDF_OUTER_SMOOTH_GAIN = 0.25
+SIDE_SDF_OUTER_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 1.45
+SIDE_SDF_OUTER_SMOOTH_GAIN = 0.38
 SIDE_SDF_CONTAINMENT_PASSES = 5
 SIDE_SDF_CONTAINMENT_GAIN = 1.0
 SIDE_SDF_CONTAINMENT_MARGIN_PX = 4.0
 SIDE_SDF_CONTAINMENT_MAX_STEP_PX = 24.0
-SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS = 8
-SIDE_SDF_DISPLACEMENT_SMOOTH_ALPHA = 0.45
-SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND = 0.70
+SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS = 16
+SIDE_SDF_DISPLACEMENT_SMOOTH_ALPHA = 0.36
+SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND = 0.86
+SIDE_SDF_EDGE_HEIGHT_SMOOTH_BINS = 220
+SIDE_SDF_EDGE_HEIGHT_SMOOTH_RADIUS_BINS = 9
+SIDE_SDF_EDGE_HEIGHT_SMOOTH_BLEND = 0.58
+SIDE_SDF_SOLVE_DATA_WEIGHT = 36.0
+SIDE_SDF_SOLVE_PIN_WEIGHT = 4.5
+SIDE_SDF_SOLVE_SMOOTH_LAMBDA = 6.5
+SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH
+SIDE_SDF_SOLVE_SIDE_PIN_SCALE = 0.35
+SIDE_SDF_SOLVE_MIN_DIAGONAL = 1e-6
 
 
 def _flat_band_with_feather(height_pct, center, half_width, feather_width):
@@ -764,8 +773,6 @@ def row_bounds_from_mask(mask, row_radius=4):
             left[y] = float(xs.min())
             right[y] = float(xs.max())
     return left, right
-
-
 def required_anchor_pct(anchor_pcts, key):
     try:
         value = float((anchor_pcts or {})[key])
@@ -863,6 +870,204 @@ def compute_torso_core_mask(vertices, side_result):
         }
 
 
+def save_side_sdf_row_debug(
+    side_mask,
+    side_image_bgr,
+    vertices,
+    side_result,
+    anchor_pcts,
+    output_dir,
+    out_name="side_sdf_profile_row_debug.png",
+    row_radius=4,
+):
+    """Save a row-wise side-profile residual diagnostic for the edited mesh."""
+    if side_mask is None or side_image_bgr is None:
+        return None
+
+    focal_length = side_result.get("focal_length") if isinstance(side_result, dict) else None
+    cam_t = side_result.get("pred_cam_t") if isinstance(side_result, dict) else None
+    if focal_length is None or cam_t is None:
+        return None
+
+    h, w = side_mask.shape[:2]
+    image = side_image_bgr
+    if image.shape[:2] != (h, w):
+        image = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
+
+    overlay = image.copy()
+    mask_tint = overlay.copy()
+    mask_tint[side_mask] = (
+        0.45 * mask_tint[side_mask].astype(np.float32) +
+        0.55 * np.array([40.0, 190.0, 80.0], dtype=np.float32)
+    ).astype(np.uint8)
+    overlay = cv2.addWeighted(mask_tint, 0.55, overlay, 0.45, 0.0)
+
+    mask_u8 = side_mask.astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (0, 0, 255), 2, cv2.LINE_AA)
+
+    v = vertices.astype(np.float64)
+    proj, depth = project_vertices_to_image(v, cam_t, float(focal_length), (h, w))
+    in_image = (
+        (depth > 1e-5) &
+        (proj[:, 0] >= 0) & (proj[:, 0] < w) &
+        (proj[:, 1] >= 0) & (proj[:, 1] < h)
+    )
+    if not np.any(in_image):
+        return None
+
+    up_dir = estimate_up_direction_from_mesh(v)
+    height_coord = v @ up_dir
+    height_min = float(height_coord.min())
+    height_span = float(height_coord.max() - height_min)
+    if height_span <= 1e-8:
+        return None
+    pct = (height_coord - height_min) / height_span
+
+    try:
+        chest_center = required_anchor_pct(anchor_pcts, "chest")
+        butt_center = required_anchor_pct(anchor_pcts, "butt")
+    except Exception:
+        return None
+
+    torso_core, _ = compute_torso_core_mask(v, side_result)
+    debug_band_half_width = SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH
+    chest_height_weight = (np.abs(pct - chest_center) <= debug_band_half_width).astype(np.float64)
+    butt_height_weight = (np.abs(pct - butt_center) <= debug_band_half_width).astype(np.float64)
+    selected = in_image & torso_core & ((chest_height_weight > 1e-4) | (butt_height_weight > 1e-4))
+    if not selected.any():
+        return None
+
+    rows = np.clip(np.rint(proj[:, 1]).astype(np.int32), 0, h - 1)
+    row_left = np.full(h, np.nan, dtype=np.float64)
+    row_right = np.full(h, np.nan, dtype=np.float64)
+    row_min = np.full(h, np.nan, dtype=np.float64)
+    row_max = np.full(h, np.nan, dtype=np.float64)
+    row_center = np.full(h, np.nan, dtype=np.float64)
+    row_half = np.full(h, np.nan, dtype=np.float64)
+    for y in range(h):
+        near = selected & (np.abs(rows - y) <= int(row_radius))
+        if near.any():
+            xs = proj[near, 0]
+            row_left[y] = float(np.quantile(xs, 0.03))
+            row_right[y] = float(np.quantile(xs, 0.97))
+            row_min[y] = float(np.min(xs))
+            row_max[y] = float(np.max(xs))
+            row_center[y] = 0.5 * (row_left[y] + row_right[y])
+            row_half[y] = max(1.0, 0.5 * (row_right[y] - row_left[y]))
+
+    mask_left, mask_right = row_bounds_from_mask(side_mask, row_radius=row_radius)
+    sdf = mask_to_sdf(side_mask)
+    anterior_sign, _ = infer_side_anterior_sign(side_result, (h, w))
+    posterior_sign = -int(anterior_sign)
+
+    row_center_at_vertex = row_center[rows]
+    row_half_at_vertex = row_half[rows]
+    valid_profile_row = np.isfinite(row_center_at_vertex) & np.isfinite(row_half_at_vertex) & (row_half_at_vertex > 1e-6)
+    signed_side_all = np.zeros(v.shape[0], dtype=np.float64)
+    signed_side_all[valid_profile_row] = (
+        proj[valid_profile_row, 0] - row_center_at_vertex[valid_profile_row]
+    ) / row_half_at_vertex[valid_profile_row]
+    chest_side_mask = in_image & torso_core & valid_profile_row & (chest_height_weight > 1e-4) & ((anterior_sign * signed_side_all) > 0.02)
+    butt_side_mask = in_image & torso_core & valid_profile_row & (butt_height_weight > 1e-4) & ((posterior_sign * signed_side_all) > 0.02)
+
+    points = np.rint(proj[in_image]).astype(np.int32)
+    if points.shape[0] > 0:
+        step = max(1, points.shape[0] // 3000)
+        sampled = points[::step]
+        overlay[sampled[:, 1], sampled[:, 0]] = (255, 230, 0)
+
+    chart_w = 260
+    canvas = np.full((h, w + chart_w, 3), 245, dtype=np.uint8)
+    canvas[:, :w] = overlay
+    chart_x0 = w + 12
+    chart_center = w + chart_w // 2
+    cv2.line(canvas, (chart_center, 0), (chart_center, h - 1), (150, 150, 150), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "row residual px", (chart_x0, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (60, 60, 60), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "right=needs outward", (chart_x0, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (60, 60, 60), 1, cv2.LINE_AA)
+
+    def band_rows(center):
+        near = in_image & (np.abs(pct - center) <= debug_band_half_width)
+        if near.sum() < 4:
+            return None
+        ys = proj[near, 1]
+        return int(np.clip(np.nanmin(ys), 0, h - 1)), int(np.clip(np.nanmax(ys), 0, h - 1))
+
+    for center, color in ((chest_center, (0, 120, 255)), (butt_center, (255, 120, 0))):
+        br = band_rows(center)
+        if br is None:
+            continue
+        y0, y1 = br
+        band = canvas.copy()
+        cv2.rectangle(band, (0, y0), (w + chart_w - 1, y1), color, -1)
+        canvas[:] = cv2.addWeighted(band, 0.08, canvas, 0.92, 0.0)
+        cv2.line(canvas, (0, y0), (w + chart_w - 1, y0), color, 1, cv2.LINE_AA)
+        cv2.line(canvas, (0, y1), (w + chart_w - 1, y1), color, 1, cv2.LINE_AA)
+
+    def draw_region(region_mask, side_sign, base_color):
+        for y in range(0, h, 2):
+            near = region_mask & (np.abs(rows - y) <= int(row_radius))
+            if not near.any():
+                continue
+            if not (np.isfinite(mask_left[y]) and np.isfinite(mask_right[y]) and np.isfinite(row_left[y]) and np.isfinite(row_right[y])):
+                continue
+            if side_sign < 0:
+                mesh_edge = row_left[y]
+                raw_edge = row_min[y]
+                mask_edge = mask_left[y]
+            else:
+                mesh_edge = row_right[y]
+                raw_edge = row_max[y]
+                mask_edge = mask_right[y]
+            if not (np.isfinite(mesh_edge) and np.isfinite(mask_edge)):
+                continue
+
+            signed_gap = (mask_edge - mesh_edge) * float(side_sign)
+            sample_xy = np.array([[mesh_edge, float(y)]], dtype=np.float64)
+            sdf_at_edge = float(sample_image_bilinear(sdf, sample_xy)[0])
+            abs_gap = abs(signed_gap)
+            if abs_gap <= 2.0:
+                color = (60, 210, 80)
+            elif signed_gap > 0.0:
+                color = (255, 0, 255)
+            else:
+                color = (255, 120, 30)
+            thickness = int(np.clip(round(abs_gap / 8.0) + 1, 1, 5))
+
+            x0 = int(np.clip(round(mesh_edge), 0, w - 1))
+            x1 = int(np.clip(round(mask_edge), 0, w - 1))
+            cv2.line(canvas, (x0, y), (x1, y), color, thickness, cv2.LINE_AA)
+            cv2.circle(canvas, (x0, y), 1, (255, 255, 0), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (x1, y), 1, (0, 0, 255), -1, cv2.LINE_AA)
+            if np.isfinite(raw_edge):
+                xr = int(np.clip(round(raw_edge), 0, w - 1))
+                cv2.circle(canvas, (xr, y), 1, (180, 180, 180), -1, cv2.LINE_AA)
+
+            bar = int(np.clip(round(signed_gap * 2.0), -110, 110))
+            chart_color = color if abs(sdf_at_edge) > 2.0 else (60, 210, 80)
+            cv2.line(canvas, (chart_center, y), (chart_center + bar, y), chart_color, thickness, cv2.LINE_AA)
+
+    draw_region(chest_side_mask, int(anterior_sign), (0, 120, 255))
+    draw_region(butt_side_mask, int(posterior_sign), (255, 120, 0))
+
+    legend_y = max(66, min(h - 92, 66))
+    legend = [
+        ("red dot/contour: mask edge", (0, 0, 255)),
+        ("cyan dot: solver mesh row edge", (255, 255, 0)),
+        ("gray dot: raw mesh min/max edge", (180, 180, 180)),
+        ("magenta bar: underfit, mask farther out", (255, 0, 255)),
+        ("orange bar: overshoot, mesh outside mask", (255, 120, 30)),
+        ("green bar: within 2 px", (60, 210, 80)),
+    ]
+    for i, (text, color) in enumerate(legend):
+        y = legend_y + i * 19
+        cv2.putText(canvas, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+    out_path = os.path.join(output_dir, out_name)
+    cv2.imwrite(out_path, canvas)
+    return out_path
+
+
 def deform_side_mesh_to_mask_profile(
     vertices,
     side_result,
@@ -876,9 +1081,13 @@ def deform_side_mesh_to_mask_profile(
     chest_lobe_gain=2.4,
     faces=None,
 ):
-    """Smoothly move chest/front and butt/back side-profile lobes toward the mask."""
-    # Keep the old option accepted, but use the same row-edge SDF rule for
-    # chest that butt uses.
+    """Smoothly move chest/front and butt/back side-profile bands toward the mask.
+
+    Chest and butt intentionally share the same row-edge SDF algorithm.  The
+    chest-specific options are accepted for old commands but do not alter the
+    correction path.
+    """
+    _ = chest_lobe_gain
     chest_mode = "row_sdf"
     meta = {
         "enabled": np.array(False),
@@ -946,7 +1155,6 @@ def deform_side_mesh_to_mask_profile(
     anterior_sign, anterior_source = infer_side_anterior_sign(side_result, image_shape)
     posterior_sign = -int(anterior_sign)
     rows = np.clip(np.rint(proj[:, 1]).astype(np.int32), 0, h - 1)
-    mask_left, mask_right = row_bounds_from_mask(side_mask, row_radius=row_radius)
 
     row_center = np.full(h, np.nan, dtype=np.float64)
     row_half = np.full(h, np.nan, dtype=np.float64)
@@ -959,6 +1167,8 @@ def deform_side_mesh_to_mask_profile(
             row_right[y] = float(np.quantile(proj[near, 0], 0.97))
             row_center[y] = 0.5 * (row_left[y] + row_right[y])
             row_half[y] = max(1.0, 0.5 * (row_right[y] - row_left[y]))
+
+    mask_left, mask_right = row_bounds_from_mask(side_mask, row_radius=row_radius)
 
     row_center_at_vertex = row_center[rows]
     row_half_at_vertex = row_half[rows]
@@ -1000,8 +1210,25 @@ def deform_side_mesh_to_mask_profile(
 
     max_push_m = max(0.0, float(max_push_cm)) / 100.0
     max_push_px = np.maximum(1.0, max_push_m * float(focal_length) / np.maximum(depth, 1e-5))
-    du_chest = np.zeros(v.shape[0], dtype=np.float64)
-    du_butt = np.zeros(v.shape[0], dtype=np.float64)
+    profile_fit_half_width = SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH
+    chest_height_weight = (np.abs(pct - chest_center) <= profile_fit_half_width).astype(np.float64)
+    butt_height_weight = (np.abs(pct - butt_center) <= profile_fit_half_width).astype(np.float64)
+    chest_support_weight = _flat_band_with_feather(
+        pct,
+        chest_center,
+        SIDE_SDF_BAND_HALF_WIDTH,
+        SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH,
+    )
+    butt_support_weight = _flat_band_with_feather(
+        pct,
+        butt_center,
+        SIDE_SDF_BAND_HALF_WIDTH,
+        SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH,
+    )
+    chest_side_strength = np.clip((anterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
+    butt_side_strength = np.clip((posterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
+    target_dx_chest = np.zeros(v.shape[0], dtype=np.float64)
+    target_dx_butt = np.zeros(v.shape[0], dtype=np.float64)
 
     for idx in np.nonzero(selected)[0]:
         y = rows[idx]
@@ -1009,59 +1236,137 @@ def deform_side_mesh_to_mask_profile(
         half = row_half[y]
         if not (np.isfinite(center) and np.isfinite(half)):
             continue
-        signed_side = signed_side_all[idx]
 
-        # Build at most one edit per vertex. Within a selected row/side, every
-        # vertex receives the same row shift instead of a per-vertex ramp.
+        # Build at most one target per vertex. All vertices inside the active
+        # band get equal data weight; only the outside support zone fades.
         candidates = []
 
-        chest_side = anterior_sign * signed_side
-        if chest_weight[idx] > 1e-4 and chest_side > 0.02:
-            raw = chest_shift_row[y] * float(strength) * float(chest_weight[idx])
-            candidates.append((abs(raw), "chest", raw))
+        if chest_height_weight[idx] > 1e-4 and chest_side_strength[idx] > 1e-4 and chest_valid_row[y]:
+            raw_px = chest_shift_row[y] * float(strength)
+            raw_px = float(np.clip(raw_px, -max_push_px[idx], max_push_px[idx]))
+            raw_m = raw_px * depth[idx] / float(focal_length)
+            candidates.append((abs(raw_m), "chest", raw_m))
 
-        butt_side = posterior_sign * signed_side
-        if butt_weight[idx] > 1e-4 and butt_side > 0.02:
-            raw = butt_shift_row[y] * float(strength) * float(butt_weight[idx])
-            candidates.append((abs(raw), "butt", raw))
+        if butt_height_weight[idx] > 1e-4 and butt_side_strength[idx] > 1e-4 and butt_valid_row[y]:
+            raw_px = butt_shift_row[y] * float(strength)
+            raw_px = float(np.clip(raw_px, -max_push_px[idx], max_push_px[idx]))
+            raw_m = raw_px * depth[idx] / float(focal_length)
+            candidates.append((abs(raw_m), "butt", raw_m))
 
         if not candidates:
             continue
 
-        _, region_name, raw = max(candidates, key=lambda item: item[0])
-        clipped = float(np.clip(raw, -max_push_px[idx], max_push_px[idx]))
+        _, region_name, raw_m = max(candidates, key=lambda item: item[0])
         if region_name == "chest":
-            du_chest[idx] = clipped
+            target_dx_chest[idx] = raw_m
         else:
-            du_butt[idx] = clipped
+            target_dx_butt[idx] = raw_m
 
-    def smooth_vertex_du(du_region, region_weight, outer_weight, side_mask, outer_width):
-        if not np.any(np.abs(du_region) > 1e-6):
-            return du_region
-        bins = np.floor(pct * 180).astype(np.int32)
-        smoothed = du_region.copy()
-        movable = np.abs(du_region) > 1e-6
-        outside = side_mask & (outer_weight > 1e-4) & ~movable
+    def build_neighbor_lists(mesh_faces, vertex_count):
+        if mesh_faces is None:
+            return None
+        try:
+            f = np.asarray(mesh_faces, dtype=np.int64).reshape(-1, 3)
+        except Exception:
+            return None
+        if f.size == 0:
+            return None
+        valid_faces = np.all((f >= 0) & (f < vertex_count), axis=1)
+        f = f[valid_faces]
+        if f.size == 0:
+            return None
+        neighbors = [set() for _ in range(vertex_count)]
+        for a, b, c in f:
+            neighbors[a].add(b); neighbors[a].add(c)
+            neighbors[b].add(a); neighbors[b].add(c)
+            neighbors[c].add(a); neighbors[c].add(b)
+        return [np.fromiter(n, dtype=np.int64) if n else np.empty(0, dtype=np.int64) for n in neighbors]
 
-        outer_radius_bins = max(2, int(np.ceil(float(outer_width) * 180.0)) + 2)
-        for bin_id in np.unique(bins[outside]) if outside.any() else []:
-            active = outside & (bins == bin_id)
-            source = movable & (np.abs(bins - bin_id) <= outer_radius_bins)
-            if active.sum() >= 1 and source.sum() >= 6:
-                blend = float(np.median(du_region[source]))
-                raw = blend * SIDE_SDF_OUTER_SMOOTH_GAIN * outer_weight[active]
-                smoothed[active] = np.clip(raw, -max_push_px[active], max_push_px[active])
-        return smoothed
+    mesh_neighbors = build_neighbor_lists(faces, v.shape[0])
+    solve_reason = "ok"
 
-    # Keep in-band vertices on target and add smoothing only outside the active band.
-    du_chest = smooth_vertex_du(du_chest, chest_weight, chest_outer_weight, chest_side_mask, chest_outer_smooth_width)
-    du_butt = smooth_vertex_du(du_butt, butt_weight, butt_outer_weight, butt_side_mask, butt_outer_smooth_width)
-    du = du_chest + du_butt
+    def solve_weighted_displacement(target_dx, height_weight, support_weight, side_strength):
+        nonlocal solve_reason
+        target_dx = np.asarray(target_dx, dtype=np.float64)
+        target_mask = np.abs(target_dx) > 1e-8
+        if target_mask.sum() < 8 or mesh_neighbors is None:
+            solve_reason = "fallback_no_targets_or_faces"
+            return np.clip(target_dx, -max_push_m, max_push_m), target_mask.copy()
 
-    dx_chest = du_chest * depth / float(focal_length)
-    dx_butt = du_butt * depth / float(focal_length)
-    dx = du * depth / float(focal_length)
-    dx = np.clip(dx, -max_push_m, max_push_m)
+        data_weight = (
+            float(SIDE_SDF_SOLVE_DATA_WEIGHT) *
+            np.asarray(height_weight, dtype=np.float64) *
+            target_mask.astype(np.float64)
+        )
+        support_weight = np.asarray(support_weight, dtype=np.float64)
+        pin_weight = float(SIDE_SDF_SOLVE_PIN_WEIGHT) * (
+            (1.0 - support_weight) ** 2.0 +
+            float(SIDE_SDF_SOLVE_SIDE_PIN_SCALE) * support_weight *
+            (1.0 - np.asarray(side_strength, dtype=np.float64)) ** 2.0
+        )
+        if float(data_weight.sum()) <= 1e-8:
+            solve_reason = "fallback_zero_data_weight"
+            return np.clip(target_dx, -max_push_m, max_push_m), target_mask.copy()
+        try:
+            from scipy import sparse
+            from scipy.sparse.linalg import spsolve
+        except Exception as e:
+            solve_reason = f"fallback_missing_scipy:{e}"
+            return np.clip(target_dx, -max_push_m, max_push_m), target_mask.copy()
+
+        n = v.shape[0]
+        rows_l = []
+        cols_l = []
+        data_l = []
+        degree = np.zeros(n, dtype=np.float64)
+        for i, nbrs in enumerate(mesh_neighbors):
+            for j in nbrs:
+                if i >= int(j):
+                    continue
+                j = int(j)
+                degree[i] += 1.0
+                degree[j] += 1.0
+                rows_l.extend([i, j])
+                cols_l.extend([j, i])
+                data_l.extend([-1.0, -1.0])
+        rows_l.extend(range(n))
+        cols_l.extend(range(n))
+        data_l.extend(degree.tolist())
+        laplacian = sparse.csr_matrix((data_l, (rows_l, cols_l)), shape=(n, n))
+        diagonal = data_weight + pin_weight + float(SIDE_SDF_SOLVE_MIN_DIAGONAL)
+        system = sparse.diags(diagonal, format="csr") + float(SIDE_SDF_SOLVE_SMOOTH_LAMBDA) * laplacian
+        rhs = data_weight * target_dx
+        try:
+            solved = np.asarray(spsolve(system, rhs), dtype=np.float64)
+        except Exception as e:
+            solve_reason = f"fallback_solve_failed:{e}"
+            return np.clip(target_dx, -max_push_m, max_push_m), target_mask.copy()
+        if not np.isfinite(solved).all():
+            solve_reason = "fallback_nonfinite_solution"
+            return np.clip(target_dx, -max_push_m, max_push_m), target_mask.copy()
+        changed = np.abs(solved - target_dx) > 1e-7
+        return np.clip(solved, -max_push_m, max_push_m), changed
+
+    dx_chest, chest_solve_changed = solve_weighted_displacement(
+        target_dx_chest,
+        chest_height_weight,
+        chest_support_weight,
+        chest_side_strength,
+    )
+    dx_butt, butt_solve_changed = solve_weighted_displacement(
+        target_dx_butt,
+        butt_height_weight,
+        butt_support_weight,
+        butt_side_strength,
+    )
+    dx = dx_chest + dx_butt
+    dx_clipped = np.clip(dx, -max_push_m, max_push_m)
+    scale = np.ones(v.shape[0], dtype=np.float64)
+    nonzero = np.abs(dx) > 1e-8
+    scale[nonzero] = dx_clipped[nonzero] / dx[nonzero]
+    dx_chest *= scale
+    dx_butt *= scale
+    dx = dx_clipped
     v[:, 0] += dx
 
     containment_dx_chest = np.zeros(v.shape[0], dtype=np.float64)
@@ -1104,28 +1409,6 @@ def deform_side_mesh_to_mask_profile(
             )
         return corr_px, active
 
-    def build_neighbor_lists(mesh_faces, vertex_count):
-        if mesh_faces is None:
-            return None
-        try:
-            f = np.asarray(mesh_faces, dtype=np.int64).reshape(-1, 3)
-        except Exception:
-            return None
-        if f.size == 0:
-            return None
-        valid_faces = np.all((f >= 0) & (f < vertex_count), axis=1)
-        f = f[valid_faces]
-        if f.size == 0:
-            return None
-        neighbors = [set() for _ in range(vertex_count)]
-        for a, b, c in f:
-            neighbors[a].add(b); neighbors[a].add(c)
-            neighbors[b].add(a); neighbors[b].add(c)
-            neighbors[c].add(a); neighbors[c].add(b)
-        return [np.fromiter(n, dtype=np.int64) if n else np.empty(0, dtype=np.int64) for n in neighbors]
-
-    mesh_neighbors = build_neighbor_lists(faces, v.shape[0])
-
     def smooth_displacement_over_mesh(dx_region, side_region_mask, region_weight, outer_weight):
         if mesh_neighbors is None or SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS <= 0:
             return dx_region.copy(), np.zeros(v.shape[0], dtype=bool)
@@ -1159,6 +1442,39 @@ def deform_side_mesh_to_mask_profile(
         blend = float(SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND)
         blended[active] = (1.0 - blend) * dx_region[active] + blend * smoothed[active]
         return blended, changed
+
+    def smooth_displacement_over_height(dx_region, side_region_mask, region_weight, outer_weight):
+        active = side_region_mask & (
+            (region_weight > 1e-4) |
+            (outer_weight > 1e-4) |
+            (np.abs(dx_region) > 1e-6)
+        )
+        if active.sum() < 8:
+            return dx_region.copy(), np.zeros(v.shape[0], dtype=bool)
+
+        transition = np.clip(1.0 - np.abs((region_weight * 2.0) - 1.0), 0.0, 1.0)
+        edge_weight = np.maximum(transition, outer_weight)
+        edge = active & (edge_weight > 1e-4)
+        source = active & (np.abs(dx_region) > 1e-6)
+        if edge.sum() < 4 or source.sum() < 8:
+            return dx_region.copy(), np.zeros(v.shape[0], dtype=bool)
+
+        bin_count = int(SIDE_SDF_EDGE_HEIGHT_SMOOTH_BINS)
+        bins = np.clip(np.floor(pct * bin_count).astype(np.int32), 0, bin_count - 1)
+        radius = int(SIDE_SDF_EDGE_HEIGHT_SMOOTH_RADIUS_BINS)
+        smoothed = dx_region.astype(np.float64).copy()
+
+        for bin_id in np.unique(bins[edge]):
+            active_bin = edge & (bins == bin_id)
+            source_bin = source & (np.abs(bins - bin_id) <= radius)
+            if active_bin.sum() < 1 or source_bin.sum() < 6:
+                continue
+            target = float(np.median(dx_region[source_bin]))
+            blend = float(SIDE_SDF_EDGE_HEIGHT_SMOOTH_BLEND) * edge_weight[active_bin]
+            smoothed[active_bin] = (1.0 - blend) * dx_region[active_bin] + blend * target
+
+        changed = edge & (np.abs(smoothed - dx_region) > 1e-7)
+        return smoothed, changed
 
     containment_weight_chest = np.maximum(chest_weight, chest_outer_weight * 0.5)
     containment_weight_butt = np.maximum(butt_weight, butt_outer_weight * 0.5)
@@ -1217,12 +1533,26 @@ def deform_side_mesh_to_mask_profile(
         containment_weight_chest,
         chest_outer_weight,
     )
+    dx_chest_smoothed, chest_edge_smooth_changed = smooth_displacement_over_height(
+        dx_chest_smoothed,
+        chest_side_mask,
+        containment_weight_chest,
+        chest_outer_weight,
+    )
+    chest_smooth_changed = chest_smooth_changed | chest_edge_smooth_changed
     dx_butt_smoothed, butt_smooth_changed = smooth_displacement_over_mesh(
         dx_butt,
         butt_side_mask,
         containment_weight_butt,
         butt_outer_weight,
     )
+    dx_butt_smoothed, butt_edge_smooth_changed = smooth_displacement_over_height(
+        dx_butt_smoothed,
+        butt_side_mask,
+        containment_weight_butt,
+        butt_outer_weight,
+    )
+    butt_smooth_changed = butt_smooth_changed | butt_edge_smooth_changed
     smooth_delta_chest = dx_chest_smoothed - dx_chest
     smooth_delta_butt = dx_butt_smoothed - dx_butt
     smooth_delta = smooth_delta_chest + smooth_delta_butt
@@ -1307,6 +1637,16 @@ def deform_side_mesh_to_mask_profile(
         "torso_core_threshold_m": torso_core_meta.get("threshold_m", np.array(0.0, dtype=np.float64)),
         "torso_core_vertex_count": torso_core_meta.get("vertex_count", np.array(int(torso_core.sum()), dtype=np.int64)),
         "chest_mode": np.array(chest_mode, dtype=object),
+        "profile_fit_half_width_pct": np.array(float(profile_fit_half_width * 100.0), dtype=np.float64),
+        "profile_fit_matches_anchor_debug_band": np.array(True, dtype=bool),
+        "solve_reason": np.array(solve_reason, dtype=object),
+        "solve_data_weight": np.array(float(SIDE_SDF_SOLVE_DATA_WEIGHT), dtype=np.float64),
+        "solve_pin_weight": np.array(float(SIDE_SDF_SOLVE_PIN_WEIGHT), dtype=np.float64),
+        "solve_smooth_lambda": np.array(float(SIDE_SDF_SOLVE_SMOOTH_LAMBDA), dtype=np.float64),
+        "solve_outside_smooth_width_pct": np.array(float(SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH * 100.0), dtype=np.float64),
+        "solve_side_pin_scale": np.array(float(SIDE_SDF_SOLVE_SIDE_PIN_SCALE), dtype=np.float64),
+        "chest_solve_changed_vertex_count": np.array(int(chest_solve_changed.sum()), dtype=np.int64),
+        "butt_solve_changed_vertex_count": np.array(int(butt_solve_changed.sum()), dtype=np.int64),
         "chest_valid_row_count": np.array(int(chest_valid_row.sum()), dtype=np.int64),
         "butt_valid_row_count": np.array(int(butt_valid_row.sum()), dtype=np.int64),
         "chest_raw_negative_row_count": np.array(int(np.sum(chest_valid_row & (chest_raw_shift_row < -1e-6))), dtype=np.int64),
@@ -1544,6 +1884,7 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         side_anchor_params["fusion_prefer_vertices_for_clad"] = np.array(True)
         side_anchor_params["fusion_rule"] = np.array("side_untouched_clad_anchor_mesh", dtype=object)
         side_anchor_params["fusion_vertices_clad"] = side_clad_vertices.astype(np.float32)
+        side_anchor_params["fusion_faces_clad"] = np.asarray(faces, dtype=np.int32)
         side_anchor_params["fusion_vertices_clad_coordinate_system"] = np.array(
             "x_lateral_y_profile_z_up_meters",
             dtype=object,
@@ -1756,7 +2097,7 @@ def main():
     parser.add_argument(
         "--side-sdf-profile-max-push-cm",
         type=float,
-        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM", "15.0")),
+        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM", "25.0")),
         help="Maximum side-profile displacement per vertex, in centimeters.",
     )
     parser.add_argument(
@@ -1993,6 +2334,7 @@ def main():
 
     side_sdf_edited_obj = None
     side_sdf_edited_render = None
+    side_sdf_row_debug_path = None
     if bool(np.asarray(side_sdf_profile_meta.get("enabled", False)).item()):
         side_sdf_edited_obj = os.path.join(output_dir, "side_sdf_profile_edited.obj")
         save_mesh_obj(side_vertices, estimator.faces, side_sdf_edited_obj)
@@ -2002,6 +2344,15 @@ def main():
             estimator.faces,
             output_dir,
             "side_sdf_profile_edited.jpg",
+        )
+        side_sdf_row_debug_path = save_side_sdf_row_debug(
+            side_mask,
+            side_image_bgr,
+            side_vertices,
+            side_result,
+            measurement_anchor_pcts,
+            output_dir,
+            row_radius=int(args.side_sdf_row_radius),
         )
 
     side_sdf_reason = np.asarray(side_sdf_profile_meta.get("reason", "unknown")).item()
@@ -2132,6 +2483,8 @@ def main():
         fused_result_scaled["fusion_side_sdf_edited_obj_path"] = np.array(side_sdf_edited_obj, dtype=object)
     if side_sdf_edited_render:
         fused_result_scaled["fusion_side_sdf_edited_render_path"] = np.array(side_sdf_edited_render, dtype=object)
+    if side_sdf_row_debug_path:
+        fused_result_scaled["fusion_side_sdf_profile_row_debug_path"] = np.array(side_sdf_row_debug_path, dtype=object)
 
     fused_clad_vertices = sam_upright_vertices_to_clad_canonical(fused_vertices_scaled)
     fused_clad_obj = os.path.join(output_dir, "front_fused_clad_geometry.obj")
@@ -2140,6 +2493,7 @@ def main():
         bool(args.no_fused_vertex_override and float(args.profile_depth_correction_strength) > 0.0),
     )
     fused_result_scaled["fusion_vertices_clad"] = fused_clad_vertices.astype(np.float32)
+    fused_result_scaled["fusion_faces_clad"] = np.asarray(estimator.faces, dtype=np.int32)
     fused_result_scaled["fusion_vertices_clad_coordinate_system"] = np.array(
         "x_lateral_y_profile_z_up_meters",
         dtype=object,
@@ -2192,6 +2546,8 @@ def main():
             print(f"Saved side anchor {key:<12}: {value}")
     if side_sdf_edited_render:
         print(f"Saved side edited render    : {side_sdf_edited_render}")
+    if side_sdf_row_debug_path:
+        print(f"Saved side row debug        : {side_sdf_row_debug_path}")
 
 
 if __name__ == "__main__":

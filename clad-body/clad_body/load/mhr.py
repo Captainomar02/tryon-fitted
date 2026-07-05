@@ -147,6 +147,49 @@ def _extract_fusion_vertices_override(
     return verts
 
 
+def _extract_fusion_faces_override(params: dict) -> Optional[np.ndarray]:
+    """Return face topology stored with a fusion vertex override, if present."""
+    raw_faces = params.get("fusion_faces_clad")
+    if raw_faces is None:
+        raw_faces = params.get("fusion_faces")
+    if raw_faces is None:
+        return None
+
+    faces = np.asarray(raw_faces, dtype=np.int64)
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError(f"Fusion face override must have shape [N,3], got {faces.shape}")
+    if faces.size and int(faces.min()) < 0:
+        raise ValueError("Fusion face override contains negative indices")
+    return faces.astype(np.int32, copy=False)
+
+
+def _load_fusion_vertex_body_if_available(params_json: str, params: dict) -> Optional[MhrBody]:
+    """Build a body directly from fusion vertices/faces without pymomentum.
+
+    Fusion JSONs already contain CLAD-canonical vertices. When they also carry
+    topology, measuring the mesh does not need the MHR/pymomentum subprocess.
+    """
+    if not bool(params.get("fusion_prefer_vertices_for_clad", False)):
+        return None
+
+    faces = _extract_fusion_faces_override(params)
+    if faces is None:
+        return None
+
+    target_height_m = _extract_target_height_m(params)
+    verts = _extract_fusion_vertices_override(params, faces, target_height_m)
+    if verts is None:
+        return None
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    return MhrBody(
+        mesh=mesh,
+        source=f"params:{os.path.basename(params_json)}+fusion_vertices",
+        sam3d_params=params,
+        joints=None,
+    )
+
+
 def _profile_band_weight(height_pct: np.ndarray, center: float, half_width: float) -> np.ndarray:
     distance = np.abs(height_pct - float(center))
     weight = np.clip(1.0 - (distance / float(half_width)), 0.0, 1.0)
@@ -244,6 +287,12 @@ def load_mhr_from_params(
         :class:`MhrBody` in canonical rest-pose (Z-up, m, +Y=front, XY-centred).
     """
     params_json = _resolve_params_json(path)
+    with open(params_json) as f:
+        sam3d_params = json.load(f)
+
+    fusion_body = _load_fusion_vertex_body_if_available(params_json, sam3d_params)
+    if fusion_body is not None:
+        return fusion_body
 
     # Ensure LD_LIBRARY_PATH includes torch/lib for pymomentum-cpu
     import importlib.util
@@ -338,9 +387,6 @@ np.savez(sys.argv[1], vertices=v, faces=faces,
     center_xy = (verts[:, :2].max(axis=0) + verts[:, :2].min(axis=0)) / 2
     verts[:, 0] -= center_xy[0]
     verts[:, 1] -= center_xy[1]
-
-    with open(params_json) as f:
-        sam3d_params = json.load(f)
 
     # Optional post-fit global scaling:
     # if the params JSON carries a desired target height, enforce it directly
