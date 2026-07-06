@@ -1,7 +1,6 @@
 import glob
 import json
 import os
-import re
 import argparse
 import shutil
 import sys
@@ -9,8 +8,6 @@ import sys
 import cv2
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-
 from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
 from tools.vis_utils import visualize_sample_together
 
@@ -56,22 +53,6 @@ def convert_result_to_save_dict(result):
     return save_dict
 
 
-def sanitize_filename_component(name):
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name))
-
-
-def save_individual_arrays(save_dict, output_dir, base_name, file_suffix):
-    saved_paths = []
-    for key, value in save_dict.items():
-        if not isinstance(value, np.ndarray):
-            continue
-        safe_key = sanitize_filename_component(key)
-        npy_path = os.path.join(output_dir, f"{base_name}_{file_suffix}_{safe_key}.npy")
-        np.save(npy_path, value)
-        saved_paths.append(npy_path)
-    return saved_paths
-
-
 def save_mesh_obj(vertices, faces, obj_path):
     vertices = np.asarray(vertices, dtype=np.float32)
     faces = np.asarray(faces, dtype=np.int32)
@@ -87,50 +68,6 @@ def save_mesh_obj(vertices, faces, obj_path):
         for face in faces:
             f.write(f"f {face[0] + 1} {face[1] + 1} {face[2] + 1}\n")
     return obj_path
-
-
-def save_result_files(result, output_dir, base_name, file_suffix="all_body_params", faces=None, mesh_vertices=None):
-    save_dict = convert_result_to_save_dict(result)
-
-    npz_path = os.path.join(output_dir, f"{base_name}_{file_suffix}.npz")
-    np.savez(npz_path, **save_dict)
-
-    json_path = os.path.join(output_dir, f"{base_name}_{file_suffix}.json")
-    json_dict = {}
-    for k, v in save_dict.items():
-        if isinstance(v, np.ndarray):
-            try:
-                json_dict[k] = v.tolist()
-            except Exception:
-                json_dict[k] = None
-        elif isinstance(v, np.generic):
-            json_dict[k] = v.item()
-        else:
-            json_dict[k] = v
-
-    with open(json_path, "w") as f:
-        json.dump(json_dict, f, indent=2)
-
-    saved_paths = [npz_path, json_path]
-    saved_paths.extend(save_individual_arrays(save_dict, output_dir, base_name, file_suffix))
-
-    mesh_vertices = mesh_vertices if mesh_vertices is not None else save_dict.get("pred_vertices")
-    if faces is not None and mesh_vertices is not None:
-        obj_path = os.path.join(output_dir, f"{base_name}_{file_suffix}.obj")
-        try:
-            saved_paths.append(save_mesh_obj(mesh_vertices, faces, obj_path))
-        except Exception as e:
-            print(f"[fusion] Warning: could not save OBJ for {base_name}: {e}")
-
-    if "mhr_model_params" in result:
-        mhr_val = result["mhr_model_params"]
-        if isinstance(mhr_val, torch.Tensor):
-            mhr_val = mhr_val.detach().cpu().numpy()
-        mhr_path = os.path.join(output_dir, f"{base_name}_{file_suffix}_mhr_model_params.npy")
-        np.save(mhr_path, mhr_val)
-        saved_paths.append(mhr_path)
-
-    return saved_paths
 
 
 def save_result_json(result, output_json_path):
@@ -325,23 +262,31 @@ SIDE_SDF_BAND_HALF_WIDTH = 0.02953125
 SIDE_SDF_BAND_FEATHER_WIDTH = SIDE_SDF_BAND_HALF_WIDTH
 SIDE_SDF_BAND_CORE_WEIGHT = 1.0
 SIDE_SDF_OUTER_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 1.45
-SIDE_SDF_OUTER_SMOOTH_GAIN = 0.38
 SIDE_SDF_CONTAINMENT_PASSES = 5
 SIDE_SDF_CONTAINMENT_GAIN = 1.0
-SIDE_SDF_CONTAINMENT_MARGIN_PX = 4.0
+SIDE_SDF_CONTAINMENT_MARGIN_PX = 2.0
 SIDE_SDF_CONTAINMENT_MAX_STEP_PX = 24.0
 SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS = 16
 SIDE_SDF_DISPLACEMENT_SMOOTH_ALPHA = 0.36
-SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND = 0.86
+SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND = 0.60
 SIDE_SDF_EDGE_HEIGHT_SMOOTH_BINS = 220
 SIDE_SDF_EDGE_HEIGHT_SMOOTH_RADIUS_BINS = 9
 SIDE_SDF_EDGE_HEIGHT_SMOOTH_BLEND = 0.58
-SIDE_SDF_SOLVE_DATA_WEIGHT = 36.0
-SIDE_SDF_SOLVE_PIN_WEIGHT = 4.5
-SIDE_SDF_SOLVE_SMOOTH_LAMBDA = 6.5
-SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH
+SIDE_SDF_ROW_EDGE_LOW_QUANTILE = 0.01
+SIDE_SDF_ROW_EDGE_HIGH_QUANTILE = 0.99
+SIDE_SDF_SOLVE_DATA_WEIGHT = 180.0
+SIDE_SDF_SOLVE_PIN_WEIGHT = 0.85
+SIDE_SDF_SOLVE_SMOOTH_LAMBDA = 1.2
+SIDE_SDF_TARGET_CORE_HALF_WIDTH = SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH
+SIDE_SDF_TARGET_FEATHER_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 3.0
+SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 2.5
 SIDE_SDF_SOLVE_SIDE_PIN_SCALE = 0.35
 SIDE_SDF_SOLVE_MIN_DIAGONAL = 1e-6
+SIDE_SDF_RESIDUAL_SOLVE_PASSES = 3
+SIDE_SDF_RESIDUAL_SOLVE_GAIN = 0.95
+SIDE_SDF_ROW_UNDERFIT_PEAK_PRESERVE = True
+SIDE_SDF_SOLVE_EDGE_DATA_FLOOR = 0.20
+SIDE_SDF_SOLVE_EDGE_DATA_POWER = 2.0
 
 
 def _flat_band_with_feather(height_pct, center, half_width, feather_width):
@@ -644,8 +589,8 @@ def save_side_anchor_debug_mask(
 
     chest_center = required_anchor_pct(anchor_pcts, "chest")
     butt_center = required_anchor_pct(anchor_pcts, "butt")
-    draw_anchor("bust", chest_center, SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH, (0, 80, 255), -8)
-    draw_anchor("butt", butt_center, SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH, (255, 80, 0), 20)
+    draw_anchor("bust", chest_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, (0, 80, 255), -8)
+    draw_anchor("butt", butt_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, (255, 80, 0), 20)
 
     out_path = os.path.join(output_dir, out_name)
     cv2.imwrite(out_path, overlay)
@@ -716,8 +661,8 @@ def save_side_projection_alignment_debug(
     for y in range(h):
         near = in_image & torso_core & (np.abs(rows - y) <= 3)
         if near.any():
-            row_left[y] = float(np.quantile(proj[near, 0], 0.03))
-            row_right[y] = float(np.quantile(proj[near, 0], 0.97))
+            row_left[y] = float(np.quantile(proj[near, 0], SIDE_SDF_ROW_EDGE_LOW_QUANTILE))
+            row_right[y] = float(np.quantile(proj[near, 0], SIDE_SDF_ROW_EDGE_HIGH_QUANTILE))
 
     for y in range(0, h, 2):
         if np.isfinite(row_left[y]):
@@ -931,7 +876,7 @@ def save_side_sdf_row_debug(
         return None
 
     torso_core, _ = compute_torso_core_mask(v, side_result)
-    debug_band_half_width = SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH
+    debug_band_half_width = SIDE_SDF_TARGET_CORE_HALF_WIDTH
     chest_height_weight = (np.abs(pct - chest_center) <= debug_band_half_width).astype(np.float64)
     butt_height_weight = (np.abs(pct - butt_center) <= debug_band_half_width).astype(np.float64)
     selected = in_image & torso_core & ((chest_height_weight > 1e-4) | (butt_height_weight > 1e-4))
@@ -949,8 +894,8 @@ def save_side_sdf_row_debug(
         near = selected & (np.abs(rows - y) <= int(row_radius))
         if near.any():
             xs = proj[near, 0]
-            row_left[y] = float(np.quantile(xs, 0.03))
-            row_right[y] = float(np.quantile(xs, 0.97))
+            row_left[y] = float(np.quantile(xs, SIDE_SDF_ROW_EDGE_LOW_QUANTILE))
+            row_right[y] = float(np.quantile(xs, SIDE_SDF_ROW_EDGE_HIGH_QUANTILE))
             row_min[y] = float(np.min(xs))
             row_max[y] = float(np.max(xs))
             row_center[y] = 0.5 * (row_left[y] + row_right[y])
@@ -1077,22 +1022,18 @@ def deform_side_mesh_to_mask_profile(
     strength=0.65,
     max_push_cm=15.0,
     row_radius=6,
-    chest_mode="row_sdf",
-    chest_lobe_gain=2.4,
     faces=None,
 ):
     """Smoothly move chest/front and butt/back side-profile bands toward the mask.
 
-    Chest and butt intentionally share the same row-edge SDF algorithm.  The
-    chest-specific options are accepted for old commands but do not alter the
-    correction path.
+    Chest and butt share one row-edge SDF/profile algorithm so there is a
+    single source of truth for side-mask correction.
     """
-    _ = chest_lobe_gain
-    chest_mode = "row_sdf"
+    profile_method = "row_edge_sdf"
     meta = {
         "enabled": np.array(False),
         "reason": np.array("disabled_or_no_mask", dtype=object),
-        "chest_mode": np.array(chest_mode, dtype=object),
+        "profile_method": np.array(profile_method, dtype=object),
         "strength": np.array(float(strength), dtype=np.float64),
         "max_push_cm": np.array(float(max_push_cm), dtype=np.float64),
         "mean_abs_push_cm": np.array(0.0, dtype=np.float64),
@@ -1138,129 +1079,44 @@ def deform_side_mesh_to_mask_profile(
     butt_center = required_anchor_pct(anchor_pcts, "butt")
     chest_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH * 2.0
     butt_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH * 2.0
-    chest_weight = _flat_band_with_feather(pct, chest_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH)
-    butt_weight = _flat_band_with_feather(pct, butt_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH)
     chest_outer_weight = _outside_band_smooth_weight(
-        pct, chest_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH, chest_outer_smooth_width
+        pct, chest_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, 0.0, chest_outer_smooth_width
     )
     butt_outer_weight = _outside_band_smooth_weight(
-        pct, butt_center, SIDE_SDF_BAND_HALF_WIDTH, SIDE_SDF_BAND_FEATHER_WIDTH, butt_outer_smooth_width
+        pct, butt_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, 0.0, butt_outer_smooth_width
+    )
+    chest_target_weight = _flat_band_with_feather(
+        pct, chest_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, SIDE_SDF_TARGET_FEATHER_WIDTH
+    )
+    butt_target_weight = _flat_band_with_feather(
+        pct, butt_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, SIDE_SDF_TARGET_FEATHER_WIDTH
     )
     torso_core, torso_core_meta = compute_torso_core_mask(v, side_result)
-    selected = in_image & torso_core & ((chest_weight > 1e-4) | (butt_weight > 1e-4))
+    selected = in_image & torso_core & ((chest_target_weight > 1e-4) | (butt_target_weight > 1e-4))
     if not selected.any():
         meta["reason"] = np.array("no_selected_vertices", dtype=object)
         return v.astype(np.float32), meta
 
     anterior_sign, anterior_source = infer_side_anterior_sign(side_result, image_shape)
     posterior_sign = -int(anterior_sign)
-    rows = np.clip(np.rint(proj[:, 1]).astype(np.int32), 0, h - 1)
-
-    row_center = np.full(h, np.nan, dtype=np.float64)
-    row_half = np.full(h, np.nan, dtype=np.float64)
-    row_left = np.full(h, np.nan, dtype=np.float64)
-    row_right = np.full(h, np.nan, dtype=np.float64)
-    for y in range(h):
-        near = selected & (np.abs(rows - y) <= row_radius)
-        if near.any():
-            row_left[y] = float(np.quantile(proj[near, 0], 0.03))
-            row_right[y] = float(np.quantile(proj[near, 0], 0.97))
-            row_center[y] = 0.5 * (row_left[y] + row_right[y])
-            row_half[y] = max(1.0, 0.5 * (row_right[y] - row_left[y]))
-
     mask_left, mask_right = row_bounds_from_mask(side_mask, row_radius=row_radius)
 
-    row_center_at_vertex = row_center[rows]
-    row_half_at_vertex = row_half[rows]
-    valid_profile_row = np.isfinite(row_center_at_vertex) & np.isfinite(row_half_at_vertex) & (row_half_at_vertex > 1e-6)
-    signed_side_all = np.zeros(v.shape[0], dtype=np.float64)
-    signed_side_all[valid_profile_row] = (proj[valid_profile_row, 0] - row_center_at_vertex[valid_profile_row]) / row_half_at_vertex[valid_profile_row]
-    chest_side_mask = in_image & torso_core & valid_profile_row & ((anterior_sign * signed_side_all) > 0.02)
-    butt_side_mask = in_image & torso_core & valid_profile_row & ((posterior_sign * signed_side_all) > 0.02)
-
-    def target_shift_by_row(side_sign):
-        shift = np.zeros(h, dtype=np.float64)
-        valid = np.zeros(h, dtype=bool)
-        for y in range(h):
-            if not (
-                np.isfinite(mask_left[y]) and np.isfinite(mask_right[y]) and
-                np.isfinite(row_left[y]) and np.isfinite(row_right[y])
-            ):
-                continue
-            if side_sign < 0:
-                shift[y] = mask_left[y] - row_left[y]
-            else:
-                shift[y] = mask_right[y] - row_right[y]
-            valid[y] = abs(shift[y]) > 1e-6
-
-        raw_shift = shift.copy()
-        sigma_px = max(float(row_radius) * 2.5, 10.0)
-        smoothed = smooth_rows(raw_shift, valid, sigma_px)
-        sign_flip = (
-            valid &
-            (np.abs(raw_shift) > 1e-6) &
-            (np.abs(smoothed) > 1e-6) &
-            (np.sign(raw_shift) != np.sign(smoothed))
-        )
-        smoothed[sign_flip] = raw_shift[sign_flip]
-        return smoothed, valid, raw_shift, sign_flip
-
-    chest_shift_row, chest_valid_row, chest_raw_shift_row, chest_shift_sign_flip_row = target_shift_by_row(anterior_sign)
-    butt_shift_row, butt_valid_row, butt_raw_shift_row, butt_shift_sign_flip_row = target_shift_by_row(posterior_sign)
-
     max_push_m = max(0.0, float(max_push_cm)) / 100.0
-    max_push_px = np.maximum(1.0, max_push_m * float(focal_length) / np.maximum(depth, 1e-5))
-    profile_fit_half_width = SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH
-    chest_height_weight = (np.abs(pct - chest_center) <= profile_fit_half_width).astype(np.float64)
-    butt_height_weight = (np.abs(pct - butt_center) <= profile_fit_half_width).astype(np.float64)
+    profile_fit_half_width = SIDE_SDF_TARGET_CORE_HALF_WIDTH + SIDE_SDF_TARGET_FEATHER_WIDTH
+    chest_height_weight = chest_target_weight
+    butt_height_weight = butt_target_weight
     chest_support_weight = _flat_band_with_feather(
         pct,
         chest_center,
-        SIDE_SDF_BAND_HALF_WIDTH,
+        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
         SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH,
     )
     butt_support_weight = _flat_band_with_feather(
         pct,
         butt_center,
-        SIDE_SDF_BAND_HALF_WIDTH,
+        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
         SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH,
     )
-    chest_side_strength = np.clip((anterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
-    butt_side_strength = np.clip((posterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
-    target_dx_chest = np.zeros(v.shape[0], dtype=np.float64)
-    target_dx_butt = np.zeros(v.shape[0], dtype=np.float64)
-
-    for idx in np.nonzero(selected)[0]:
-        y = rows[idx]
-        center = row_center[y]
-        half = row_half[y]
-        if not (np.isfinite(center) and np.isfinite(half)):
-            continue
-
-        # Build at most one target per vertex. All vertices inside the active
-        # band get equal data weight; only the outside support zone fades.
-        candidates = []
-
-        if chest_height_weight[idx] > 1e-4 and chest_side_strength[idx] > 1e-4 and chest_valid_row[y]:
-            raw_px = chest_shift_row[y] * float(strength)
-            raw_px = float(np.clip(raw_px, -max_push_px[idx], max_push_px[idx]))
-            raw_m = raw_px * depth[idx] / float(focal_length)
-            candidates.append((abs(raw_m), "chest", raw_m))
-
-        if butt_height_weight[idx] > 1e-4 and butt_side_strength[idx] > 1e-4 and butt_valid_row[y]:
-            raw_px = butt_shift_row[y] * float(strength)
-            raw_px = float(np.clip(raw_px, -max_push_px[idx], max_push_px[idx]))
-            raw_m = raw_px * depth[idx] / float(focal_length)
-            candidates.append((abs(raw_m), "butt", raw_m))
-
-        if not candidates:
-            continue
-
-        _, region_name, raw_m = max(candidates, key=lambda item: item[0])
-        if region_name == "chest":
-            target_dx_chest[idx] = raw_m
-        else:
-            target_dx_butt[idx] = raw_m
 
     def build_neighbor_lists(mesh_faces, vertex_count):
         if mesh_faces is None:
@@ -1293,9 +1149,15 @@ def deform_side_mesh_to_mask_profile(
             solve_reason = "fallback_no_targets_or_faces"
             return np.clip(target_dx, -max_push_m, max_push_m), target_mask.copy()
 
+        edge_data_weight = (
+            float(SIDE_SDF_SOLVE_EDGE_DATA_FLOOR) +
+            (1.0 - float(SIDE_SDF_SOLVE_EDGE_DATA_FLOOR)) *
+            np.clip(np.asarray(side_strength, dtype=np.float64), 0.0, 1.0) ** float(SIDE_SDF_SOLVE_EDGE_DATA_POWER)
+        )
         data_weight = (
             float(SIDE_SDF_SOLVE_DATA_WEIGHT) *
             np.asarray(height_weight, dtype=np.float64) *
+            edge_data_weight *
             target_mask.astype(np.float64)
         )
         support_weight = np.asarray(support_weight, dtype=np.float64)
@@ -1347,27 +1209,314 @@ def deform_side_mesh_to_mask_profile(
         changed = np.abs(solved - target_dx) > 1e-7
         return np.clip(solved, -max_push_m, max_push_m), changed
 
-    dx_chest, chest_solve_changed = solve_weighted_displacement(
-        target_dx_chest,
-        chest_height_weight,
-        chest_support_weight,
-        chest_side_strength,
-    )
-    dx_butt, butt_solve_changed = solve_weighted_displacement(
-        target_dx_butt,
-        butt_height_weight,
-        butt_support_weight,
-        butt_side_strength,
-    )
+    def compute_profile_state(vertices_cur):
+        proj_cur, depth_cur = project_vertices_to_image(vertices_cur, cam_t, float(focal_length), image_shape)
+        in_image_cur = (
+            (depth_cur > 1e-5) &
+            (proj_cur[:, 0] >= 0) & (proj_cur[:, 0] < w) &
+            (proj_cur[:, 1] >= 0) & (proj_cur[:, 1] < h)
+        )
+        rows_cur = np.clip(np.rint(proj_cur[:, 1]).astype(np.int32), 0, h - 1)
+        selected_cur = in_image_cur & torso_core & ((chest_target_weight > 1e-4) | (butt_target_weight > 1e-4))
+
+        row_center_cur = np.full(h, np.nan, dtype=np.float64)
+        row_half_cur = np.full(h, np.nan, dtype=np.float64)
+        row_left_cur = np.full(h, np.nan, dtype=np.float64)
+        row_right_cur = np.full(h, np.nan, dtype=np.float64)
+        for y in range(h):
+            near = selected_cur & (np.abs(rows_cur - y) <= row_radius)
+            if near.any():
+                xs = proj_cur[near, 0]
+                row_left_cur[y] = float(np.quantile(xs, SIDE_SDF_ROW_EDGE_LOW_QUANTILE))
+                row_right_cur[y] = float(np.quantile(xs, SIDE_SDF_ROW_EDGE_HIGH_QUANTILE))
+                row_center_cur[y] = 0.5 * (row_left_cur[y] + row_right_cur[y])
+                row_half_cur[y] = max(1.0, 0.5 * (row_right_cur[y] - row_left_cur[y]))
+
+        row_center_at_vertex = row_center_cur[rows_cur]
+        row_half_at_vertex = row_half_cur[rows_cur]
+        valid_profile_row_cur = (
+            np.isfinite(row_center_at_vertex) &
+            np.isfinite(row_half_at_vertex) &
+            (row_half_at_vertex > 1e-6)
+        )
+        signed_side_all_cur = np.zeros(v.shape[0], dtype=np.float64)
+        signed_side_all_cur[valid_profile_row_cur] = (
+            proj_cur[valid_profile_row_cur, 0] - row_center_at_vertex[valid_profile_row_cur]
+        ) / row_half_at_vertex[valid_profile_row_cur]
+        chest_side_mask_cur = in_image_cur & torso_core & valid_profile_row_cur & ((anterior_sign * signed_side_all_cur) > 0.02)
+        butt_side_mask_cur = in_image_cur & torso_core & valid_profile_row_cur & ((posterior_sign * signed_side_all_cur) > 0.02)
+        return {
+            "proj": proj_cur,
+            "depth": depth_cur,
+            "in_image": in_image_cur,
+            "rows": rows_cur,
+            "row_left": row_left_cur,
+            "row_right": row_right_cur,
+            "valid_profile_row": valid_profile_row_cur,
+            "signed_side_all": signed_side_all_cur,
+            "chest_side_mask": chest_side_mask_cur,
+            "butt_side_mask": butt_side_mask_cur,
+            "selected": selected_cur,
+        }
+
+    def target_shift_by_row(profile_state, side_sign):
+        shift = np.zeros(h, dtype=np.float64)
+        valid = np.zeros(h, dtype=bool)
+        row_left_cur = profile_state["row_left"]
+        row_right_cur = profile_state["row_right"]
+        for y in range(h):
+            if not (
+                np.isfinite(mask_left[y]) and np.isfinite(mask_right[y]) and
+                np.isfinite(row_left_cur[y]) and np.isfinite(row_right_cur[y])
+            ):
+                continue
+            if side_sign < 0:
+                shift[y] = mask_left[y] - row_left_cur[y]
+            else:
+                shift[y] = mask_right[y] - row_right_cur[y]
+            valid[y] = abs(shift[y]) > 1e-6
+
+        raw_shift = shift.copy()
+        sigma_px = max(float(row_radius) * 2.5, 10.0)
+        smoothed = smooth_rows(raw_shift, valid, sigma_px)
+        sign_flip = (
+            valid &
+            (np.abs(raw_shift) > 1e-6) &
+            (np.abs(smoothed) > 1e-6) &
+            (np.sign(raw_shift) != np.sign(smoothed))
+        )
+        smoothed[sign_flip] = raw_shift[sign_flip]
+        if SIDE_SDF_ROW_UNDERFIT_PEAK_PRESERVE:
+            raw_underfit = raw_shift * float(side_sign)
+            smoothed_underfit = smoothed * float(side_sign)
+            underfit_peak = (
+                valid &
+                (raw_underfit > 1e-6) &
+                (raw_underfit > smoothed_underfit)
+            )
+            smoothed[underfit_peak] = raw_shift[underfit_peak]
+        return smoothed, valid, raw_shift, sign_flip
+
+    def build_target_dx(profile_state, shift_row, valid_row, side_strength, height_weight, side_mask):
+        target_dx = np.zeros(v.shape[0], dtype=np.float64)
+        target_px = np.zeros(v.shape[0], dtype=np.float64)
+        max_push_px_cur = np.maximum(
+            1.0,
+            max_push_m * float(focal_length) / np.maximum(profile_state["depth"], 1e-5),
+        )
+        rows_cur = profile_state["rows"]
+        selected_cur = profile_state["selected"]
+        for idx in np.nonzero(selected_cur)[0]:
+            y = rows_cur[idx]
+            if height_weight[idx] <= 1e-4 or side_strength[idx] <= 1e-4 or not valid_row[y] or not side_mask[idx]:
+                continue
+            raw_px = shift_row[y] * float(strength)
+            raw_px = float(np.clip(raw_px, -max_push_px_cur[idx], max_push_px_cur[idx]))
+            target_px[idx] = raw_px
+            target_dx[idx] = raw_px * profile_state["depth"][idx] / float(focal_length)
+        return target_dx, target_px
+
+    def signed_row_gap_stats(shift_row, valid_row, side_sign):
+        valid_shift = valid_row & np.isfinite(shift_row)
+        if not np.any(valid_shift):
+            return {
+                "valid_count": 0,
+                "mean_abs_px": 0.0,
+                "p95_abs_px": 0.0,
+                "max_abs_px": 0.0,
+                "mean_underfit_px": 0.0,
+                "p95_underfit_px": 0.0,
+                "max_underfit_px": 0.0,
+                "mean_overfit_px": 0.0,
+                "max_overfit_px": 0.0,
+            }
+        signed_gap = shift_row[valid_shift] * float(side_sign)
+        underfit = signed_gap[signed_gap > 1e-6]
+        overfit = -signed_gap[signed_gap < -1e-6]
+        abs_gap = np.abs(signed_gap)
+        return {
+            "valid_count": int(valid_shift.sum()),
+            "mean_abs_px": float(np.mean(abs_gap)),
+            "p95_abs_px": float(np.percentile(abs_gap, 95.0)),
+            "max_abs_px": float(np.max(abs_gap)),
+            "mean_underfit_px": float(np.mean(underfit)) if underfit.size else 0.0,
+            "p95_underfit_px": float(np.percentile(underfit, 95.0)) if underfit.size else 0.0,
+            "max_underfit_px": float(np.max(underfit)) if underfit.size else 0.0,
+            "mean_overfit_px": float(np.mean(overfit)) if overfit.size else 0.0,
+            "max_overfit_px": float(np.max(overfit)) if overfit.size else 0.0,
+        }
+
+    def displacement_stats(dx_values):
+        active = np.abs(dx_values) > 1e-8
+        if not np.any(active):
+            return {"count": 0, "mean_abs_cm": 0.0, "p95_abs_cm": 0.0, "max_abs_cm": 0.0}
+        abs_cm = np.abs(dx_values[active]) * 100.0
+        return {
+            "count": int(active.sum()),
+            "mean_abs_cm": float(np.mean(abs_cm)),
+            "p95_abs_cm": float(np.percentile(abs_cm, 95.0)),
+            "max_abs_cm": float(np.max(abs_cm)),
+        }
+
+    def pixel_target_stats(px_values):
+        active = np.abs(px_values) > 1e-8
+        if not np.any(active):
+            return {"count": 0, "mean_abs_px": 0.0, "p95_abs_px": 0.0, "max_abs_px": 0.0}
+        abs_px = np.abs(px_values[active])
+        return {
+            "count": int(active.sum()),
+            "mean_abs_px": float(np.mean(abs_px)),
+            "p95_abs_px": float(np.percentile(abs_px, 95.0)),
+            "max_abs_px": float(np.max(abs_px)),
+        }
+
+    dx_chest = np.zeros(v.shape[0], dtype=np.float64)
+    dx_butt = np.zeros(v.shape[0], dtype=np.float64)
+    chest_solve_changed = np.zeros(v.shape[0], dtype=bool)
+    butt_solve_changed = np.zeros(v.shape[0], dtype=bool)
+    target_dx_chest = np.zeros(v.shape[0], dtype=np.float64)
+    target_dx_butt = np.zeros(v.shape[0], dtype=np.float64)
+    target_px_chest = np.zeros(v.shape[0], dtype=np.float64)
+    target_px_butt = np.zeros(v.shape[0], dtype=np.float64)
+    solved_dx_chest_initial = np.zeros(v.shape[0], dtype=np.float64)
+    solved_dx_butt_initial = np.zeros(v.shape[0], dtype=np.float64)
+    chest_shift_row = np.zeros(h, dtype=np.float64)
+    butt_shift_row = np.zeros(h, dtype=np.float64)
+    chest_raw_shift_row = np.zeros(h, dtype=np.float64)
+    butt_raw_shift_row = np.zeros(h, dtype=np.float64)
+    chest_valid_row = np.zeros(h, dtype=bool)
+    butt_valid_row = np.zeros(h, dtype=bool)
+    chest_shift_sign_flip_row = np.zeros(h, dtype=bool)
+    butt_shift_sign_flip_row = np.zeros(h, dtype=bool)
+    residual_solve_pass_count = 0
+    residual_solve_gains = []
+    residual_chest_raw_mean_underfit_px_by_pass = []
+    residual_chest_raw_max_underfit_px_by_pass = []
+    residual_chest_smoothed_mean_underfit_px_by_pass = []
+    residual_chest_smoothed_max_underfit_px_by_pass = []
+    residual_butt_raw_mean_underfit_px_by_pass = []
+    residual_butt_raw_max_underfit_px_by_pass = []
+    residual_butt_smoothed_mean_underfit_px_by_pass = []
+    residual_butt_smoothed_max_underfit_px_by_pass = []
+    residual_chest_applied_mean_abs_cm_by_pass = []
+    residual_chest_applied_max_abs_cm_by_pass = []
+    residual_butt_applied_mean_abs_cm_by_pass = []
+    residual_butt_applied_max_abs_cm_by_pass = []
+
+    for pass_idx in range(max(1, int(SIDE_SDF_RESIDUAL_SOLVE_PASSES))):
+        profile_state = compute_profile_state(v)
+        chest_side_mask_pass = profile_state["chest_side_mask"]
+        butt_side_mask_pass = profile_state["butt_side_mask"]
+        signed_side_all = profile_state["signed_side_all"]
+        chest_side_strength_pass = np.clip((anterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
+        butt_side_strength_pass = np.clip((posterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
+
+        chest_shift_row_pass, chest_valid_row_pass, chest_raw_shift_row_pass, chest_shift_sign_flip_row_pass = target_shift_by_row(
+            profile_state,
+            anterior_sign,
+        )
+        butt_shift_row_pass, butt_valid_row_pass, butt_raw_shift_row_pass, butt_shift_sign_flip_row_pass = target_shift_by_row(
+            profile_state,
+            posterior_sign,
+        )
+
+        chest_raw_pass_stats = signed_row_gap_stats(chest_raw_shift_row_pass, chest_valid_row_pass, anterior_sign)
+        chest_smoothed_pass_stats = signed_row_gap_stats(chest_shift_row_pass, chest_valid_row_pass, anterior_sign)
+        butt_raw_pass_stats = signed_row_gap_stats(butt_raw_shift_row_pass, butt_valid_row_pass, posterior_sign)
+        butt_smoothed_pass_stats = signed_row_gap_stats(butt_shift_row_pass, butt_valid_row_pass, posterior_sign)
+        residual_chest_raw_mean_underfit_px_by_pass.append(chest_raw_pass_stats["mean_underfit_px"])
+        residual_chest_raw_max_underfit_px_by_pass.append(chest_raw_pass_stats["max_underfit_px"])
+        residual_chest_smoothed_mean_underfit_px_by_pass.append(chest_smoothed_pass_stats["mean_underfit_px"])
+        residual_chest_smoothed_max_underfit_px_by_pass.append(chest_smoothed_pass_stats["max_underfit_px"])
+        residual_butt_raw_mean_underfit_px_by_pass.append(butt_raw_pass_stats["mean_underfit_px"])
+        residual_butt_raw_max_underfit_px_by_pass.append(butt_raw_pass_stats["max_underfit_px"])
+        residual_butt_smoothed_mean_underfit_px_by_pass.append(butt_smoothed_pass_stats["mean_underfit_px"])
+        residual_butt_smoothed_max_underfit_px_by_pass.append(butt_smoothed_pass_stats["max_underfit_px"])
+
+        target_dx_chest_pass, target_px_chest_pass = build_target_dx(
+            profile_state,
+            chest_shift_row_pass,
+            chest_valid_row_pass,
+            chest_side_strength_pass,
+            chest_height_weight,
+            chest_side_mask_pass,
+        )
+        target_dx_butt_pass, target_px_butt_pass = build_target_dx(
+            profile_state,
+            butt_shift_row_pass,
+            butt_valid_row_pass,
+            butt_side_strength_pass,
+            butt_height_weight,
+            butt_side_mask_pass,
+        )
+
+        pass_gain = float(SIDE_SDF_RESIDUAL_SOLVE_GAIN)
+        target_dx_chest_pass *= pass_gain
+        target_dx_butt_pass *= pass_gain
+        target_px_chest_pass *= pass_gain
+        target_px_butt_pass *= pass_gain
+
+        if pass_idx == 0:
+            chest_shift_row = chest_shift_row_pass.copy()
+            butt_shift_row = butt_shift_row_pass.copy()
+            chest_raw_shift_row = chest_raw_shift_row_pass.copy()
+            butt_raw_shift_row = butt_raw_shift_row_pass.copy()
+            chest_valid_row = chest_valid_row_pass.copy()
+            butt_valid_row = butt_valid_row_pass.copy()
+            chest_shift_sign_flip_row = chest_shift_sign_flip_row_pass.copy()
+            butt_shift_sign_flip_row = butt_shift_sign_flip_row_pass.copy()
+            target_dx_chest = target_dx_chest_pass.copy()
+            target_dx_butt = target_dx_butt_pass.copy()
+            target_px_chest = target_px_chest_pass.copy()
+            target_px_butt = target_px_butt_pass.copy()
+
+        dx_chest_pass, chest_solve_changed_pass = solve_weighted_displacement(
+            target_dx_chest_pass,
+            chest_height_weight,
+            chest_support_weight,
+            chest_side_strength_pass,
+        )
+        dx_butt_pass, butt_solve_changed_pass = solve_weighted_displacement(
+            target_dx_butt_pass,
+            butt_height_weight,
+            butt_support_weight,
+            butt_side_strength_pass,
+        )
+        if pass_idx == 0:
+            solved_dx_chest_initial = dx_chest_pass.copy()
+            solved_dx_butt_initial = dx_butt_pass.copy()
+
+        requested_step = dx_chest_pass + dx_butt_pass
+        total_before = dx_chest + dx_butt
+        total_after = np.clip(total_before + requested_step, -max_push_m, max_push_m)
+        applied_step = total_after - total_before
+        step_scale = np.ones(v.shape[0], dtype=np.float64)
+        nonzero_step = np.abs(requested_step) > 1e-8
+        step_scale[nonzero_step] = applied_step[nonzero_step] / requested_step[nonzero_step]
+        dx_chest_step = dx_chest_pass * step_scale
+        dx_butt_step = dx_butt_pass * step_scale
+
+        v[:, 0] += applied_step
+        dx_chest += dx_chest_step
+        dx_butt += dx_butt_step
+        chest_step_stats = displacement_stats(dx_chest_step)
+        butt_step_stats = displacement_stats(dx_butt_step)
+        residual_chest_applied_mean_abs_cm_by_pass.append(chest_step_stats["mean_abs_cm"])
+        residual_chest_applied_max_abs_cm_by_pass.append(chest_step_stats["max_abs_cm"])
+        residual_butt_applied_mean_abs_cm_by_pass.append(butt_step_stats["mean_abs_cm"])
+        residual_butt_applied_max_abs_cm_by_pass.append(butt_step_stats["max_abs_cm"])
+        chest_solve_changed |= chest_solve_changed_pass | (np.abs(dx_chest_step) > 1e-7)
+        butt_solve_changed |= butt_solve_changed_pass | (np.abs(dx_butt_step) > 1e-7)
+        residual_solve_pass_count += 1
+        residual_solve_gains.append(pass_gain)
+
+    final_pre_containment_state = compute_profile_state(v)
+    chest_side_mask = final_pre_containment_state["chest_side_mask"]
+    butt_side_mask = final_pre_containment_state["butt_side_mask"]
+    signed_side_all = final_pre_containment_state["signed_side_all"]
+    chest_side_strength = np.clip((anterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
+    butt_side_strength = np.clip((posterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
     dx = dx_chest + dx_butt
-    dx_clipped = np.clip(dx, -max_push_m, max_push_m)
-    scale = np.ones(v.shape[0], dtype=np.float64)
-    nonzero = np.abs(dx) > 1e-8
-    scale[nonzero] = dx_clipped[nonzero] / dx[nonzero]
-    dx_chest *= scale
-    dx_butt *= scale
-    dx = dx_clipped
-    v[:, 0] += dx
 
     containment_dx_chest = np.zeros(v.shape[0], dtype=np.float64)
     containment_dx_butt = np.zeros(v.shape[0], dtype=np.float64)
@@ -1476,8 +1625,8 @@ def deform_side_mesh_to_mask_profile(
         changed = edge & (np.abs(smoothed - dx_region) > 1e-7)
         return smoothed, changed
 
-    containment_weight_chest = np.maximum(chest_weight, chest_outer_weight * 0.5)
-    containment_weight_butt = np.maximum(butt_weight, butt_outer_weight * 0.5)
+    containment_weight_chest = np.maximum(chest_target_weight, chest_outer_weight * 0.5)
+    containment_weight_butt = np.maximum(butt_target_weight, butt_outer_weight * 0.5)
     for _ in range(SIDE_SDF_CONTAINMENT_PASSES):
         proj_cur, depth_cur = project_vertices_to_image(v, cam_t, float(focal_length), image_shape)
         sdf_cur = sample_image_bilinear(sdf, proj_cur)
@@ -1622,6 +1771,33 @@ def deform_side_mesh_to_mask_profile(
     displacement_smooth_delta_butt = dx_butt - pre_smooth_dx_butt
     dx = dx_chest + dx_butt
 
+    initial_chest_row_gap = signed_row_gap_stats(chest_shift_row, chest_valid_row, anterior_sign)
+    initial_butt_row_gap = signed_row_gap_stats(butt_shift_row, butt_valid_row, posterior_sign)
+    initial_chest_raw_row_gap = signed_row_gap_stats(chest_raw_shift_row, chest_valid_row, anterior_sign)
+    initial_butt_raw_row_gap = signed_row_gap_stats(butt_raw_shift_row, butt_valid_row, posterior_sign)
+    target_chest_px_stats = pixel_target_stats(target_px_chest)
+    target_butt_px_stats = pixel_target_stats(target_px_butt)
+    target_chest_dx_stats = displacement_stats(target_dx_chest)
+    target_butt_dx_stats = displacement_stats(target_dx_butt)
+    solved_chest_initial_stats = displacement_stats(solved_dx_chest_initial)
+    solved_butt_initial_stats = displacement_stats(solved_dx_butt_initial)
+    final_chest_dx_stats = displacement_stats(dx_chest)
+    final_butt_dx_stats = displacement_stats(dx_butt)
+
+    final_profile_state = compute_profile_state(v)
+    final_chest_shift_row, final_chest_valid_row, final_chest_raw_shift_row, _ = target_shift_by_row(
+        final_profile_state,
+        anterior_sign,
+    )
+    final_butt_shift_row, final_butt_valid_row, final_butt_raw_shift_row, _ = target_shift_by_row(
+        final_profile_state,
+        posterior_sign,
+    )
+    final_chest_row_gap = signed_row_gap_stats(final_chest_shift_row, final_chest_valid_row, anterior_sign)
+    final_butt_row_gap = signed_row_gap_stats(final_butt_shift_row, final_butt_valid_row, posterior_sign)
+    final_chest_raw_row_gap = signed_row_gap_stats(final_chest_raw_shift_row, final_chest_valid_row, anterior_sign)
+    final_butt_raw_row_gap = signed_row_gap_stats(final_butt_raw_shift_row, final_butt_valid_row, posterior_sign)
+
     moved = np.abs(dx) > 1e-6
     chest_moved = np.abs(dx_chest) > 1e-6
     butt_moved = np.abs(dx_butt) > 1e-6
@@ -1636,8 +1812,10 @@ def deform_side_mesh_to_mask_profile(
         "torso_core_reason": torso_core_meta.get("reason", np.array("unknown", dtype=object)),
         "torso_core_threshold_m": torso_core_meta.get("threshold_m", np.array(0.0, dtype=np.float64)),
         "torso_core_vertex_count": torso_core_meta.get("vertex_count", np.array(int(torso_core.sum()), dtype=np.int64)),
-        "chest_mode": np.array(chest_mode, dtype=object),
+        "profile_method": np.array(profile_method, dtype=object),
         "profile_fit_half_width_pct": np.array(float(profile_fit_half_width * 100.0), dtype=np.float64),
+        "target_core_half_width_pct": np.array(float(SIDE_SDF_TARGET_CORE_HALF_WIDTH * 100.0), dtype=np.float64),
+        "target_feather_width_pct": np.array(float(SIDE_SDF_TARGET_FEATHER_WIDTH * 100.0), dtype=np.float64),
         "profile_fit_matches_anchor_debug_band": np.array(True, dtype=bool),
         "solve_reason": np.array(solve_reason, dtype=object),
         "solve_data_weight": np.array(float(SIDE_SDF_SOLVE_DATA_WEIGHT), dtype=np.float64),
@@ -1645,6 +1823,28 @@ def deform_side_mesh_to_mask_profile(
         "solve_smooth_lambda": np.array(float(SIDE_SDF_SOLVE_SMOOTH_LAMBDA), dtype=np.float64),
         "solve_outside_smooth_width_pct": np.array(float(SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH * 100.0), dtype=np.float64),
         "solve_side_pin_scale": np.array(float(SIDE_SDF_SOLVE_SIDE_PIN_SCALE), dtype=np.float64),
+        "solve_edge_data_floor": np.array(float(SIDE_SDF_SOLVE_EDGE_DATA_FLOOR), dtype=np.float64),
+        "solve_edge_data_power": np.array(float(SIDE_SDF_SOLVE_EDGE_DATA_POWER), dtype=np.float64),
+        "residual_solve_pass_count": np.array(int(residual_solve_pass_count), dtype=np.int64),
+        "residual_solve_configured_pass_count": np.array(int(SIDE_SDF_RESIDUAL_SOLVE_PASSES), dtype=np.int64),
+        "residual_solve_gain": np.array(float(SIDE_SDF_RESIDUAL_SOLVE_GAIN), dtype=np.float64),
+        "residual_solve_gains": np.asarray(residual_solve_gains, dtype=np.float64),
+        "row_underfit_peak_preserve": np.array(bool(SIDE_SDF_ROW_UNDERFIT_PEAK_PRESERVE), dtype=bool),
+        "target_displacement_height_scaled": np.array(False, dtype=bool),
+        "residual_chest_raw_mean_underfit_px_by_pass": np.asarray(residual_chest_raw_mean_underfit_px_by_pass, dtype=np.float64),
+        "residual_chest_raw_max_underfit_px_by_pass": np.asarray(residual_chest_raw_max_underfit_px_by_pass, dtype=np.float64),
+        "residual_chest_smoothed_mean_underfit_px_by_pass": np.asarray(residual_chest_smoothed_mean_underfit_px_by_pass, dtype=np.float64),
+        "residual_chest_smoothed_max_underfit_px_by_pass": np.asarray(residual_chest_smoothed_max_underfit_px_by_pass, dtype=np.float64),
+        "residual_butt_raw_mean_underfit_px_by_pass": np.asarray(residual_butt_raw_mean_underfit_px_by_pass, dtype=np.float64),
+        "residual_butt_raw_max_underfit_px_by_pass": np.asarray(residual_butt_raw_max_underfit_px_by_pass, dtype=np.float64),
+        "residual_butt_smoothed_mean_underfit_px_by_pass": np.asarray(residual_butt_smoothed_mean_underfit_px_by_pass, dtype=np.float64),
+        "residual_butt_smoothed_max_underfit_px_by_pass": np.asarray(residual_butt_smoothed_max_underfit_px_by_pass, dtype=np.float64),
+        "residual_chest_applied_mean_abs_cm_by_pass": np.asarray(residual_chest_applied_mean_abs_cm_by_pass, dtype=np.float64),
+        "residual_chest_applied_max_abs_cm_by_pass": np.asarray(residual_chest_applied_max_abs_cm_by_pass, dtype=np.float64),
+        "residual_butt_applied_mean_abs_cm_by_pass": np.asarray(residual_butt_applied_mean_abs_cm_by_pass, dtype=np.float64),
+        "residual_butt_applied_max_abs_cm_by_pass": np.asarray(residual_butt_applied_max_abs_cm_by_pass, dtype=np.float64),
+        "row_edge_low_quantile": np.array(float(SIDE_SDF_ROW_EDGE_LOW_QUANTILE), dtype=np.float64),
+        "row_edge_high_quantile": np.array(float(SIDE_SDF_ROW_EDGE_HIGH_QUANTILE), dtype=np.float64),
         "chest_solve_changed_vertex_count": np.array(int(chest_solve_changed.sum()), dtype=np.int64),
         "butt_solve_changed_vertex_count": np.array(int(butt_solve_changed.sum()), dtype=np.int64),
         "chest_valid_row_count": np.array(int(chest_valid_row.sum()), dtype=np.int64),
@@ -1692,6 +1892,41 @@ def deform_side_mesh_to_mask_profile(
         "mean_selected_sdf_px": np.array(float(np.mean(sdf_values[selected])) if selected.any() else 0.0, dtype=np.float64),
         "moved_vertex_count": np.array(int(moved.sum()), dtype=np.int64),
     })
+
+    def add_count_float_stats(prefix, stats, value_suffix):
+        meta[f"{prefix}_count"] = np.array(int(stats.get("count", 0)), dtype=np.int64)
+        for key, value in stats.items():
+            if key == "count":
+                continue
+            meta[f"{prefix}_{key.replace('_px', value_suffix).replace('_cm', value_suffix)}"] = np.array(
+                float(value),
+                dtype=np.float64,
+            )
+
+    def add_row_gap_stats(prefix, stats):
+        meta[f"{prefix}_valid_row_count"] = np.array(int(stats.get("valid_count", 0)), dtype=np.int64)
+        for key, value in stats.items():
+            if key == "valid_count":
+                continue
+            meta[f"{prefix}_{key}"] = np.array(float(value), dtype=np.float64)
+
+    add_row_gap_stats("chest_initial_smoothed_row_gap", initial_chest_row_gap)
+    add_row_gap_stats("butt_initial_smoothed_row_gap", initial_butt_row_gap)
+    add_row_gap_stats("chest_initial_raw_row_gap", initial_chest_raw_row_gap)
+    add_row_gap_stats("butt_initial_raw_row_gap", initial_butt_raw_row_gap)
+    add_row_gap_stats("chest_final_smoothed_row_gap", final_chest_row_gap)
+    add_row_gap_stats("butt_final_smoothed_row_gap", final_butt_row_gap)
+    add_row_gap_stats("chest_final_raw_row_gap", final_chest_raw_row_gap)
+    add_row_gap_stats("butt_final_raw_row_gap", final_butt_raw_row_gap)
+    add_count_float_stats("chest_target_vertex_px", target_chest_px_stats, "_px")
+    add_count_float_stats("butt_target_vertex_px", target_butt_px_stats, "_px")
+    add_count_float_stats("chest_target_vertex_dx", target_chest_dx_stats, "_cm")
+    add_count_float_stats("butt_target_vertex_dx", target_butt_dx_stats, "_cm")
+    add_count_float_stats("chest_solved_initial_dx", solved_chest_initial_stats, "_cm")
+    add_count_float_stats("butt_solved_initial_dx", solved_butt_initial_stats, "_cm")
+    add_count_float_stats("chest_final_dx", final_chest_dx_stats, "_cm")
+    add_count_float_stats("butt_final_dx", final_butt_dx_stats, "_cm")
+
     return v.astype(np.float32), meta
 
 
@@ -1990,43 +2225,6 @@ def build_fused_result(front_result, side_result, fused_vertices, target_height)
     return fused
 
 
-def copy_input_image(image_path, output_dir, out_name):
-    out_path = os.path.join(output_dir, out_name)
-    shutil.copy2(image_path, out_path)
-    return out_path
-
-
-def save_mesh_preview(vertices, save_path, title):
-    v = vertices.astype(np.float64)
-
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection="3d")
-
-    ax.scatter(v[:, 0], v[:, 1], v[:, 2], s=0.5)
-
-    mins = v.min(axis=0)
-    maxs = v.max(axis=0)
-    center = 0.5 * (mins + maxs)
-    extent = np.max(maxs - mins)
-    if extent < 1e-8:
-        extent = 1.0
-    half = extent / 2.0
-
-    ax.set_xlim(center[0] - half, center[0] + half)
-    ax.set_ylim(center[1] - half, center[1] + half)
-    ax.set_zlim(center[2] - half, center[2] + half)
-
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y (up)")
-    ax.set_zlabel("Z")
-    ax.set_title(title)
-    ax.view_init(elev=10, azim=-90)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close(fig)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -2091,13 +2289,13 @@ def main():
     parser.add_argument(
         "--side-sdf-profile-strength",
         type=float,
-        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_STRENGTH", "0.9")),
+        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_STRENGTH", "1.0")),
         help="Strength for bidirectional side-mask silhouette correction in chest/butt bands. Use 0 to disable.",
     )
     parser.add_argument(
         "--side-sdf-profile-max-push-cm",
         type=float,
-        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM", "25.0")),
+        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM", "35.0")),
         help="Maximum side-profile displacement per vertex, in centimeters.",
     )
     parser.add_argument(
@@ -2105,21 +2303,6 @@ def main():
         type=int,
         default=int(os.environ.get("FUSION_SIDE_SDF_ROW_RADIUS", "6")),
         help="Vertical pixel radius used when matching side mesh rows to mask/SDF rows.",
-    )
-    parser.add_argument(
-        "--side-sdf-chest-mode",
-        choices=("apex_lobe", "row_sdf"),
-        default=os.environ.get("FUSION_SIDE_SDF_CHEST_MODE", "row_sdf"),
-        help=(
-            "Chest correction mode. Bust now always uses the same row-edge SDF "
-            "method as butt; apex_lobe is accepted only for backward compatibility."
-        ),
-    )
-    parser.add_argument(
-        "--side-sdf-chest-lobe-gain",
-        type=float,
-        default=float(os.environ.get("FUSION_SIDE_SDF_CHEST_LOBE_GAIN", "2.4")),
-        help="Legacy option kept for compatibility; bust uses the butt-style row-edge SDF path.",
     )
     parser.add_argument(
         "--no-fused-vertex-override",
@@ -2326,8 +2509,6 @@ def main():
         strength=float(args.side_sdf_profile_strength),
         max_push_cm=float(args.side_sdf_profile_max_push_cm),
         row_radius=int(args.side_sdf_row_radius),
-        chest_mode=str(args.side_sdf_chest_mode),
-        chest_lobe_gain=float(args.side_sdf_chest_lobe_gain),
         faces=estimator.faces,
     )
     side_result["pred_vertices"] = side_vertices.astype(np.float32)
@@ -2359,7 +2540,7 @@ def main():
     side_sdf_moved_count = int(np.asarray(side_sdf_profile_meta.get("moved_vertex_count", 0)).item())
     side_sdf_mean_push_cm = float(np.asarray(side_sdf_profile_meta.get("mean_abs_push_cm", 0.0)).item())
     side_sdf_max_push_cm = float(np.asarray(side_sdf_profile_meta.get("max_abs_push_cm", 0.0)).item())
-    side_sdf_chest_mode = np.asarray(side_sdf_profile_meta.get("chest_mode", args.side_sdf_chest_mode)).item()
+    side_sdf_profile_method = np.asarray(side_sdf_profile_meta.get("profile_method", "row_edge_sdf")).item()
     side_sdf_chest_count = int(np.asarray(side_sdf_profile_meta.get("chest_moved_vertex_count", 0)).item())
     side_sdf_chest_mean_cm = float(np.asarray(side_sdf_profile_meta.get("chest_mean_abs_push_cm", 0.0)).item())
     side_sdf_chest_max_cm = float(np.asarray(side_sdf_profile_meta.get("chest_max_abs_push_cm", 0.0)).item())
@@ -2376,7 +2557,7 @@ def main():
     side_sdf_butt_smooth_max_cm = float(np.asarray(side_sdf_profile_meta.get("butt_displacement_smooth_max_abs_delta_cm", 0.0)).item())
 
     print("\nSide SDF/profile correction:")
-    print(f"  chest mode          : {side_sdf_chest_mode}")
+    print(f"  profile method      : {side_sdf_profile_method}")
     print(f"  reason              : {side_sdf_reason}")
     print(f"  moved vertices      : {side_sdf_moved_count}")
     print(f"  mean abs push       : {side_sdf_mean_push_cm:.4f} cm")
