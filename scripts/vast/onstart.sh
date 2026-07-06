@@ -18,6 +18,47 @@ fi
 cd "${APP_DIR}"
 
 mkdir -p "${APP_DIR}/input" "${APP_DIR}/output" "${APP_DIR}/checkpoints"
+
+ensure_mhr_runtime_deps() {
+  if python - <<'PY_CHECK'
+import torch
+import torchvision
+import torchaudio
+import pymomentum.geometry  # noqa: F401
+import mhr  # noqa: F401
+def version_tuple(value):
+    return tuple(int(part) for part in value.split("+")[0].split(".")[:3])
+if version_tuple(torch.__version__) < (2, 8, 0):
+    raise SystemExit(1)
+if version_tuple(torchvision.__version__) < (0, 23, 0):
+    raise SystemExit(1)
+if version_tuple(torchaudio.__version__) < (2, 8, 0):
+    raise SystemExit(1)
+PY_CHECK
+  then
+    echo "MHR runtime deps already installed."
+    return
+  fi
+
+  echo "Installing missing MHR runtime deps into $(python -c 'import sys; print(sys.executable)')..."
+  python -m pip install \
+    torch==2.8.0 \
+    torchvision==0.23.0 \
+    torchaudio==2.8.0 \
+    pymomentum-cpu==0.1.108.post0 \
+    mhr==1.0.1
+
+  python - <<'PY_CHECK'
+import torch
+import torchvision
+import torchaudio
+import pymomentum.geometry  # noqa: F401
+import mhr  # noqa: F401
+print(f"MHR runtime deps ok: torch {torch.__version__}, torchvision {torchvision.__version__}, torchaudio {torchaudio.__version__}")
+PY_CHECK
+}
+
+ensure_mhr_runtime_deps
 python -m pip install -e "./clad-body[mhr,render]" --no-build-isolation --no-deps
 scripts/vast/download_checkpoints.sh
 scripts/vast/download_mhr_assets.sh

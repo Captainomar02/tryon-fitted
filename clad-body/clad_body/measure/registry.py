@@ -295,7 +295,13 @@ _reg(MeasurementDef(
     key="mass_kg",
     name="Body mass",
     description=(
-        "Total body mass in kilograms measured on a standing scale. "
+        "Total body mass in kilograms. When body fat estimation is available "
+        "(requires neck circumference), uses volume × estimated tissue density "
+        "(V×ρ, Siri two-component, tissue-only convention: 900 fat / 1100 FFM "
+        "kg/m³) for realistic scale weight. Falls back to Anny fixed-density "
+        "mass (V×980) otherwise — note that 980 sits between the two literature "
+        "conventions (whole-body ~985 with lung air, tissue-only ~1030+ without) "
+        "and is empirically calibrated rather than physically derived. "
         "ISO 8559-1 §5.6.1."
     ),
     iso_ref="5.6.1",
@@ -342,6 +348,34 @@ _reg(MeasurementDef(
     type=SCALAR, standard=DERIVED, region=FULL_BODY, tier=ENHANCED,
     garments=frozenset(), unit="pct",
     needs_joints=True, anny_only=True,
+))
+
+_reg(MeasurementDef(
+    key="estimated_density",
+    name="Estimated tissue density",
+    description=(
+        "Estimated whole-body tissue density in kg/m³, derived from body fat "
+        "percentage via the Siri equation."
+    ),
+    iso_ref=None,
+    type=SCALAR, standard=DERIVED, region=FULL_BODY, tier=ENHANCED,
+    garments=frozenset(), unit="kg/m3",
+    needs_joints=True, anny_only=True,
+))
+
+_reg(MeasurementDef(
+    key="back_neck_to_waist_cm",
+    name="Back neck point to waist length",
+    description=(
+        "Distance from the back neck point (cervicale, C7 vertebra prominens) "
+        "down the centre back, following the body contour, to the waist level. "
+        "Stand erect; the tape touches the skin and follows the curvature of "
+        "the spine. ISO 8559-1 §5.4.5."
+    ),
+    iso_ref="5.4.5",
+    type=LENGTH, standard=ISO, region=TORSO, tier=ENHANCED,
+    garments=_g(TOPS, DRESSES, OUTERWEAR), unit="cm",
+    needs_joints=True, anny_only=False,
 ))
 
 _reg(MeasurementDef(
@@ -446,12 +480,12 @@ _reg(MeasurementDef(
 
 _reg(MeasurementDef(
     key="shirt_length_cm",
-    name="Shirt/top length",
+    name="Shirt/jacket length",
     description=(
         "Distance from the side neck point (where collar meets shoulder seam) "
-        "down along the front body contour to the hip line for a standard "
-        "untucked top. Let the tape follow the natural curve of the chest and "
-        "stomach. Industry standard (not in ISO 8559-1)."
+        "down along the front body contour to the crotch level. Let the tape "
+        "follow the natural curve of the chest and stomach. "
+        "Industry standard (not in ISO 8559-1)."
     ),
     iso_ref=None,
     type=LENGTH, standard=TAILOR, region=TORSO, tier=FITTED,

@@ -15,7 +15,6 @@ Usage:
 
 import argparse
 import json
-import math
 import os
 import sys
 from pathlib import Path
@@ -25,7 +24,6 @@ import trimesh
 
 try:
     import anny
-    import roma
     import torch
 except ImportError as _e:
     raise ImportError(
@@ -45,12 +43,16 @@ from clad_body.measure._circumferences import (
     torso_sweep_bust_hips,
 )
 from clad_body.measure._lengths import (
+    c7_surface_point,
     extract_linear_measurement_polylines,
+    measure_back_neck_to_waist,
     measure_crotch_length,
     measure_inseam,
+    measure_inseam_from_perineum_vertices,
     measure_shirt_length,
     measure_shoulder_width,
     measure_sleeve_length,
+    measure_sleeve_length_from_joints,
 )
 from clad_body.measure._render import extract_measurement_contours, render_4view
 from clad_body.measure._lengths import extract_joints_from_names
@@ -66,36 +68,90 @@ from clad_body.measure._render import (
 # lateral (X) position for the shoulder/arm junction. The actual acromion
 # (bony shoulder tip) is found by find_acromion() (max Z above bone tail).
 ANNY_JOINT_MAP = {
-    "c7": ["neck01"],
-    "neck_base": ["neck01"],      # base of neck (C7 level, ~85% height)
-    "neck_mid": ["neck02"],       # neck01 tail = neck02 head (~86% height, Adam's apple)
-    "head": ["head"],             # top of neck / base of skull
-    "side_neck": ["shoulder01.L", "shoulder01.R"],  # shoulder01 head = clavicle tail (~82% height)
-    "l_shoulder": ["upperarm01.L"],
-    "r_shoulder": ["upperarm01.R"],
-    "l_elbow": ["lowerarm01.L"],
-    "r_elbow": ["lowerarm01.R"],
-    "l_wrist": ["wrist.L"],
-    "r_wrist": ["wrist.R"],
+    # neck01.head (~83.7% height) is the T1 joint — too low for C7.
+    # The midpoint of neck01 lands at ~84.6%, matching the anatomical
+    # C7 spinous process (84–85% of stature).
+    "c7":        [("neck01", "midpoint")],
+    "neck_base": ["neck01"],       # base of neck (~84% height)
+    "neck_mid":  ["neck02"],       # neck01 tail = neck02 head (~86%, Adam's apple)
+    "head":      ["head"],         # top of neck / base of skull
+    # Shoulder bones are inside the body — use the bone TAIL (outer end of
+    # upperarm01) for the correct lateral position; acromion is then found
+    # via find_acromion() (max Z above the tail).
+    "l_shoulder": [("upperarm01.L", "tail")],
+    "r_shoulder": [("upperarm01.R", "tail")],
+    # Ball joint = upperarm01 HEAD = the actual shoulder articulation point.
+    # Used by measure_sleeve_length_from_joints. Distinct from "l_shoulder"
+    # (which is the bone TAIL = mid-bicep) because the legacy find_acromion
+    # path is calibrated against the tail-anchored bone position.
+    "l_shoulder_ball": [("upperarm01.L", "head")],
+    "r_shoulder_ball": [("upperarm01.R", "head")],
+    "l_elbow":   ["lowerarm01.L"],
+    "r_elbow":   ["lowerarm01.R"],
+    "l_wrist":   ["wrist.L"],
+    "r_wrist":   ["wrist.R"],
+    # upperleg01 TAIL sits at the perineum / inner-thigh merge level — the
+    # anatomical crotch. The HEAD is the femoral head (ball joint inside the
+    # pelvis, ~8cm above the perineum). Tail matches the mesh-sweep crotch
+    # within ~1–2cm across body types and is differentiable through LBS.
+    "l_hip":     [("upperleg01.L", "tail")],
+    "r_hip":     [("upperleg01.R", "tail")],
+    # Knee = upperleg02 TAIL = lowerleg01 HEAD (same point in space, the knee
+    # joint articulation). Used by measure_calf to bound the lower-leg sweep
+    # below the patella, so a deflated calf doesn't let the kneecap region
+    # (wider than the calf belly on tuned bodies) win the max-girth search.
+    "l_knee":    [("upperleg02.L", "tail")],
+    "r_knee":    [("upperleg02.R", "tail")],
+    # Ankle = lowerleg02 TAIL = foot HEAD = ankle joint articulation.
+    "l_ankle":   [("lowerleg02.L", "tail")],
+    "r_ankle":   [("lowerleg02.R", "tail")],
 }
 
 # Arm/hand bone indices (shoulder01 through all fingers, both sides).
 # Excludes clavicle (48, 74) which is at the torso boundary.
 ARM_HAND_BONES = set(range(49, 74)) | set(range(75, 100))
 
+# Leg/foot bone indices (upperleg01 through toes, excluding pelvis which is a
+# torso-boundary bone). Used by soft-thigh to partition vertices into single-leg
+# subsets so angular binning around one thigh doesn't mix in the other leg.
+LEFT_LEG_BONES = set(range(2, 21))    # upperleg01.L (2) through toe5-3.L (20)
+RIGHT_LEG_BONES = set(range(22, 41))  # upperleg01.R (22) through toe5-3.R (40)
+
 
 # ── Body fat & density estimation ──
 # Navy formula (Hodgdon & Beckett, 1984) for normal range,
 # Weltman equations (1987/1988) for obese bodies.
 # See findings/feature_impact_and_density.md for full research.
+#
+# The implementation is torch-native so the same formula can be used in both
+# the float `measure()` path and the differentiable `measure_grad()` path.
+# The Navy↔Weltman switch is a sigmoid soft-blend (transition width 2 BF
+# units) instead of a hard branch, so the formula is gradient-friendly even
+# in the obese regime.
+
+# Siri two-component model (cadaver-derived, tissue-only).
+_SIRI_D_FAT = 900.0   # kg/m³
+_SIRI_D_FFM = 1100.0  # kg/m³
+
+# Soft-blend parameters for Navy↔Weltman switch.
+_NAVY_WELTMAN_THRESHOLD = {"male": 28.0, "female": 38.0}
+_NAVY_WELTMAN_BLEND_WIDTH = 2.0  # BF % per sigmoid e-fold
+
+
+def _to_tensor(x, ref):
+    """Wrap a Python float as a tensor on the same device/dtype as ``ref``."""
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.as_tensor(x, dtype=ref.dtype, device=ref.device)
+
 
 def estimate_body_fat_pct(height_cm, waist_cm, hip_cm, neck_cm,
                           mass_kg, gender):
     """Estimate body fat % from circumference measurements.
 
     Uses the Hodgdon & Beckett (1984) density equations (cm inputs) with the
-    Siri transform to get BF%. Switches to Weltman equations (1987/1988) for
-    obese bodies where the Navy formula underestimates fat.
+    Siri transform to get BF%. Soft-blends Navy ↔ Weltman around 28 % (male)
+    or 38 % (female) so the formula is differentiable in the obese regime.
 
     IMPORTANT: The Hodgdon density formulas use cm. The commonly-cited direct
     BF% formulas (86.010 × log10(waist-neck)...) use INCHES — using those
@@ -106,94 +162,111 @@ def estimate_body_fat_pct(height_cm, waist_cm, hip_cm, neck_cm,
     Navy formula validated against DXA: SEE ±3.5% in normal range.
     Weltman validated against hydrostatic weighing: SEE ±2.9% in obese range.
 
+    Inputs may be Python floats or torch tensors (mixing is supported — floats
+    are wrapped on the device/dtype of the first tensor input). The return
+    type matches: float in → float out, tensor in → tensor out (gradients
+    preserved).
+
     Args:
         height_cm: body height
         waist_cm: waist circumference (Anny vertex loop or narrowest point)
         hip_cm: hip circumference
         neck_cm: neck circumference (minimum in neck region)
-        mass_kg: body mass (Anny volume × 980)
+        mass_kg: body mass — used by the Weltman branch as a bootstrap
         gender: "male" or "female"
 
     Returns:
-        Estimated body fat percentage (clipped to 3-60% range).
+        Estimated body fat percentage (clamped to 3-60 % range).
     """
+    inputs = {"height_cm": height_cm, "waist_cm": waist_cm,
+              "hip_cm": hip_cm, "neck_cm": neck_cm, "mass_kg": mass_kg}
+    tensor_inputs = [v for v in inputs.values() if isinstance(v, torch.Tensor)]
+    return_float = not tensor_inputs
+
+    # Pick a reference tensor for device/dtype, or build one from a float.
+    if tensor_inputs:
+        ref = tensor_inputs[0]
+    else:
+        ref = torch.tensor(0.0, dtype=torch.float64)
+    inputs = {k: _to_tensor(v, ref) for k, v in inputs.items()}
+    height_cm = inputs["height_cm"]
+    waist_cm = inputs["waist_cm"]
+    hip_cm = inputs["hip_cm"]
+    neck_cm = inputs["neck_cm"]
+    mass_kg = inputs["mass_kg"]
+
     if gender == "male":
         diff = waist_cm - neck_cm
-        if diff <= 0:
-            return 3.0
-        # Hodgdon & Beckett density formula (cm inputs)
+        # log10(diff) is undefined at diff <= 0; clamp protects against
+        # degenerate geometries while keeping a finite gradient.
+        diff_safe = torch.clamp_min(diff, 0.1)
         density = (1.0324
-                   - 0.19077 * math.log10(diff)
-                   + 0.15456 * math.log10(height_cm))
+                   - 0.19077 * torch.log10(diff_safe)
+                   + 0.15456 * torch.log10(height_cm))
         navy_bf = 495.0 / density - 450.0
-        # Switch to Weltman for obese males (Navy underestimates above ~28% BF)
-        if navy_bf > 28:
-            bf = 0.31457 * waist_cm - 0.10969 * mass_kg + 10.8336
-        else:
-            bf = navy_bf
+        weltman_bf = 0.31457 * waist_cm - 0.10969 * mass_kg + 10.8336
+        threshold = _NAVY_WELTMAN_THRESHOLD["male"]
     else:
         diff = waist_cm + hip_cm - neck_cm
-        if diff <= 0:
-            return 3.0
-        # Hodgdon & Beckett density formula (cm inputs)
+        diff_safe = torch.clamp_min(diff, 0.1)
         density = (1.29579
-                   - 0.35004 * math.log10(diff)
-                   + 0.22100 * math.log10(height_cm))
+                   - 0.35004 * torch.log10(diff_safe)
+                   + 0.22100 * torch.log10(height_cm))
         navy_bf = 495.0 / density - 450.0
-        # Switch to Weltman for obese females (Navy underestimates above ~38% BF)
-        if navy_bf > 38:
-            bf = (0.11077 * waist_cm - 0.17666 * height_cm
-                  + 0.14354 * mass_kg + 51.03301)
-        else:
-            bf = navy_bf
+        weltman_bf = (0.11077 * waist_cm - 0.17666 * height_cm
+                      + 0.14354 * mass_kg + 51.03301)
+        threshold = _NAVY_WELTMAN_THRESHOLD["female"]
 
-    return max(3.0, min(60.0, bf))
+    # Soft Navy↔Weltman blend.  Below threshold → ~Navy; above → ~Weltman.
+    blend = torch.sigmoid((navy_bf - threshold) / _NAVY_WELTMAN_BLEND_WIDTH)
+    bf = (1.0 - blend) * navy_bf + blend * weltman_bf
+    bf = torch.clamp(bf, 3.0, 60.0)
+
+    return float(bf.item()) if return_float else bf
 
 
 def body_density_from_bf(bf_pct):
-    """Whole-body density (kg/m³) from body fat percentage.
+    """Tissue-only body density (kg/m³) from body fat percentage.
 
     Uses the Siri two-component model (1961):
         density = 1 / (BF/d_fat + (1-BF)/d_ffm)
 
-    Returns density in kg/m³ (e.g. 1039 for 15% BF).
+    Accepts Python floats or torch tensors; returns the same kind.
+
+    Note on conventions: this is *tissue-only* density (the value hydrostatic
+    weighing reports after subtracting residual lung volume), not whole-body
+    density including lung air. Whole-body density averages ~985 kg/m³ (just
+    below water, why humans barely float); tissue-only density is ~1030–1080
+    depending on body composition. Siri's constants 900 (fat) and 1100 (FFM)
+    come from cadaver dissection and are tissue-only. The Anny default
+    980 kg/m³ used elsewhere sits between these two conventions — see
+    questionnaire/findings/feature_impact_and_density.md for the rationale
+    and the open question about which volume convention Anny's mesh follows.
     """
-    bf = bf_pct / 100.0
-    bf = max(0.03, min(0.60, bf))
-    d_fat = 900.0    # kg/m³
-    d_ffm = 1100.0   # kg/m³
-    return 1.0 / (bf / d_fat + (1.0 - bf) / d_ffm)
+    if isinstance(bf_pct, torch.Tensor):
+        bf = torch.clamp(bf_pct / 100.0, 0.03, 0.60)
+        return 1.0 / (bf / _SIRI_D_FAT + (1.0 - bf) / _SIRI_D_FFM)
+    bf = max(0.03, min(0.60, bf_pct / 100.0))
+    return 1.0 / (bf / _SIRI_D_FAT + (1.0 - bf) / _SIRI_D_FFM)
 
 
-# Median tissue density per gender from our sampling distribution (200-sample
-# validation, stable across seeds). Anny's 980 kg/m³ is calibrated so that
-# anny_mass ≈ real_mass for average bodies. These medians let us normalize
-# density relative to the population center.
-_MEDIAN_DENSITY = {"male": 1059, "female": 1031}
+def bf_corrected_density(height_cm, waist_cm, hip_cm, neck_cm,
+                         mass_kg, gender):
+    """Convenience: BF-corrected tissue density (kg/m³).
 
+    Equivalent to ``body_density_from_bf(estimate_body_fat_pct(...))``.
+    Used in both ``measure()`` and ``measure_grad()`` so the two paths
+    compute the same ``mass_kg = volume × density`` value.
 
-def density_corrected_mass(mass_kg, estimated_density, gender):
-    """Correct Anny mass for body composition differences across builds.
-
-    Anny uses fixed 980 kg/m³ which gives correct mass for average bodies.
-    This function adjusts mass relative to the population median density so
-    that athletic bodies (denser) get slightly more mass and soft bodies
-    (less dense) get slightly less — without shifting the average.
-
-    Typical corrections: -2 to +1 kg (centered around zero for average build).
-
-    Args:
-        mass_kg: Anny mass (volume × 980)
-        estimated_density: from body_density_from_bf() (kg/m³)
-        gender: "male" or "female"
-
-    Returns:
-        Corrected mass in kg.
+    Returns Python float for float inputs, torch tensor for tensor inputs.
     """
-    ref = _MEDIAN_DENSITY.get(gender, 1045)
-    return mass_kg * (estimated_density / ref)
+    bf = estimate_body_fat_pct(height_cm, waist_cm, hip_cm, neck_cm,
+                               mass_kg, gender)
+    return body_density_from_bf(bf)
 
 
+# Median tissue-only density per gender from our sampling distribution
+# (200-sample validation, stable across seeds). These match published
 def _infer_gender(model, verts):
     """Infer gender string from Anny model's last phenotype kwargs.
 
@@ -247,6 +320,289 @@ def find_acromion(verts, shoulder_joint, side="left"):
     if len(candidates) == 0:
         return shoulder_joint.copy()
     return candidates[np.argmax(candidates[:, 2])].copy()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ISO 8559-1 sleeve length: slow reference (calibration only)
+#
+# This is the SLOW REFERENCE function used to calibrate the differentiable
+# runtime function `measure_sleeve_length_from_joints` in _lengths.py.
+#
+# Architecture (mirrors `measure_inseam` / `measure_inseam_from_perineum_vertices`):
+#   - measure_sleeve_length_iso_reference (this file): non-differentiable,
+#     poses the body in rest pose with natural ~42° elbow flex, detects
+#     acromion / olecranon / wrist styloid via skinning weights and bone
+#     geometry, slices the body with two planes (upper-arm + forearm),
+#     walks Dijkstra shortest paths along the resulting contours.
+#     Used once per body during calibration.
+#   - measure_sleeve_length_from_joints (_lengths.py): fast differentiable,
+#     bone chain + linear correction calibrated against this reference.
+#     Used in the gradient hot loop.
+#
+# Per ISO 8559-1 §3.1.1: shoulder point = "most lateral point of the
+# lateral edge of the spine (acromial process) of the scapula, projected
+# vertically to the surface of the skin."
+# Per ISO §3.1.10: elbow point = "most prominent point of the olecranon
+# of ulna" (the bony bump on the back of a flexed elbow).
+# Per ISO §5.4.14/5.4.15: upper arm length and lower arm length are
+# measured along the body surface with the elbow bent.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _vertices_skinned_to(model, bone_indices, threshold=0.1):
+    """Boolean (V,) mask: True if vertex has weight > threshold on any of the
+    listed bone indices (taking the sum across the up-to-8 bone slots)."""
+    vbw = model.vertex_bone_weights.detach().cpu().numpy()
+    vbi = model.vertex_bone_indices.detach().cpu().numpy()
+    weight_per_vertex = np.zeros(vbw.shape[0])
+    for bi in bone_indices:
+        slot_match = (vbi == bi)
+        weight_per_vertex += np.where(slot_match, vbw, 0).sum(axis=1)
+    return weight_per_vertex > threshold
+
+
+def _detect_acromion_iso(model, verts, ball_pos, upperarm01_tail, side):
+    """ISO acromion: surface vertex in a tube around the perpendicular ray
+    from the ball joint, perpendicular to the upperarm01 bone, picking the
+    HIGHEST Z within the tube.
+
+    The ray geometry mirrors how a tape measurer projects the bony
+    acromial process onto the skin: starting at the ball joint and going
+    outward perpendicular to the humerus, the first point on the skin
+    along that direction (constrained to be high) is the acromion.
+    """
+    labels = list(model.bone_labels)
+    bone_idx = [labels.index(f"shoulder01.{side}"), labels.index(f"upperarm01.{side}")]
+    skin_mask = _vertices_skinned_to(model, bone_idx, threshold=0.1)
+
+    u = upperarm01_tail - ball_pos
+    u = u / np.linalg.norm(u)
+
+    # Lateral perpendicular direction (outward, perpendicular to bone)
+    side_sign = +1 if side == "L" else -1
+    world_lat = np.array([side_sign, 0.0, 0.0], dtype=verts.dtype)
+    lateral = world_lat - (world_lat @ u) * u
+    lateral = lateral / np.linalg.norm(lateral)
+
+    candidates = verts[skin_mask]
+    delta = candidates - ball_pos
+    lateral_proj = delta @ lateral
+    perp = delta - lateral_proj[:, None] * lateral
+    perp_dist = np.linalg.norm(perp, axis=1)
+
+    near_tube = (perp_dist < 0.015) & (lateral_proj > 0)
+    if not near_tube.any():
+        raise ValueError(f"No skinned vertices near acromion ray on {side} side")
+    tube_verts = candidates[near_tube]
+    return tube_verts[np.argmax(tube_verts[:, 2])]
+
+
+def _detect_olecranon_iso(model, verts, ball_pos, elbow_pos, wrist_pos, side):
+    """ISO olecranon: surface vertex within 5 cm of the elbow joint, furthest
+    along the geometric back-of-elbow direction.
+
+    The "back of bent elbow" direction is the bisector of the OUTSIDE of
+    the bend: -unit(unit(ball-elbow) + unit(wrist-elbow)). This points
+    posteriorly when the elbow is flexed and lands on the olecranon
+    protrusion regardless of how much the elbow is bent.
+    """
+    labels = list(model.bone_labels)
+    bone_idx = [labels.index(f"upperarm02.{side}"), labels.index(f"lowerarm01.{side}")]
+    skin_mask = _vertices_skinned_to(model, bone_idx, threshold=0.1)
+    near_mask = np.linalg.norm(verts - elbow_pos, axis=1) < 0.05
+    mask = skin_mask & near_mask
+    if not mask.any():
+        raise ValueError(f"No vertices near elbow joint on {side} side")
+    u = ball_pos - elbow_pos; u = u / np.linalg.norm(u)
+    v = wrist_pos - elbow_pos; v = v / np.linalg.norm(v)
+    back_dir = -(u + v)
+    back_dir = back_dir / np.linalg.norm(back_dir)
+    candidates = verts[mask]
+    proj = (candidates - elbow_pos) @ back_dir
+    return candidates[np.argmax(proj)]
+
+
+def _detect_wrist_styloid_iso(model, verts, wrist_pos, side):
+    """ISO wrist landmark (ulnar styloid approximation): most lateral surface
+    vertex within a thin Z-slab around the wrist joint, restricted to
+    lowerarm02-skinned verts (excludes hand verts distal to the wrist crease).
+    """
+    labels = list(model.bone_labels)
+    bone_idx = [labels.index(f"lowerarm02.{side}")]
+    skin_mask = _vertices_skinned_to(model, bone_idx, threshold=0.1)
+    z_slab = np.abs(verts[:, 2] - wrist_pos[2]) < 0.008
+    mask = skin_mask & z_slab
+    if not mask.any():
+        raise ValueError(f"No vertices in Z-slab around wrist joint on {side} side")
+    candidates = verts[mask]
+    if side == "L":
+        return candidates[np.argmax(candidates[:, 0])]
+    return candidates[np.argmin(candidates[:, 0])]
+
+
+def _slice_and_walk(verts, faces, p_start, p_end, p_plane):
+    """Plane-mesh slice between p_start and p_end, with the plane containing
+    the third point p_plane (typically a bone joint to fix the orientation).
+    Walks the shortest path along the contour from p_start to p_end.
+
+    Returns (length_cm, polyline_vertices) or raises if no contour exists.
+    """
+    import trimesh
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    normal = np.cross(p_end - p_start, p_plane - p_start)
+    normal = normal / np.linalg.norm(normal)
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    lines = trimesh.intersections.mesh_plane(
+        mesh, plane_normal=normal, plane_origin=p_start,
+    )
+    if len(lines) == 0:
+        raise ValueError("Plane missed mesh")
+
+    # Chain segments and run Dijkstra
+    segments = lines.reshape(-1, 3)
+    n_seg = len(lines)
+    eps = 1e-5
+    rounded = np.round(segments / eps).astype(np.int64)
+    _, inverse = np.unique(rounded, axis=0, return_inverse=True)
+    n_unique = inverse.max() + 1
+    unique_pts = np.zeros((n_unique, 3))
+    for i in range(len(segments)):
+        unique_pts[inverse[i]] = segments[i]
+
+    rows, cols, data = [], [], []
+    for s in range(n_seg):
+        a = int(inverse[2 * s])
+        b = int(inverse[2 * s + 1])
+        if a == b:
+            continue
+        w = float(np.linalg.norm(unique_pts[a] - unique_pts[b]))
+        rows.append(a); cols.append(b); data.append(w)
+        rows.append(b); cols.append(a); data.append(w)
+    graph = csr_matrix((data, (rows, cols)), shape=(n_unique, n_unique))
+
+    i_start = int(np.argmin(np.linalg.norm(unique_pts - p_start, axis=1)))
+    i_end = int(np.argmin(np.linalg.norm(unique_pts - p_end, axis=1)))
+
+    dist, pred = dijkstra(graph, indices=i_start, return_predecessors=True)
+    if pred[i_end] == -9999:
+        raise ValueError("No contour path between landmarks")
+    path = [i_end]
+    cur = i_end
+    while cur != i_start:
+        cur = int(pred[cur])
+        path.append(cur)
+    path.reverse()
+    return float(dist[i_end]) * 100, unique_pts[path]
+
+
+def measure_sleeve_length_iso_reference(body, side="L"):
+    """Slow ISO 8559-1 sleeve length reference for calibration.
+
+    Re-poses the body in REST POSE (lowerarm01 rotation 0° → natural ~42°
+    elbow flex, the convention for "elbow bent" in ISO §5.4.14/5.4.15),
+    detects acromion / olecranon / wrist styloid landmarks, slices the
+    body with two planes (upper-arm bone + acromion + olecranon, forearm
+    bone + olecranon + wrist styloid), and walks the shortest path along
+    each contour.
+
+    NOT differentiable. Used once per body during calibration of
+    `measure_sleeve_length_from_joints` (the fast differentiable runtime).
+    Costs ~1 second per body.
+
+    Args:
+        body:  AnnyBody from load_anny_from_params (the model is used; the
+               body's vertices/joints are NOT used because we re-pose).
+        side:  "L" or "R" — which arm to measure. Default left.
+
+    Returns:
+        dict with 'sleeve_length_cm', 'acromion', 'olecranon',
+        'wrist_styloid', and 'path_vertices' (the polyline of the surface
+        walk for visualization).
+    """
+    import torch
+
+    model = body.model
+    pheno = getattr(model, "_last_phenotype_kwargs", None)
+    if pheno is None:
+        raise ValueError("body.model has no _last_phenotype_kwargs; "
+                         "use load_anny_from_params first")
+
+    # Build a rest pose: lowerarm01 rotation = 0° (natural Anny rest position)
+    n = model.bone_count
+    # Anny models don't expose a single .parameters() iterator; pull device
+    # from any tensor attribute we can find.
+    device = torch.device("cpu")
+    if hasattr(model, "vertex_bone_weights"):
+        device = model.vertex_bone_weights.device
+    pose = torch.eye(4, device=device, dtype=torch.float32)
+    pose = pose.unsqueeze(0).unsqueeze(0).expand(1, n, 4, 4).clone()
+    # No rotation applied — rest pose is natural ~42° elbow flex
+
+    # Resolve local_changes_kwargs for the re-pose forward — must match the
+    # values used to produce the body, otherwise the re-pose returns baseline-
+    # arm geometry regardless of the body's actual blendshape values.
+    # Search order: body → model cache → phenotype_params dict fallback.
+    local_kwargs = body.local_changes_kwargs
+    if local_kwargs is None:
+        local_kwargs = getattr(model, "_last_local_changes_kwargs", None)
+    if local_kwargs is None:
+        lc_dict = (body.phenotype_params or {}).get("_local_changes") or {}
+        local_kwargs = {l: torch.tensor([v], dtype=torch.float32, device=device)
+                        for l, v in lc_dict.items()}
+    with torch.no_grad():
+        out = model(
+            pose_parameters=pose,
+            phenotype_kwargs=pheno,
+            local_changes_kwargs=local_kwargs,
+            pose_parameterization="root_relative_world",
+            return_bone_ends=True,
+        )
+
+    verts_yup = out["vertices"][0].cpu().numpy()
+    heads = out["bone_heads"][0].cpu().numpy()
+    tails = out["bone_tails"][0].cpu().numpy()
+    faces = (model.faces.detach().cpu().numpy()
+             if hasattr(model.faces, "detach") else np.array(model.faces)).astype(np.int64)
+
+    # Anny outputs are Z-up natively (verified by checking extents). Just
+    # shift to floor and XY-centre to match the canonical clad-body frame.
+    z_min = float(verts_yup[:, 2].min())
+    verts = verts_yup.copy()
+    verts[:, 2] -= z_min
+    cxy = (verts[:, :2].max(0) + verts[:, :2].min(0)) / 2
+    verts[:, 0] -= cxy[0]; verts[:, 1] -= cxy[1]
+    heads = heads.copy(); heads[:, 2] -= z_min
+    heads[:, 0] -= cxy[0]; heads[:, 1] -= cxy[1]
+    tails = tails.copy(); tails[:, 2] -= z_min
+    tails[:, 0] -= cxy[0]; tails[:, 1] -= cxy[1]
+
+    labels = list(model.bone_labels)
+    ball_pos = heads[labels.index(f"upperarm01.{side}")]
+    upperarm01_tail = tails[labels.index(f"upperarm01.{side}")]
+    elbow_pos = heads[labels.index(f"lowerarm01.{side}")]
+    wrist_pos = heads[labels.index(f"wrist.{side}")]
+
+    # Landmark detection
+    acr = _detect_acromion_iso(model, verts, ball_pos, upperarm01_tail, side)
+    olc = _detect_olecranon_iso(model, verts, ball_pos, elbow_pos, wrist_pos, side)
+    wrs = _detect_wrist_styloid_iso(model, verts, wrist_pos, side)
+
+    # Two-plane surface walk
+    len_upper, walk_upper = _slice_and_walk(verts, faces, acr, olc, ball_pos)
+    len_forearm, walk_forearm = _slice_and_walk(verts, faces, olc, wrs, elbow_pos)
+    walked = np.vstack([walk_upper, walk_forearm[1:]])  # avoid duplicate olecranon
+    total_cm = len_upper + len_forearm
+
+    return {
+        "sleeve_length_cm": total_cm,
+        "acromion": acr,
+        "olecranon": olc,
+        "wrist_styloid": wrs,
+        "path_vertices": walked,
+    }
+
 
 # Breast bone indices (breast.L=45, breast.R=46 in Anny skeleton).
 BREAST_BONES = {45, 46}
@@ -303,12 +659,28 @@ def breast_floor_z(model, mesh_verts, weight_threshold=0.3):
 # WARNING: Hip and bust loops are NOT accurate circumference tracers — they don't
 # form clean anatomical rings. They ARE used for Z-height anchoring only (the mean Z
 # of each loop gives a reliable anatomical landmark at ~75% for bust, ~52% for hips).
-# Do NOT use these for circumference measurement — use plane sweep instead.
-# Thigh and upperarm loops are used by tuning_anny.py for differentiable optimization.
+# Do NOT use these for circumference measurement — use plane sweep (reporting)
+# or soft circumference (``measure_grad``) instead.
+# Upperarm loop is reasonable as a differentiable proxy (< 1 cm vs plane sweep).
 BASE_MESH_HIP_VERTICES = [4296, 4295, 4291, 4292, 4336, 4339, 4331, 4359, 10983, 10958, 10965, 10962, 10922, 10921, 10925, 10926, 10923, 10924, 10860, 10867, 10853, 10854, 4218, 4217, 4233, 4225, 4294, 4293]
-BASE_MESH_BUST_VERTICES = [1445, 1438, 1855, 1888, 1762, 1798, 8470, 8434, 8560, 8527, 8126, 8133, 8315, 8313, 8365, 8241, 8247, 8253, 1575, 1569, 1563, 1693, 1641, 1643]
-BASE_MESH_THIGH_VERTICES = [6745, 6744, 6743, 6742, 6741, 6740, 6739, 6738, 6737, 6736, 6755, 6754, 6753, 6752, 6751, 6750, 6749, 6748, 6747, 6746]
 BASE_MESH_UPPERARM_VERTICES = [3788, 1710, 1706, 1705, 1701, 1702, 1703, 1704, 1694, 1700, 1695, 1696, 3763, 1697, 1698, 1699, 1709, 1708, 1707, 3850]
+
+# Shoulder width landmark seeds (base-mesh indices). The R/L acromion seeds
+# are NOT used directly — they only anchor the k-ring patch over which the
+# soft acromion does its Z-argmax (the actual argmax vertex drifts off the
+# seed on broad-shoulder males). C7 IS used directly (stable on 100/100
+# random bodies). See findings/shoulder_width_diff.md.
+BASE_MESH_R_ACROMION_SEED = 1557
+BASE_MESH_C7_SURFACE_SEED = 858
+BASE_MESH_L_ACROMION_SEED = 8235
+
+# Soft-acromion hyperparameters. K=2 covers 100 % of observed argmax landings
+# on a 100-body sample. X_BAND mirrors the numpy ±5 cm hard band as a soft
+# Gaussian. TAU is the Z softmax temperature — sharp enough to behave like
+# a hard argmax at the optimum, soft enough to leak gradient to neighbours.
+ACROMION_RING_K = 2
+ACROMION_X_BAND = 0.018          # 18 mm Gaussian half-width
+ACROMION_SOFTMAX_TAU = 0.010     # 10 mm Z softmax temperature
 
 
 def remap_vertex_indices(model, base_mesh_indices):
@@ -322,14 +694,125 @@ def remap_vertex_indices(model, base_mesh_indices):
     return [base_to_reduced.index(i) for i in base_mesh_indices]
 
 
+def compute_k_ring(model, seed_reduced_idx, k):
+    """Vertex indices within graph distance ≤ k from seed (reduced mesh).
+
+    BFS over the face-adjacency graph. Topology-only — safe to cache on the
+    model. Returns a sorted list of int indices, including the seed.
+    """
+    faces = model.faces.detach().cpu().numpy() if hasattr(model.faces, "detach") else np.asarray(model.faces)
+    n_verts = int(faces.max()) + 1
+    neigh = [set() for _ in range(n_verts)]
+    for a, b, c in faces:
+        neigh[a].update((b, c))
+        neigh[b].update((a, c))
+        neigh[c].update((a, b))
+    frontier = {int(seed_reduced_idx)}
+    visited = {int(seed_reduced_idx)}
+    for _ in range(k):
+        nxt = set()
+        for v in frontier:
+            nxt |= neigh[v]
+        nxt -= visited
+        visited |= nxt
+        frontier = nxt
+    return sorted(visited)
+
+
 def setup_extended_anthro(model):
-    """Create Anthropometry instance with all custom vertex loops attached."""
+    """Create Anthropometry instance with all custom vertex loops attached.
+
+    Cached on ``model._extended_anthro`` — the result depends only on model
+    topology (vertex indices, bone hierarchy) which is constant across forward
+    passes with different phenotype params.
+    """
+    cached = getattr(model, "_extended_anthro", None)
+    if cached is not None:
+        return cached
     anthro = anny.Anthropometry(model)
     anthro.hip_vertex_indices = remap_vertex_indices(model, BASE_MESH_HIP_VERTICES)
-    anthro.bust_vertex_indices = remap_vertex_indices(model, BASE_MESH_BUST_VERTICES)
-    anthro.thigh_vertex_indices = remap_vertex_indices(model, BASE_MESH_THIGH_VERTICES)
     anthro.upperarm_vertex_indices = remap_vertex_indices(model, BASE_MESH_UPPERARM_VERTICES)
+
+    # Shoulder-width landmarks: seeds + per-side k-ring patches for soft-argmax.
+    r_seed, c7_seed, l_seed = remap_vertex_indices(
+        model,
+        [BASE_MESH_R_ACROMION_SEED,
+         BASE_MESH_C7_SURFACE_SEED,
+         BASE_MESH_L_ACROMION_SEED],
+    )
+    anthro.shoulder_c7_index = c7_seed  # C7 is stable — used directly
+    anthro.shoulder_r_acromion_ring = compute_k_ring(model, r_seed, ACROMION_RING_K)
+    anthro.shoulder_l_acromion_ring = compute_k_ring(model, l_seed, ACROMION_RING_K)
+    # Bone indices for the per-body lateral X anchor (midpoint of upperarm01).
+    bone_labels = list(model.bone_labels)
+    anthro.shoulder_r_upperarm_bone = bone_labels.index("upperarm01.R")
+    anthro.shoulder_l_upperarm_bone = bone_labels.index("upperarm01.L")
+
+    model._extended_anthro = anthro
     return anthro
+
+
+def compute_soft_acromion(verts, ring_indices, anchor_x,
+                          x_band=ACROMION_X_BAND, tau=ACROMION_SOFTMAX_TAU):
+    """Differentiable acromion landmark — soft equivalent of ``find_acromion``.
+
+    Soft analogue of "highest Z within a lateral band around the shoulder":
+
+        log_w = Z / tau − (X − anchor_x)² / (2 · x_band²)
+
+    Returns the softmax-weighted average position over ``ring_indices``.
+    The Gaussian X term excludes medial vertices on the trapezius hump
+    (which outrank the bony shoulder tip on Z alone) without a hard mask.
+
+    Args:
+        verts: (1, V, 3) tensor — axis 0 = lateral X, axis 2 = Z.
+        ring_indices: reduced-mesh vertex indices for the search patch.
+        anchor_x: (1, 1) tensor — lateral anchor (typically the upperarm01
+            bone-midpoint X, so the band drifts via LBS with body shape).
+    """
+    candidates = verts[:, ring_indices]
+    z = candidates[:, :, 2]
+    x = candidates[:, :, 0]
+    log_w = z / tau - ((x - anchor_x) ** 2) / (2.0 * x_band ** 2)
+    weights = torch.softmax(log_w, dim=-1)
+    return torch.sum(weights.unsqueeze(-1) * candidates, dim=1)
+
+
+def compute_shoulder_arc_length(verts, anthro, model, n_samples=30,
+                                x_band=ACROMION_X_BAND,
+                                tau=ACROMION_SOFTMAX_TAU):
+    """ISO 8559-1 §5.4.2 shoulder arc length, fully differentiable.
+
+    Soft acromions on each side + cached C7 vertex + quadratic curve through
+    (R, C7, L), sampled at ``n_samples`` points; segment norms summed.
+    Per-side X anchor = midpoint of ``upperarm01.{head, tail}`` (the lateral
+    shoulder edge — both endpoints move via LBS with shoulder breadth).
+
+    ``model._last_bone_heads`` / ``_last_bone_tails`` must be populated by
+    the immediately preceding forward pass (``return_bone_ends=True``).
+    """
+    heads = model._last_bone_heads[0]
+    tails = model._last_bone_tails[0]
+    r_anchor = 0.5 * (heads[anthro.shoulder_r_upperarm_bone, 0:1]
+                      + tails[anthro.shoulder_r_upperarm_bone, 0:1]).unsqueeze(0)
+    l_anchor = 0.5 * (heads[anthro.shoulder_l_upperarm_bone, 0:1]
+                      + tails[anthro.shoulder_l_upperarm_bone, 0:1]).unsqueeze(0)
+
+    P_r = compute_soft_acromion(verts, anthro.shoulder_r_acromion_ring,
+                                r_anchor, x_band=x_band, tau=tau)
+    P_l = compute_soft_acromion(verts, anthro.shoulder_l_acromion_ring,
+                                l_anchor, x_band=x_band, tau=tau)
+    P_c7 = verts[:, anthro.shoulder_c7_index]
+
+    # Quadratic through (R at t=0, C7 at t=0.5, L at t=1) — closed form.
+    a = 2.0 * P_r + 2.0 * P_l - 4.0 * P_c7
+    b = 4.0 * P_c7 - 3.0 * P_r - P_l
+    c = P_r
+    t = torch.linspace(0.0, 1.0, n_samples, dtype=verts.dtype, device=verts.device)
+    t2 = t.unsqueeze(-1)
+    curve = a.unsqueeze(1) * (t2 ** 2) + b.unsqueeze(1) * t2 + c.unsqueeze(1)
+    segs = curve[:, 1:] - curve[:, :-1]
+    return torch.sum(torch.linalg.norm(segs, dim=-1), dim=-1).squeeze(0)
 
 
 def compute_loop_circumference(verts, vertex_indices):
@@ -338,8 +821,10 @@ def compute_loop_circumference(verts, vertex_indices):
     Same algorithm as anny.Anthropometry.waist_circumference():
     vertices at given indices form a closed loop, sum of edge lengths.
 
-    Used by tuning_anny.py for gradient-based optimization (waist, thigh).
-    For measurement reporting, use plane sweep instead (measure_thigh/measure_upperarm).
+    Used by measure_grad for waist (46-vertex anatomical loop) and upperarm
+    (20 vertices, < 1 cm error). For reporting, use plane sweep
+    (``measure()``); for differentiable thigh/bust/hip/underbust use the
+    soft circumference path in ``_soft_circ.py``.
 
     Args:
         verts: (1, V, 3) tensor — full mesh vertices
@@ -352,21 +837,90 @@ def compute_loop_circumference(verts, vertex_indices):
     return torch.sum(torch.linalg.norm(loop_rolled - loop_verts, dim=-1), dim=-1)
 
 
-def _extract_anny_joints(model):
+def _extract_anny_joints(model, as_tensor=False):
     """Extract canonical joint positions from Anny model after forward pass.
 
     Uses bone_heads from the last forward pass (stashed on model by
-    generate_anny_mesh_from_params). Falls back to template_bone_heads
-    if no forward pass output is available.
+    load_anny_from_params / load_anny_from_verts). Falls back to template_bone_heads
+    if no forward pass output is available (numpy path only).
 
     For shoulder joints (l_shoulder, r_shoulder), uses bone TAILS (end of
     upperarm01) instead of heads. The tail of upperarm01 sits at the
     outer end of the upper arm bone, closer to the actual shoulder tip.
 
+    Args:
+        model: Anny rigged model with ``_last_bone_heads`` / ``_last_bone_tails``
+            stashed from the most recent forward pass.
+        as_tensor: If ``True``, return (3,) torch tensors that preserve autograd
+            history from the forward pass that produced the bone data.  The
+            Y-up → Z-up coordinate swap and floor-alignment are performed
+            differentiably so that gradients flow through Z positions.
+            Requires ``model._last_bone_heads`` to be present (no template
+            fallback — templates have no live gradient).
+            Default ``False`` preserves the existing numpy behaviour.
+
     Returns:
-        dict mapping canonical joint names to (3,) numpy arrays (Z-up, metres),
+        dict mapping canonical joint names to (3,) arrays/tensors (Z-up, metres),
         or empty dict if bone data unavailable.
     """
+    if as_tensor:
+        # ── Torch path: preserves autograd history ──────────────────────────
+        bone_heads = getattr(model, "_last_bone_heads", None)
+        bone_tails = getattr(model, "_last_bone_tails", None)
+        if bone_heads is None:
+            raise ValueError(
+                "model._last_bone_heads is missing — the model must be run with "
+                "return_bone_ends=True before calling measure_grad(). "
+                "Use load_anny_from_params() which does this automatically."
+            )
+
+        heads = bone_heads[0]  # (n_joints, 3) — grad flows from here
+        tails = bone_tails[0] if bone_tails is not None else None
+
+        # Detect height axis under no_grad — result is a Python int, not tracked
+        with torch.no_grad():
+            extents = heads.max(dim=0).values - heads.min(dim=0).values
+            height_axis = int(extents.argmax().item())
+
+        if height_axis == 1:  # Y-up → Z-up: [x, y, z] → [x, z, -y]
+            heads = torch.stack([heads[:, 0], heads[:, 2], -heads[:, 1]], dim=-1)
+            if tails is not None:
+                tails = torch.stack([tails[:, 0], tails[:, 2], -tails[:, 1]], dim=-1)
+
+        # Floor at Z=0 (differentiable — z_min carries gradient through Z positions)
+        z_min = heads[:, 2].min()
+        heads = torch.stack([heads[:, 0], heads[:, 1], heads[:, 2] - z_min], dim=-1)
+        if tails is not None:
+            tails = torch.stack([tails[:, 0], tails[:, 1], tails[:, 2] - z_min], dim=-1)
+
+        bone_labels = list(model.bone_labels) if hasattr(model, "bone_labels") else []
+        if not bone_labels:
+            return {}
+
+        # Same extraction logic as extract_joints_from_names but with torch tensors
+        name_to_idx = {name: i for i, name in enumerate(bone_labels)}
+        result = {}
+        for canon_name, candidates in ANNY_JOINT_MAP.items():
+            for cand in candidates:
+                if isinstance(cand, str):
+                    bone, mode = cand, "head"
+                else:
+                    bone, mode = cand
+                if bone not in name_to_idx:
+                    continue
+                i = name_to_idx[bone]
+                if mode == "head":
+                    result[canon_name] = heads[i]
+                elif mode == "tail" and tails is not None:
+                    result[canon_name] = tails[i]
+                elif mode == "midpoint" and tails is not None:
+                    result[canon_name] = 0.5 * (heads[i] + tails[i])
+                else:
+                    continue
+                break
+        return result
+
+    # ── Numpy path (existing behaviour) ─────────────────────────────────────
     bone_heads = getattr(model, "_last_bone_heads", None)
     bone_tails = getattr(model, "_last_bone_tails", None)
     if bone_heads is not None:
@@ -405,16 +959,7 @@ def _extract_anny_joints(model):
     if not bone_labels:
         return {}
 
-    joints = extract_joints_from_names(bone_labels, heads_np, ANNY_JOINT_MAP)
-
-    # Override shoulder joints with bone tails (end of upperarm01)
-    if tails_np is not None:
-        tail_joints = extract_joints_from_names(bone_labels, tails_np, ANNY_JOINT_MAP)
-        for key in ("l_shoulder", "r_shoulder"):
-            if key in tail_joints:
-                joints[key] = tail_joints[key]
-
-    return joints
+    return extract_joints_from_names(bone_labels, heads_np, ANNY_JOINT_MAP, tails=tails_np)
 
 
 def _anny_to_trimesh(verts_tensor, model):
@@ -477,304 +1022,6 @@ def load_phenotype_params(params_path: str) -> dict:
         return json.load(f)
 
 
-def generate_anny_mesh_from_params(params_dict: dict, device="cpu") -> tuple[torch.Tensor, object]:
-    """Generate Anny mesh in A-pose from phenotype parameters.
-
-    .. deprecated::
-        Prefer :func:`clad_body.load.anny.load_anny_from_params` which
-        returns an :class:`AnnyBody` with cached model, mesh, and bone
-        data — ready for ``measure()`` without redundant work.
-
-    This function creates a **new** Anny model (~400 ms) on every call.
-    Use ``load_anny_from_params`` to avoid this cost.
-
-    Returns:
-        vertices: (1, V, 3) torch tensor (Y-up, Anny native)
-        model: Anny model instance (with ``_last_bone_heads/tails`` stashed)
-    """
-    device = torch.device(device)
-
-    # Extract local changes if present
-    local_changes = params_dict.get("_local_changes", {})
-    local_change_labels = list(local_changes.keys()) if local_changes else False
-
-    # Create Anny model
-    model = anny.create_fullbody_model(
-        all_phenotypes=True, triangulate_faces=True,
-        local_changes=local_change_labels,
-    )
-    model = model.to(dtype=torch.float32, device=device)
-
-    # Build phenotype kwargs
-    phenotype_kwargs = {}
-    for label in model.phenotype_labels:
-        if label in params_dict:
-            phenotype_kwargs[label] = torch.tensor(
-                [params_dict[label]], dtype=torch.float32, device=device
-            )
-
-    # Build local changes kwargs
-    local_kwargs = {}
-    for label, value in local_changes.items():
-        local_kwargs[label] = torch.tensor([value], dtype=torch.float32, device=device)
-
-    # Generate A-pose mesh
-    n_joints = model.bone_count
-    a_pose = torch.eye(4, device=device, dtype=torch.float32)
-    a_pose = a_pose.unsqueeze(0).unsqueeze(0).expand(1, n_joints, 4, 4).clone()
-
-    # A-pose: lowerarm01.L [52] and lowerarm01.R [78] rotated X=-45°
-    angle = math.radians(-45)
-    rotvec_arm = torch.tensor([angle, 0, 0], device=device, dtype=torch.float32)
-    a_pose[0, 52, :3, :3] = roma.rotvec_to_rotmat(rotvec_arm)
-    a_pose[0, 78, :3, :3] = roma.rotvec_to_rotmat(rotvec_arm)
-
-    # Forward pass — request bone ends for joint-based measurements
-    with torch.no_grad():
-        output = model(
-            pose_parameters=a_pose,
-            phenotype_kwargs=phenotype_kwargs,
-            local_changes_kwargs=local_kwargs,
-            pose_parameterization='root_relative_world',
-            return_bone_ends=True,
-        )
-
-    # Stash bone heads and tails on model for downstream joint extraction
-    model._last_bone_heads = output.get("bone_heads")
-    model._last_bone_tails = output.get("bone_tails")
-    model._last_phenotype_kwargs = phenotype_kwargs
-
-    return output["vertices"], model
-
-
-def measure_body_from_verts(verts, model, render_path=None, title="", fast=False):
-    """Measure an Anny body from pre-generated vertices.
-
-    .. deprecated::
-        Use ``clad_body.measure.measure(body, preset=...)`` instead.
-
-    Same measurements as measure_body() but skips mesh generation — use when you
-    already have vertices (e.g. after scaling or during optimization).
-
-    When ``fast=True``, skips expensive operations not needed for bulk dataset
-    generation: acromion search (shoulder_width_cm, sleeve_length_cm), linear
-    polylines, and contour extraction.  Circumference measurements, belly depth,
-    and body composition are still computed.
-
-    All circumference measurements use plane sweep (ISO 8559-1):
-    - Bust: torso-only mesh plane sweep (arm faces excluded via skinning weights)
-    - Waist: Anny built-in vertex loop (anatomically defined by model)
-    - Hips: full mesh plane sweep with 0.60m x_extent filter
-    - Thigh: full mesh plane sweep, 2 separate leg contours at 30-37% height
-    - Upper arm: full mesh plane sweep, arm contours at 72-80% height
-
-    Args:
-        verts: (1, V, 3) torch tensor — Anny mesh vertices
-        model: Anny model instance (for faces, vertex loops, skinning weights)
-        render_path: if set, save 4-view render with measurement contours
-        title: title for the 4-view render
-
-    Returns:
-        dict with measurements in cm/kg and internal metadata (_mesh_tri, etc.)
-    """
-    anthro = setup_extended_anthro(model)
-    mesh_tri = _anny_to_trimesh(verts, model)
-    mesh_verts = np.array(mesh_tri.vertices)
-    height = mesh_verts[:, 2].max()
-
-    # Build torso-only mesh (exclude arm/hand faces via skinning weights)
-    arm_mask = build_arm_mask(model)
-    torso_mesh = build_torso_mesh(mesh_tri, arm_mask)
-
-    # Waist from Anny built-in vertex loop
-    waist_cm = anthro.waist_circumference(verts).item() * 100
-    waist_z = float(mesh_verts[anthro.waist_vertex_indices, 2].mean())
-
-    # Anchor bust at breast bone prominence (ISO 8559-1 §5.3.4: "across the bust
-    # prominence"), hip around vertex loop Z.
-    bust_anchor_z = _breast_prominence_z(model, mesh_verts)
-    hip_anchor_z = float(mesh_verts[anthro.hip_vertex_indices, 2].mean())
-
-    # Bust (torso-only mesh) and hips (full mesh) via plane sweep
-    bust_cm, bust_z, hip_cm, hip_z = torso_sweep_bust_hips(
-        mesh_tri, torso_mesh, waist_z, height,
-        bust_anchor_z=bust_anchor_z, hip_anchor_z=hip_anchor_z)
-
-
-    measurements = {"height_cm": height * 100}
-
-    # Hip
-    measurements["hip_cm"] = hip_cm
-    measurements["_hip_z"] = hip_z
-    measurements["_hip_pct"] = (hip_z / height * 100) if hip_z > 0 else 0
-
-    # Bust
-    measurements["bust_cm"] = bust_cm
-    measurements["_bust_z"] = bust_z
-    measurements["_bust_pct"] = (bust_z / height * 100) if bust_z > 0 else 0
-
-    # Waist from Anny vertex loop
-    measurements["waist_cm"] = waist_cm
-    measurements["_waist_z"] = waist_z
-    measurements["_waist_pct"] = waist_z / height * 100
-
-    # Stomach: max torso circ between waist and hips (belly prominence)
-    stomach_cm, stomach_z, stomach_pct, belly_front_y = measure_stomach(
-        torso_mesh, waist_z, hip_anchor_z, height)
-    measurements["stomach_cm"] = stomach_cm
-    measurements["_stomach_z"] = stomach_z
-    measurements["_stomach_pct"] = stomach_pct
-    measurements["_belly_front_y"] = belly_front_y
-
-    # Joint positions (needed for neck perpendicular slicing + linear measurements)
-    joints = _extract_anny_joints(model)
-
-    # Limb measurements (expensive plane sweeps — skip in fast mode)
-    if not fast:
-        thigh_cm, thigh_z, thigh_pct = measure_thigh(mesh_tri, height)
-        measurements["thigh_cm"] = thigh_cm
-        measurements["_thigh_z"] = thigh_z
-        measurements["_thigh_pct"] = thigh_pct
-
-        knee_cm, knee_z, knee_pct = measure_knee(mesh_tri, height)
-        measurements["knee_cm"] = knee_cm
-        measurements["_knee_z"] = knee_z
-        measurements["_knee_pct"] = knee_pct
-
-        calf_cm, calf_z, calf_pct = measure_calf(mesh_tri, height)
-        measurements["calf_cm"] = calf_cm
-        measurements["_calf_z"] = calf_z
-        measurements["_calf_pct"] = calf_pct
-
-        upperarm_cm, upperarm_z, upperarm_pct = measure_upperarm(mesh_tri, height)
-        measurements["upperarm_cm"] = upperarm_cm
-        measurements["_upperarm_z"] = upperarm_z
-        measurements["_upperarm_pct"] = upperarm_pct
-
-        # Inseam via mesh geometry (crotch detection)
-        inseam_cm, inseam_z, inseam_pct = measure_inseam(mesh_tri, height)
-        measurements["inseam_cm"] = inseam_cm
-        measurements["_inseam_z"] = inseam_z
-        measurements["_inseam_pct"] = inseam_pct
-
-        # Crotch length (total rise) via surface tracing
-        crotch_len, front_rise, back_rise, crotch_f_pts, crotch_b_pts = \
-            measure_crotch_length(
-                mesh_tri, height,
-                measurements.get("_waist_z", 0), inseam_z)
-        measurements["crotch_length_cm"] = crotch_len
-        measurements["front_rise_cm"] = front_rise
-        measurements["back_rise_cm"] = back_rise
-        if crotch_f_pts is not None:
-            measurements["_crotch_front_pts"] = crotch_f_pts
-        if crotch_b_pts is not None:
-            measurements["_crotch_back_pts"] = crotch_b_pts
-
-    # Neck circumference (single plane sweep — always computed, needed for BF% estimation)
-    neck_cm, neck_z, neck_pct, neck_pts = measure_neck(
-        mesh_tri, height, joints=joints)
-    measurements["neck_cm"] = neck_cm
-    measurements["_neck_z"] = neck_z
-    measurements["_neck_pct"] = neck_pct
-    if neck_pts is not None:
-        measurements["_neck_contour_pts"] = neck_pts
-
-    # Wrist circumference (perpendicular to forearm axis — skip in fast mode)
-    if not fast:
-        wrist_cm, wrist_z, wrist_pct = measure_wrist(mesh_tri, height, joints=joints)
-        measurements["wrist_cm"] = wrist_cm
-        measurements["_wrist_z"] = wrist_z
-        measurements["_wrist_pct"] = wrist_pct
-
-    # Underbust (ISO 8559-1 §5.7.8 — inframammary fold):
-    # Bottom of the breast region from skinning weights (weight > 0.3) marks
-    # the inframammary fold. Measure torso circumference at that Z directly.
-    fold_z = breast_floor_z(model, mesh_verts)
-    if fold_z is not None and fold_z > 0:
-        underbust_z = fold_z
-        underbust_cm = torso_circumference_at_z(
-            torso_mesh, underbust_z, max_x_extent=MAX_TORSO_X_EXTENT,
-            combine_fragments=True) * 100
-    else:
-        underbust_z, underbust_cm = 0.0, 0.0
-    measurements["underbust_cm"] = underbust_cm
-    measurements["_underbust_z"] = underbust_z
-    measurements["_underbust_pct"] = (underbust_z / height * 100) if underbust_z > 0 else 0
-
-    # Belly depth: how much the belly protrudes forward vs the underbust/ribcage.
-    # Compares most-anterior Y at belly level (from measure_stomach) vs underbust
-    # level.  Negative = belly sticks out more than ribcage = belly prominence.
-    # Uses underbust as reference because it's above the belly blendshape zone
-    # (51-69% height), unlike waist (61%) which is inside it.
-    belly_depth_cm = 0.0
-    if belly_front_y is not None and underbust_z > 0:
-        ub_front_y = _front_y_at_z(torso_mesh, underbust_z)
-        if ub_front_y is not None:
-            belly_depth_cm = (belly_front_y - ub_front_y) * 100
-    measurements["belly_depth_cm"] = belly_depth_cm
-
-    # Acromion-based measurements (expensive — skip in fast mode)
-    if not fast:
-        sw_cm, sw_arc = measure_shoulder_width(
-            joints, mesh=mesh_tri, acromion_fn=find_acromion)
-        measurements["shoulder_width_cm"] = sw_cm
-        if sw_arc is not None:
-            measurements["_shoulder_arc_pts"] = sw_arc
-        measurements["sleeve_length_cm"] = measure_sleeve_length(
-            joints, mesh=mesh_tri, acromion_fn=find_acromion)
-
-        # Shirt length: side neck → hip line along front contour
-        shirt_cm, shirt_pts = measure_shirt_length(
-            joints, mesh_tri, measurements.get("_inseam_z", 0),
-            measurements=measurements)
-        measurements["shirt_length_cm"] = shirt_cm
-        if shirt_pts is not None:
-            measurements["_shirt_length_pts"] = shirt_pts
-
-    # Anny-specific body composition
-    measurements["volume_m3"] = anthro.volume(verts).item()
-    measurements["mass_kg"] = anthro.mass(verts).item()
-    measurements["bmi"] = anthro.bmi(verts).item()
-
-    # Body fat % and density estimation (requires neck measurement)
-    neck = measurements.get("neck_cm", 0)
-    if neck > 0:
-        gender_str = _infer_gender(model, verts)
-        bf_pct = estimate_body_fat_pct(
-            height_cm=measurements["height_cm"],
-            waist_cm=measurements["waist_cm"],
-            hip_cm=measurements["hip_cm"],
-            neck_cm=neck,
-            mass_kg=measurements["mass_kg"],
-            gender=gender_str,
-        )
-        measurements["body_fat_pct"] = bf_pct
-        dens = body_density_from_bf(bf_pct)
-        measurements["estimated_density"] = dens
-        measurements["density_corrected_mass_kg"] = density_corrected_mass(
-            measurements["mass_kg"], dens, gender_str)
-
-    # Visualization polylines + contours (skip in fast mode)
-    if not fast:
-        measurements["_linear_polylines"] = extract_linear_measurement_polylines(
-            mesh_tri, measurements, joints)
-        measurements["mesh"] = mesh_tri
-        measurements["contours"] = extract_measurement_contours(
-            mesh_tri, measurements, torso_mesh=torso_mesh)
-
-    # Internal metadata (kept for backward compat)
-    measurements["_mesh_tri"] = mesh_tri
-    measurements["_torso_mesh"] = torso_mesh
-    measurements["_anthro"] = anthro
-
-    if render_path:
-        render_4view(mesh_tri, measurements, render_path,
-                     title=title, model_label="Anny", torso_mesh=torso_mesh)
-
-    return measurements
-
-
-
 def _measure_anny(body, *, groups, render_path=None, title="", device=None):
     """Internal: measure an AnnyBody with selective computation groups.
 
@@ -789,7 +1036,7 @@ def _measure_anny(body, *, groups, render_path=None, title="", device=None):
         device: ``"cpu"``, ``"cuda"``, or ``None`` (auto-detect).
     """
     from clad_body.measure import (
-        GROUP_A, GROUP_B, GROUP_C, GROUP_D, GROUP_E, GROUP_F, GROUP_G,
+        GROUP_A, GROUP_B, GROUP_C, GROUP_D, GROUP_E, GROUP_F, GROUP_G, GROUP_H,
     )
     if body.phenotype_params is None:
         raise ValueError(
@@ -816,7 +1063,7 @@ def _measure_anny(body, *, groups, render_path=None, title="", device=None):
     arm_mask = build_arm_mask(model)
     torso_mesh = build_torso_mesh(mesh_tri, arm_mask)
 
-    measurements = {"height_cm": height * 100}
+    measurements = {"height_cm": float(height * 100)}
 
     # ── Group A: Core torso ──────────────────────────────────────────────
     if GROUP_A in groups:
@@ -884,12 +1131,12 @@ def _measure_anny(body, *, groups, render_path=None, title="", device=None):
         measurements["_thigh_z"] = thigh_z
         measurements["_thigh_pct"] = thigh_pct
 
-        knee_cm, knee_z, knee_pct = measure_knee(mesh_tri, height)
+        knee_cm, knee_z, knee_pct = measure_knee(mesh_tri, height, joints=joints)
         measurements["knee_cm"] = knee_cm
         measurements["_knee_z"] = knee_z
         measurements["_knee_pct"] = knee_pct
 
-        calf_cm, calf_z, calf_pct = measure_calf(mesh_tri, height)
+        calf_cm, calf_z, calf_pct = measure_calf(mesh_tri, height, joints=joints)
         measurements["calf_cm"] = calf_cm
         measurements["_calf_z"] = calf_z
         measurements["_calf_pct"] = calf_pct
@@ -899,7 +1146,12 @@ def _measure_anny(body, *, groups, render_path=None, title="", device=None):
         measurements["_upperarm_z"] = upperarm_z
         measurements["_upperarm_pct"] = upperarm_pct
 
-    # ── Group D: Perpendicular (neck, wrist) ─────────────────────────────
+        wrist_cm, wrist_z, wrist_pct = measure_wrist(mesh_tri, height, joints=joints)
+        measurements["wrist_cm"] = wrist_cm
+        measurements["_wrist_z"] = wrist_z
+        measurements["_wrist_pct"] = wrist_pct
+
+    # ── Group D: Perpendicular (neck) ────────────────────────────────────
     if GROUP_D in groups:
         neck_cm, neck_z, neck_pct, neck_pts = measure_neck(
             mesh_tri, height, joints=joints)
@@ -909,13 +1161,12 @@ def _measure_anny(body, *, groups, render_path=None, title="", device=None):
         if neck_pts is not None:
             measurements["_neck_contour_pts"] = neck_pts
 
-        wrist_cm, wrist_z, wrist_pct = measure_wrist(mesh_tri, height, joints=joints)
-        measurements["wrist_cm"] = wrist_cm
-        measurements["_wrist_z"] = wrist_z
-        measurements["_wrist_pct"] = wrist_pct
-
     # ── Group E: Mesh geometry (inseam, crotch) ──────────────────────────
     if GROUP_E in groups:
+        # Reporting path: ISO 8559-1 mesh sweep (accurate, non-differentiable).
+        # For gradient-based optimisation use measure_grad() which calls
+        # measure_inseam_from_perineum_vertices() — a differentiable vertex-pair
+        # proxy that tracks this sweep within ~0.2 cm.
         inseam_cm, inseam_z, inseam_pct = measure_inseam(mesh_tri, height)
         measurements["inseam_cm"] = inseam_cm
         measurements["_inseam_z"] = inseam_z
@@ -935,15 +1186,23 @@ def _measure_anny(body, *, groups, render_path=None, title="", device=None):
 
     # ── Group C: Joint linear (shoulder, sleeve) ─────────────────────────
     if GROUP_C in groups:
+        c7 = joints.get("c7")
+        if c7 is not None:
+            measurements["_c7_surface_pt"] = c7_surface_point(
+                np.array(mesh_tri.vertices), c7)
         sw_cm, sw_arc = measure_shoulder_width(
             joints, mesh=mesh_tri, acromion_fn=find_acromion)
         measurements["shoulder_width_cm"] = sw_cm
         if sw_arc is not None:
             measurements["_shoulder_arc_pts"] = sw_arc
-        measurements["sleeve_length_cm"] = measure_sleeve_length(
-            joints, mesh=mesh_tri, acromion_fn=find_acromion)
+        # ISO 8559-1 sleeve length: slow surface-walk reference (~1 s per body).
+        # For gradient-based optimisation use measure_grad() which calls
+        # measure_sleeve_length_from_joints() — a differentiable approximation
+        # calibrated against this reference.
+        sleeve_ref = measure_sleeve_length_iso_reference(body)
+        measurements["sleeve_length_cm"] = sleeve_ref["sleeve_length_cm"]
 
-    # ── Group F: Surface trace (shirt length to hip line) ────────────────
+    # ── Group F: Surface trace (shirt length) ────────────────────────────
     if GROUP_F in groups:
         shirt_cm, shirt_pts = measure_shirt_length(
             joints, mesh_tri, measurements.get("_inseam_z", 0),
@@ -952,10 +1211,21 @@ def _measure_anny(body, *, groups, render_path=None, title="", device=None):
         if shirt_pts is not None:
             measurements["_shirt_length_pts"] = shirt_pts
 
+    # ── Group H: Back neck to waist (ISO 5.4.5) ──────────────────────────
+    if GROUP_H in groups:
+        bnw_cm, bnw_pts = measure_back_neck_to_waist(
+            joints, mesh_tri, measurements.get("_waist_z", 0),
+            c7_surface=measurements.get("_c7_surface_pt"))
+        measurements["back_neck_to_waist_cm"] = bnw_cm
+        if bnw_pts is not None:
+            measurements["_back_neck_to_waist_pts"] = bnw_pts
+
     # ── Group G: Body composition ────────────────────────────────────────
     if GROUP_G in groups:
         measurements["volume_m3"] = anthro.volume(verts).item()
-        measurements["mass_kg"] = anthro.mass(verts).item()
+        anny_mass = anthro.mass(verts).item()
+        measurements["_anny_mass_kg"] = anny_mass  # V×980 (internal)
+        measurements["mass_kg"] = anny_mass  # default; overridden by V×ρ̂ below
         measurements["bmi"] = anthro.bmi(verts).item()
 
         neck = measurements.get("neck_cm", 0)
@@ -966,18 +1236,18 @@ def _measure_anny(body, *, groups, render_path=None, title="", device=None):
                 waist_cm=measurements.get("waist_cm", 0),
                 hip_cm=measurements.get("hip_cm", 0),
                 neck_cm=neck,
-                mass_kg=measurements["mass_kg"],
+                mass_kg=anny_mass,
                 gender=gender_str,
             )
             measurements["body_fat_pct"] = bf_pct
             dens = body_density_from_bf(bf_pct)
             measurements["estimated_density"] = dens
-            measurements["density_corrected_mass_kg"] = density_corrected_mass(
-                measurements["mass_kg"], dens, gender_str)
+            # Single-source BF-corrected mass — same formula measure_grad uses.
+            measurements["mass_kg"] = measurements["volume_m3"] * dens
 
     # ── Visualization ────────────────────────────────────────────────────
     # Polylines + contours when we have enough data
-    has_linear = GROUP_C in groups or GROUP_E in groups
+    has_linear = GROUP_C in groups or GROUP_E in groups or GROUP_H in groups
     if has_linear:
         measurements["_linear_polylines"] = extract_linear_measurement_polylines(
             mesh_tri, measurements, joints)
@@ -996,27 +1266,286 @@ def _measure_anny(body, *, groups, render_path=None, title="", device=None):
     return measurements
 
 
-def measure_body(params_dict: dict, render_path=None, title="") -> dict:
-    """Extract body measurements from phenotype parameters.
+# ── Differentiable measurements ───────────────────────────────────────────────
 
-    .. deprecated::
-        Use ``clad_body.measure.measure(body)`` instead::
+#: Keys supported by :func:`measure_grad`.  All have fully differentiable
+#: implementations that compose existing building blocks.  Callers can inspect
+#: this set to check support before requesting a key.
+SUPPORTED_KEYS = frozenset({
+    "height_cm",
+    "bust_cm",
+    "underbust_cm",
+    "waist_cm",
+    "stomach_cm",
+    "hip_cm",
+    "thigh_cm",
+    "knee_cm",
+    "calf_cm",
+    "upperarm_cm",
+    "shoulder_width_cm",
+    "inseam_cm",
+    "sleeve_length_cm",
+    "neck_cm",
+    "mass_kg",
+})
 
-            from clad_body.load import load_anny_from_params
-            from clad_body.measure import measure
-            body = load_anny_from_params(params)
-            m = measure(body, render_path="out.png")
+
+def measure_grad(body, *, pose=None, only=None):
+    """Differentiable Anny measurements for autograd-based mesh optimisation.
+
+    Runs a fresh forward pass with the body's phenotype kwargs and returns
+    measurements as torch tensors with autograd history preserved.  Gradients
+    flow from the returned tensors back to any tensor in
+    ``body.phenotype_kwargs`` / ``body.local_changes_kwargs`` that has
+    ``requires_grad=True``.
+
+    Companion to :func:`clad_body.measure.measure`.  Same input (an
+    :class:`~clad_body.load.anny.AnnyBody`) and same key naming — you can swap
+    between the two APIs with no translation.  Only a subset of keys have
+    differentiable implementations; requesting an unsupported key raises
+    :exc:`ValueError` rather than silently falling back to numpy (which would
+    break gradient flow without warning).
+
+    Example — optimisation loop::
+
+        from clad_body.load.anny import load_anny_from_params
+        from clad_body.measure import measure_grad
+        import torch
+
+        body = load_anny_from_params(initial_params, requires_grad=True)
+        optimizer = torch.optim.Adam(list(body.phenotype_kwargs.values()), lr=0.01)
+
+        for step in range(500):
+            optimizer.zero_grad()
+            m = measure_grad(body, only=["waist_cm", "inseam_cm"])
+            loss = (m["waist_cm"] - 78.0) ** 2 + (m["inseam_cm"] - 82.0) ** 2
+            loss.backward()
+            optimizer.step()
 
     Args:
-        params_dict: Anny phenotype parameters (from load_phenotype_params)
-        render_path: if set, save 4-view render with measurement contours
-        title: title for the 4-view render
+        body: :class:`~clad_body.load.anny.AnnyBody` from
+            :func:`~clad_body.load.anny.load_anny_from_params`.  Its
+            ``phenotype_kwargs`` and ``local_changes_kwargs`` are used as the
+            input to a fresh forward pass on ``body.model``.  Pass
+            ``requires_grad=True`` to ``load_anny_from_params`` to enable
+            gradients on all tensors, or call
+            ``body.phenotype_kwargs[label].requires_grad_(True)`` per-tensor.
+        pose: optional ``(1, n_joints, 4, 4)`` pose tensor.  Defaults to Anny
+            A-pose via :func:`~clad_body.load.anny.build_anny_apose`.
+        only: list of measurement keys to compute.  ``None`` means all
+            supported keys.
 
     Returns:
-        Dictionary with measurements in cm and kg
+        dict mapping measurement key → 0-dim torch tensor (cm) with autograd
+        history preserved.
+
+    Raises:
+        ValueError: if ``only`` contains a key not in :data:`SUPPORTED_KEYS`,
+            or if ``body.phenotype_kwargs`` is missing (body wasn't created
+            via :func:`load_anny_from_params`).
+
+    Supported keys (Anny):
+        ``height_cm``, ``bust_cm``, ``underbust_cm``, ``waist_cm``,
+        ``stomach_cm``, ``hip_cm``, ``thigh_cm``, ``knee_cm``,
+        ``calf_cm``, ``upperarm_cm``, ``shoulder_width_cm``,
+        ``inseam_cm``, ``sleeve_length_cm``, ``neck_cm``, ``mass_kg``.
+
+    Note on shoulder_width_cm:
+        Soft-argmax acromions in a Gaussian X-band anchored at the
+        upperarm01 bone midpoint, plus a closed-form quadratic curve
+        through (R, C7, L). RMS 1.4 cm and R²=0.96 vs the numpy ISO
+        reference on 100 random bodies, and SMOOTHER than the reference
+        on parameter sweeps (no argmax jumps). See
+        findings/shoulder_width_diff.md.
+
+    Note on mass_kg:
+        Computed as ``volume(verts) × ρ̂(BF)`` where ``ρ̂`` is the Siri
+        tissue density derived from a body-fat estimate (Hodgdon & Beckett
+        Navy formula, soft-blended into Weltman past 28 % male / 38 %
+        female).  This matches :func:`measure`'s ``mass_kg`` exactly — same
+        helper (:func:`bf_corrected_density`) called from both paths.
+
+        Requesting ``mass_kg`` auto-includes its dependencies (``height_cm``,
+        ``waist_cm``, ``hip_cm``, ``neck_cm``) for the BF formula but does
+        not return them unless the caller also asked for them explicitly.
+
+    Note:
+        MHR is not yet supported.  API and supported keys may change between
+        minor versions while this is under active development.
     """
-    verts, model = generate_anny_mesh_from_params(params_dict)
-    return measure_body_from_verts(verts, model, render_path=render_path, title=title)
+    from clad_body.load.anny import AnnyBody, build_anny_apose
+
+    if not isinstance(body, AnnyBody):
+        raise TypeError(
+            f"measure_grad expects an AnnyBody, got {type(body).__name__}"
+        )
+
+    if body.phenotype_kwargs is None:
+        raise ValueError(
+            "body.phenotype_kwargs is missing — create the body via "
+            "load_anny_from_params() so the torch tensors needed for "
+            "measure_grad() are populated."
+        )
+
+    # Validate keys before paying for the forward pass
+    requested = frozenset(SUPPORTED_KEYS) if only is None else frozenset(only)
+    unsupported = requested - SUPPORTED_KEYS
+    if unsupported:
+        raise ValueError(
+            f"Key(s) {sorted(unsupported)!r} are not differentiable. "
+            f"Supported keys: {sorted(SUPPORTED_KEYS)}"
+        )
+
+    model = body.model
+    device = next(iter(body.phenotype_kwargs.values())).device
+
+    if pose is None:
+        pose = build_anny_apose(model, device)
+
+    # Forward pass — keep the computation graph (no torch.no_grad)
+    output = model(
+        pose_parameters=pose,
+        phenotype_kwargs=body.phenotype_kwargs,
+        local_changes_kwargs=body.local_changes_kwargs or {},
+        pose_parameterization="root_relative_world",
+        return_bone_ends=True,
+    )
+    model._last_bone_heads = output["bone_heads"]
+    model._last_bone_tails = output["bone_tails"]
+
+    return _measure_grad_from_verts(model, output["vertices"], requested=requested)
+
+
+def _measure_grad_from_verts(model, verts, *, requested):
+    """Compute differentiable measurements from a verts tensor.
+
+    Internal — assumes ``model._last_bone_heads`` and ``_last_bone_tails`` are
+    already populated by the caller (typically :func:`measure_grad` itself),
+    and that ``requested`` is a validated frozenset of keys.
+    """
+    # mass_kg uses the BF-corrected formula — same as measure() — which needs
+    # height/waist/hip/neck. Auto-include them so the user doesn't have to,
+    # then strip the ones they didn't ask for before returning.
+    user_requested = frozenset(requested)
+    if "mass_kg" in user_requested:
+        requested = frozenset(
+            set(user_requested) | {"height_cm", "waist_cm", "hip_cm", "neck_cm"}
+        )
+
+    result = {}
+
+    # Vertex loop indices (cached on model after first call — topology-only)
+    anthro = setup_extended_anthro(model)
+
+    # Detect height axis once under no_grad — returns a Python int, not tracked
+    with torch.no_grad():
+        extents = verts[0].max(dim=0).values - verts[0].min(dim=0).values
+        height_axis = int(extents.argmax().item())
+
+    # ── height_cm ────────────────────────────────────────────────────────────
+    if "height_cm" in requested:
+        col = verts[:, :, height_axis]
+        result["height_cm"] = (col.max() - col.min()) * 100
+
+    # ── bust_cm / underbust_cm (soft circumference) ─────────────────────────
+    if "bust_cm" in requested or "underbust_cm" in requested:
+        from ._soft_circ import measure_bust_underbust
+        bu = measure_bust_underbust(model, verts)
+        if "bust_cm" in requested and "bust_cm" in bu:
+            result["bust_cm"] = bu["bust_cm"]
+        if "underbust_cm" in requested:
+            result["underbust_cm"] = bu["underbust_cm"]
+
+    # ── hip_cm (soft circumference) ──────────────────────────────────────
+    if "hip_cm" in requested:
+        from ._soft_circ import measure_hip
+        hp = measure_hip(model, verts)
+        result["hip_cm"] = hp["hip_cm"]
+
+    # ── waist_cm ─────────────────────────────────────────────────────────────
+    if "waist_cm" in requested:
+        result["waist_cm"] = (
+            compute_loop_circumference(verts, anthro.waist_vertex_indices).squeeze(0) * 100
+        )
+
+    # ── stomach_cm (soft max over Z range between hip and waist) ────────────
+    if "stomach_cm" in requested:
+        from ._soft_circ import measure_stomach_soft
+        st = measure_stomach_soft(model, verts)
+        result["stomach_cm"] = st["stomach_cm"]
+
+    # ── thigh_cm (soft circumference, per-leg edges) ────────────────────────
+    if "thigh_cm" in requested:
+        from ._soft_circ import measure_thigh_soft
+        th = measure_thigh_soft(model, verts)
+        result["thigh_cm"] = th["thigh_cm"]
+
+    # ── knee_cm (soft circumference, per-leg edges, bone-anchored Z) ────────
+    if "knee_cm" in requested:
+        from ._soft_circ import measure_knee_soft
+        kn = measure_knee_soft(model, verts)
+        result["knee_cm"] = kn["knee_cm"]
+
+    # ── calf_cm (soft-argmax over Z + perpendicular plane at that Z) ────────
+    if "calf_cm" in requested:
+        from ._soft_circ import measure_calf_soft
+        cf = measure_calf_soft(model, verts)
+        result["calf_cm"] = cf["calf_cm"]
+
+    # ── upperarm_cm (also required as input for sleeve_length) ───────────────
+    upperarm_loop_cm = None
+    if "upperarm_cm" in requested or "sleeve_length_cm" in requested:
+        upperarm_loop_cm = (
+            compute_loop_circumference(verts, anthro.upperarm_vertex_indices).squeeze(0) * 100
+        )
+        if "upperarm_cm" in requested:
+            result["upperarm_cm"] = upperarm_loop_cm
+
+    # ── shoulder_width_cm — soft-argmax acromions + quadratic arc ────────────
+    if "shoulder_width_cm" in requested:
+        result["shoulder_width_cm"] = (
+            compute_shoulder_arc_length(verts, anthro, model) * 100
+        )
+
+    # ── inseam_cm — perineum vertex pair (no joints needed) ──────────────────
+    if "inseam_cm" in requested:
+        result["inseam_cm"] = measure_inseam_from_perineum_vertices(verts, height_axis)
+
+    # ── sleeve_length_cm (needs differentiable joint tensors) ────────────────
+    if "sleeve_length_cm" in requested:
+        joints_torch = _extract_anny_joints(model, as_tensor=True)
+        result["sleeve_length_cm"] = measure_sleeve_length_from_joints(
+            joints_torch, upperarm_loop_cm
+        )
+
+    # ── neck_cm (tilted soft circumference perpendicular to neck axis) ───────
+    if "neck_cm" in requested:
+        from ._soft_circ import measure_neck_soft
+        nk = measure_neck_soft(model, verts)
+        result["neck_cm"] = nk["neck_cm"]
+
+    # ── mass_kg ───────────────────────────────────────────────────────────────
+    # V × BF-corrected tissue density.  Same formula as measure() — Navy
+    # density (Hodgdon & Beckett) blended into Weltman in the obese regime
+    # via a sigmoid (no hard branch, gradients flow through every input).
+    # The Weltman bootstrap mass uses Anny's V×980 default — same as the
+    # float ``measure()`` callsite.
+    if "mass_kg" in requested:
+        gender_str = _infer_gender(model, verts)
+        anny_mass = anthro.mass(verts).squeeze(0)  # V × 980 (bootstrap)
+        density = bf_corrected_density(
+            height_cm=result["height_cm"],
+            waist_cm=result["waist_cm"],
+            hip_cm=result["hip_cm"],
+            neck_cm=result["neck_cm"],
+            mass_kg=anny_mass,
+            gender=gender_str,
+        )
+        volume_m3 = anthro.volume(verts).squeeze(0)
+        result["mass_kg"] = volume_m3 * density
+
+    # Strip auto-included mass_kg dependencies that the user didn't request.
+    return {k: v for k, v in result.items() if k in user_requested}
 
 
 def main():
@@ -1074,7 +1603,10 @@ def main():
 
     # Measure (+ optional 4-view render)
     print(f"\nGenerating mesh and measuring (plane sweep, 2mm steps)...")
-    measurements = measure_body(params_dict, render_path=render_path, title=source_name)
+    from clad_body.load.anny import load_anny_from_params
+    from clad_body.measure import measure
+    body = load_anny_from_params(params_dict)
+    measurements = measure(body, render_path=render_path, title=source_name)
 
     # Load target measurements (explicit or auto-detected)
     target_path = args.target

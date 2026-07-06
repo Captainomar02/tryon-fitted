@@ -404,9 +404,11 @@ def render_4view(mesh, measurements, output_path, title="", model_label="",
             "shoulder_width": ("cyan", {"Front", "Back", "Side (R)", "3/4 View"}),
             "sleeve_length": ("magenta", {"Back", "Side (R)"}),
             "inseam": ("yellow", {"Side (R)", "3/4 View"}),
-            "crotch_front": ("lime", {"Side (R)", "Front"}),
-            "crotch_back": ("lime", {"Side (R)", "Back"}),
+            "front_rise": ("lime", {"Side (R)", "Front"}),
+            "back_rise": ("lime", {"Side (R)", "Back"}),
+            "crotch_length": ("lime", {"Side (R)"}),
             "shirt_length": ("dodgerblue", {"Side (R)", "Front"}),
+            "back_neck_to_waist": ("orange", {"Back", "Side (R)"}),
         }
         for name, pts in measurements.get("_linear_polylines", {}).items():
             cfg = _linear_cfg.get(name)
@@ -511,6 +513,7 @@ def print_comparison(current: dict, target: dict):
         "front_rise_cm":      ("Front rise", "cm", ".1f"),
         "back_rise_cm":       ("Back rise",  "cm", ".1f"),
         "shirt_length_cm":    ("Shirt len",  "cm", ".1f"),
+        "back_neck_to_waist_cm": ("Bk neck-waist", "cm", ".1f"),
         "mass_kg":            ("Mass",       "kg", ".1f"),
     }
 

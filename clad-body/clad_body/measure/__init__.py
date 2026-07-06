@@ -14,8 +14,6 @@ Public API::
 **Performance**: Always use ``only=`` or ``preset=`` when you don't need all
 measurements.  The ``AnnyBody`` from ``load_anny_from_params`` caches the Anny
 model — ``measure()`` reuses it (~100 ms per call vs ~500 ms without cache).
-Do NOT use the deprecated ``generate_anny_mesh_from_params()`` or
-``measure_body_from_verts()`` — they create a new model on every call.
 """
 
 from __future__ import annotations
@@ -32,12 +30,13 @@ from clad_body.measure.registry import (
 # measure() resolves which groups need to run based on requested keys.
 
 GROUP_A = "core_torso"       # height, bust, waist, hip, stomach, underbust, belly_depth
-GROUP_B = "limb_sweeps"      # thigh, knee, calf, upperarm
+GROUP_B = "limb_sweeps"      # thigh, knee, calf, upperarm, wrist
 GROUP_C = "joint_linear"     # shoulder_width, sleeve_length
-GROUP_D = "perpendicular"    # neck, wrist
+GROUP_D = "perpendicular"    # neck
 GROUP_E = "mesh_geometry"    # inseam, crotch_length, front_rise, back_rise
 GROUP_F = "surface_trace"    # shirt_length
-GROUP_G = "body_composition" # volume, mass, bmi, body_fat, estimated_density, density_corrected_mass
+GROUP_G = "body_composition" # volume, mass, bmi, body_fat, estimated_density
+GROUP_H = "back_length"      # back_neck_to_waist (needs joints + waist_z from A)
 
 _KEY_TO_GROUP = {
     "height_cm": GROUP_A,
@@ -54,22 +53,30 @@ _KEY_TO_GROUP = {
     "shoulder_width_cm": GROUP_C,
     "sleeve_length_cm": GROUP_C,
     "neck_cm": GROUP_D,
-    "wrist_cm": GROUP_D,
+    "wrist_cm": GROUP_B,
     "inseam_cm": GROUP_E,
     "crotch_length_cm": GROUP_E,
     "front_rise_cm": GROUP_E,
     "back_rise_cm": GROUP_E,
     "shirt_length_cm": GROUP_F,
+    "back_neck_to_waist_cm": GROUP_H,
     "volume_m3": GROUP_G,
     "mass_kg": GROUP_G,
     "bmi": GROUP_G,
     "body_fat_pct": GROUP_G,
+    "estimated_density": GROUP_G,
 }
 
-# Group dependencies: F needs A/E (hip + inseam context), G needs D (neck/BF%)
+# Group dependencies:
+#   F needs E (uses inseam_z to find shirt-length endpoint)
+#   G needs D (BF% formula uses neck) AND A (BF% formula uses waist + hip).
+#     Without A, waist/hip default to 0 → BF% formula early-returns 3% →
+#     wrong density → mass_kg off by 5+ kg.  See test_only_mass_kg_matches_full.
+#   H needs A (back_neck_to_waist surface trace endpoint is _waist_z)
 _GROUP_DEPS = {
-    GROUP_F: {GROUP_A, GROUP_E},
-    GROUP_G: {GROUP_D},
+    GROUP_F: {GROUP_E},
+    GROUP_G: {GROUP_A, GROUP_D},
+    GROUP_H: {GROUP_A},
 }
 
 
@@ -166,8 +173,19 @@ def measure(
     return result
 
 
+def measure_grad(body, *, pose=None, only=None):
+    """Differentiable Anny measurements for autograd-based mesh optimisation.
+
+    Thin re-export of :func:`clad_body.measure.anny.measure_grad`.
+    See that function for full documentation, supported keys, and examples.
+    """
+    from clad_body.measure.anny import measure_grad as _mg
+    return _mg(body, pose=pose, only=only)
+
+
 __all__ = [
     "measure",
+    "measure_grad",
     "REGISTRY",
     "MeasurementDef",
     "list_measurements",

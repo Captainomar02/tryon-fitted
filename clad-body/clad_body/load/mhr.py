@@ -14,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -90,152 +89,6 @@ def _resolve_params_json(path: str) -> str:
     raise FileNotFoundError(f"No params JSON found for: {path}")
 
 
-def _extract_target_height_m(params: dict) -> Optional[float]:
-    """Read optional target height as meters from params JSON.
-
-    Unit conventions:
-    - All target-height fields are interpreted as centimeters.
-    - Internal return value remains meters for mesh scaling.
-    """
-    for key in ("fusion_target_height_cm", "fusion_target_height", "target_height"):
-        if key in params:
-            try:
-                value_cm = float(params[key])
-            except (TypeError, ValueError):
-                continue
-            if value_cm > 0:
-                return value_cm / 100.0
-    return None
-
-
-def _normalise_canonical_vertices(verts: np.ndarray, target_height_m: Optional[float]) -> np.ndarray:
-    verts = np.asarray(verts, dtype=np.float32).reshape(-1, 3).copy()
-    if not np.isfinite(verts).all():
-        raise ValueError("Fusion vertex override contains non-finite values")
-
-    verts[:, 2] -= verts[:, 2].min()
-    center_xy = (verts[:, :2].max(axis=0) + verts[:, :2].min(axis=0)) / 2
-    verts[:, 0] -= center_xy[0]
-    verts[:, 1] -= center_xy[1]
-
-    if target_height_m is not None:
-        cur_h = float(verts[:, 2].max() - verts[:, 2].min())
-        if cur_h > 1e-8:
-            verts *= float(target_height_m) / cur_h
-    return verts
-
-
-def _extract_fusion_vertices_override(
-    params: dict,
-    faces: np.ndarray,
-    target_height_m: Optional[float],
-) -> Optional[np.ndarray]:
-    """Return CLAD-canonical fusion vertices when a fusion JSON opts in."""
-    if not bool(params.get("fusion_prefer_vertices_for_clad", False)):
-        return None
-
-    raw_vertices = params.get("fusion_vertices_clad")
-    if raw_vertices is None:
-        return None
-
-    verts = _normalise_canonical_vertices(np.asarray(raw_vertices), target_height_m)
-    if faces.size and int(np.asarray(faces).max()) >= len(verts):
-        raise ValueError(
-            "Fusion vertex override does not match MHR topology: "
-            f"{len(verts)} vertices for face max index {int(np.asarray(faces).max())}"
-        )
-    return verts
-
-
-def _extract_fusion_faces_override(params: dict) -> Optional[np.ndarray]:
-    """Return face topology stored with a fusion vertex override, if present."""
-    raw_faces = params.get("fusion_faces_clad")
-    if raw_faces is None:
-        raw_faces = params.get("fusion_faces")
-    if raw_faces is None:
-        return None
-
-    faces = np.asarray(raw_faces, dtype=np.int64)
-    if faces.ndim != 2 or faces.shape[1] != 3:
-        raise ValueError(f"Fusion face override must have shape [N,3], got {faces.shape}")
-    if faces.size and int(faces.min()) < 0:
-        raise ValueError("Fusion face override contains negative indices")
-    return faces.astype(np.int32, copy=False)
-
-
-def _load_fusion_vertex_body_if_available(params_json: str, params: dict) -> Optional[MhrBody]:
-    """Build a body directly from fusion vertices/faces without pymomentum.
-
-    Fusion JSONs already contain CLAD-canonical vertices. When they also carry
-    topology, measuring the mesh does not need the MHR/pymomentum subprocess.
-    """
-    if not bool(params.get("fusion_prefer_vertices_for_clad", False)):
-        return None
-
-    faces = _extract_fusion_faces_override(params)
-    if faces is None:
-        return None
-
-    target_height_m = _extract_target_height_m(params)
-    verts = _extract_fusion_vertices_override(params, faces, target_height_m)
-    if verts is None:
-        return None
-
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-    return MhrBody(
-        mesh=mesh,
-        source=f"params:{os.path.basename(params_json)}+fusion_vertices",
-        sam3d_params=params,
-        joints=None,
-    )
-
-
-def _profile_band_weight(height_pct: np.ndarray, center: float, half_width: float) -> np.ndarray:
-    distance = np.abs(height_pct - float(center))
-    weight = np.clip(1.0 - (distance / float(half_width)), 0.0, 1.0)
-    return weight * weight * (3.0 - 2.0 * weight)
-
-
-def _float_param(params: dict, key: str, default: float = 1.0) -> float:
-    try:
-        return float(params.get(key, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _apply_profile_depth_to_mhr_restpose(verts: np.ndarray, params: dict) -> np.ndarray:
-    """Apply fusion-derived bust/hip profile depth to a valid MHR rest-pose mesh."""
-    if not bool(params.get("fusion_apply_profile_depth_to_mhr", False)):
-        return verts
-
-    bust_scale = _float_param(params, "fusion_profile_depth_bust_scale", 1.0)
-    hip_scale = _float_param(params, "fusion_profile_depth_hip_scale", 1.0)
-    if max(bust_scale, hip_scale) <= 1.0001:
-        return verts
-
-    corrected = np.asarray(verts, dtype=np.float32).copy()
-    z_min = float(corrected[:, 2].min())
-    height = float(corrected[:, 2].max() - z_min)
-    if height <= 1e-8:
-        return corrected
-
-    pct = (corrected[:, 2] - z_min) / height
-    total_weight = np.zeros(len(corrected), dtype=np.float32)
-    total_weight += _profile_band_weight(pct, 0.725, 0.075) * (bust_scale - 1.0)
-    total_weight += _profile_band_weight(pct, 0.50, 0.09) * (hip_scale - 1.0)
-
-    if float(total_weight.max()) <= 0.0:
-        return corrected
-
-    unique_bins = np.floor(pct * 200).astype(np.int32)
-    y_center = np.zeros(len(corrected), dtype=np.float32)
-    for bin_id in np.unique(unique_bins):
-        bin_mask = unique_bins == bin_id
-        y_center[bin_mask] = np.median(corrected[bin_mask, 1])
-    corrected[:, 1] = y_center + (corrected[:, 1] - y_center) * (1.0 + total_weight)
-    return corrected
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -287,12 +140,6 @@ def load_mhr_from_params(
         :class:`MhrBody` in canonical rest-pose (Z-up, m, +Y=front, XY-centred).
     """
     params_json = _resolve_params_json(path)
-    with open(params_json) as f:
-        sam3d_params = json.load(f)
-
-    fusion_body = _load_fusion_vertex_body_if_available(params_json, sam3d_params)
-    if fusion_body is not None:
-        return fusion_body
 
     # Ensure LD_LIBRARY_PATH includes torch/lib for pymomentum-cpu
     import importlib.util
@@ -303,14 +150,9 @@ def load_mhr_from_params(
         if _torch_lib not in _ld:
             os.environ["LD_LIBRARY_PATH"] = f"{_torch_lib}:{_ld}" if _ld else _torch_lib
 
-    repo_root = Path(__file__).resolve().parents[3]
-    default_mhr_assets_dir = repo_root / "checkpoints" / "mhr-assets" / "assets"
-    mhr_assets_dir = Path(os.environ.get("MHR_ASSETS_DIR", str(default_mhr_assets_dir))).expanduser().resolve()
-
     # Subprocess script — pymomentum.geometry MUST import before torch
     script = f"""\
 import sys, os
-from pathlib import Path
 import pymomentum.geometry  # noqa: F401 — MUST come before torch
 import pymomentum.skel_state as pym_skel_state
 import json, torch, numpy as np
@@ -321,8 +163,7 @@ with open({params_json!r}) as f:
 
 shape_t = torch.tensor(params["shape_params"], dtype=torch.float32).unsqueeze(0)
 
-asset_dir = Path({str(mhr_assets_dir)!r})
-model = MHR.from_files(folder=asset_dir, device="cpu", wants_pose_correctives=False)
+model = MHR.from_files(device="cpu", wants_pose_correctives=False)
 
 # Rest pose: zero translation/rotation/pose, keep scale from model output.
 # Layout: [trans(3)|rot(3)|pose(130)|scale(68)] = 204
@@ -388,25 +229,7 @@ np.savez(sys.argv[1], vertices=v, faces=faces,
     verts[:, 0] -= center_xy[0]
     verts[:, 1] -= center_xy[1]
 
-    # Optional post-fit global scaling:
-    # if the params JSON carries a desired target height, enforce it directly
-    # on the reconstructed canonical mesh.
-    target_height_m = _extract_target_height_m(sam3d_params)
-    if target_height_m is not None:
-        cur_h = float(verts[:, 2].max() - verts[:, 2].min())
-        if cur_h > 1e-8:
-            h_scale = target_height_m / cur_h
-            verts *= h_scale
-
-    verts = _apply_profile_depth_to_mhr_restpose(verts, sam3d_params)
-
-    fusion_override_verts = _extract_fusion_vertices_override(
-        sam3d_params,
-        faces,
-        target_height_m,
-    )
-    mesh_verts = fusion_override_verts if fusion_override_verts is not None else verts
-    mesh = trimesh.Trimesh(vertices=mesh_verts, faces=faces, process=False)
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
     # Extract canonical joint positions (same coordinate transform as vertices)
     joints = None
@@ -418,19 +241,16 @@ np.savez(sys.argv[1], vertices=v, faces=faces,
         # Apply same XY centering as vertices
         joint_pos_canonical[:, 0] -= center_xy[0]
         joint_pos_canonical[:, 1] -= center_xy[1]
-        if target_height_m is not None:
-            cur_h = float(joint_pos_canonical[:, 2].max() - joint_pos_canonical[:, 2].min())
-            if cur_h > 1e-8:
-                j_scale = target_height_m / cur_h
-                joint_pos_canonical *= j_scale
         joint_names = list(joint_names_raw)
         joints = extract_joints_from_names(
             joint_names, joint_pos_canonical, MHR_JOINT_MAP)
 
-    source_suffix = "+fusion_vertices" if fusion_override_verts is not None else ""
+    with open(params_json) as f:
+        sam3d_params = json.load(f)
+
     return MhrBody(
         mesh=mesh,
-        source=f"params:{os.path.basename(params_json)}{source_suffix}",
+        source=f"params:{os.path.basename(params_json)}",
         sam3d_params=sam3d_params,
         joints=joints,
     )

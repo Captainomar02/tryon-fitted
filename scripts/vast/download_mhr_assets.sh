@@ -10,6 +10,18 @@ MHR_ASSETS_DIR="${MHR_ASSETS_DIR:-${MHR_ASSETS_ROOT}/assets}"
 MHR_ASSETS_URL="${MHR_ASSETS_URL:-https://github.com/facebookresearch/MHR/releases/download/v1.0.1/assets.zip}"
 MHR_ASSETS_ZIP="${MHR_ASSETS_ZIP:-/tmp/mhr-assets.zip}"
 
+link_mhr_package_assets() {
+  local package_assets_dir
+  package_assets_dir="$(python - <<'PY'
+from pathlib import Path
+import mhr
+print(Path(mhr.__file__).resolve().parents[1] / "assets")
+PY
+)"
+  ln -sfn "${MHR_ASSETS_DIR}" "${package_assets_dir}"
+  echo "Linked MHR package assets: ${package_assets_dir} -> ${MHR_ASSETS_DIR}"
+}
+
 required_files=(
   "${MHR_ASSETS_DIR}/lod1.fbx"
   "${MHR_ASSETS_DIR}/compact_v6_1.model"
@@ -26,6 +38,7 @@ done
 
 if [[ "${all_present}" == "1" ]]; then
   echo "MHR assets already present in ${MHR_ASSETS_DIR}"
+  link_mhr_package_assets
   exit 0
 fi
 
@@ -43,5 +56,10 @@ for path in "${required_files[@]}"; do
     exit 1
   fi
 done
+
+# The upstream mhr package defaults to <site-packages>/assets when
+# MHR.from_files() is called without a folder. Link our downloaded assets
+# there so the vendored upstream clad-body works without local loader patches.
+link_mhr_package_assets
 
 echo "MHR asset download complete."

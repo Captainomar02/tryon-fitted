@@ -40,7 +40,9 @@ from clad_body.measure._circumferences import (
     measure_wrist,
 )
 from clad_body.measure._lengths import (
+    c7_surface_point,
     extract_linear_measurement_polylines,
+    measure_back_neck_to_waist,
     measure_crotch_length,
     measure_inseam,
     measure_shirt_length,
@@ -60,23 +62,6 @@ MHR_JOINT_MAP = {
     "l_wrist": ["l_wrist"],
     "r_wrist": ["r_wrist"],
 }
-
-def _uses_fusion_vertex_mesh(body) -> bool:
-    params = getattr(body, "sam3d_params", None)
-    return isinstance(params, dict) and bool(params.get("fusion_prefer_vertices_for_clad", False))
-
-
-def _torso_slice_options(body) -> dict:
-    if _uses_fusion_vertex_mesh(body):
-        return {"max_x_extent": 0.80, "combine_fragments": True}
-    return {}
-
-
-def _hip_slice_options(body) -> dict:
-    if _uses_fusion_vertex_mesh(body):
-        return {"max_x_extent": 0.80, "combine_fragments": True}
-    return {"max_x_extent": 0.60}
-
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -164,11 +149,8 @@ def measure_mhr(mesh_or_body, render_path=None, title=""):
     else:
         mesh = mesh_or_body
 
-    torso_slice_options = _torso_slice_options(mesh_or_body)
-    hip_slice_options = _hip_slice_options(mesh_or_body)
-
     height = mesh.vertices[:, 2].max()
-    zs, circs = body_signature(mesh, **torso_slice_options)
+    zs, circs = body_signature(mesh)
 
     measurements = {"height_cm": height * 100}
 
@@ -187,7 +169,7 @@ def measure_mhr(mesh_or_body, render_path=None, title=""):
                        height * hip_region["high_pct"], 0.002)
     hip_slicer = MeshSlicer(mesh)
     hip_circs = np.array([
-        hip_slicer.circumference_at_z(z, **hip_slice_options) for z in hip_zs
+        hip_slicer.circumference_at_z(z, max_x_extent=0.60) for z in hip_zs
     ])
     hip_valid = hip_circs > 0.30
     if hip_valid.any():
@@ -202,7 +184,7 @@ def measure_mhr(mesh_or_body, render_path=None, title=""):
 
     # Waist: circumference at ISO 8559-1 waist level (fixed % of height).
     waist_z = height * WAIST_HEIGHT_PCT
-    waist_circ = torso_circumference_at_z(mesh, waist_z, **torso_slice_options)
+    waist_circ = torso_circumference_at_z(mesh, waist_z)
     measurements["waist_cm"] = waist_circ * 100
     measurements["_waist_z"] = waist_z
     measurements["_waist_pct"] = WAIST_HEIGHT_PCT * 100
@@ -282,6 +264,10 @@ def measure_mhr(mesh_or_body, render_path=None, title=""):
 
     # Joint-based linear measurements (shoulder width, arm length)
     if joints:
+        c7 = joints.get("c7")
+        if c7 is not None:
+            measurements["_c7_surface_pt"] = c7_surface_point(
+                np.array(mesh.vertices), c7)
         sw_cm, sw_arc = measure_shoulder_width(
             joints, mesh=mesh, acromion_fn=find_acromion)
         measurements["shoulder_width_cm"] = sw_cm
@@ -290,7 +276,7 @@ def measure_mhr(mesh_or_body, render_path=None, title=""):
         measurements["sleeve_length_cm"] = measure_sleeve_length(
             joints, mesh=mesh, acromion_fn=find_acromion)
 
-        # Shirt length: side neck → hip line along front contour
+        # Shirt length: side neck → crotch along front body contour
         shirt_cm, shirt_pts = measure_shirt_length(
             joints, mesh, measurements.get("_inseam_z", 0),
             measurements=measurements)
@@ -320,19 +306,17 @@ def _measure_mhr(body, *, groups, render_path=None, title=""):
     Called by ``clad_body.measure.measure()``. Do not call directly.
     """
     from clad_body.measure import (
-        GROUP_A, GROUP_B, GROUP_C, GROUP_D, GROUP_E, GROUP_F, GROUP_G,
+        GROUP_A, GROUP_B, GROUP_C, GROUP_D, GROUP_E, GROUP_F, GROUP_G, GROUP_H,
     )
     mesh = body.mesh
     joints = body.joints
-    torso_slice_options = _torso_slice_options(body)
-    hip_slice_options = _hip_slice_options(body)
     height = mesh.vertices[:, 2].max()
 
     measurements = {"height_cm": height * 100}
 
     # ── Group A: Core torso ──────────────────────────────────────────────
     if GROUP_A in groups:
-        zs, circs = body_signature(mesh, **torso_slice_options)
+        zs, circs = body_signature(mesh)
 
         # Bust
         z, circ_cm, pct = find_measurement(zs, circs, height, "bust")
@@ -346,7 +330,7 @@ def _measure_mhr(body, *, groups, render_path=None, title=""):
                            height * hip_region["high_pct"], 0.002)
         hip_slicer = MeshSlicer(mesh)
         hip_circs = np.array([
-            hip_slicer.circumference_at_z(z, **hip_slice_options) for z in hip_zs
+            hip_slicer.circumference_at_z(z, max_x_extent=0.60) for z in hip_zs
         ])
         hip_valid = hip_circs > 0.30
         if hip_valid.any():
@@ -361,7 +345,7 @@ def _measure_mhr(body, *, groups, render_path=None, title=""):
 
         # Waist
         waist_z = height * WAIST_HEIGHT_PCT
-        waist_circ = torso_circumference_at_z(mesh, waist_z, **torso_slice_options)
+        waist_circ = torso_circumference_at_z(mesh, waist_z)
         measurements["waist_cm"] = waist_circ * 100
         measurements["_waist_z"] = waist_z
         measurements["_waist_pct"] = WAIST_HEIGHT_PCT * 100
@@ -381,7 +365,7 @@ def _measure_mhr(body, *, groups, render_path=None, title=""):
                     best_front_y = front_y
                     best_z = sz
             if best_z is not None:
-                circ = torso_circumference_at_z(mesh, best_z, **torso_slice_options)
+                circ = torso_circumference_at_z(mesh, best_z)
                 if circ > 0.30:
                     measurements["stomach_cm"] = circ * 100
                     measurements["_stomach_z"] = best_z
@@ -437,6 +421,10 @@ def _measure_mhr(body, *, groups, render_path=None, title=""):
 
     # ── Group C: Joint linear (shoulder, sleeve) ─────────────────────────
     if GROUP_C in groups and joints:
+        c7 = joints.get("c7")
+        if c7 is not None:
+            measurements["_c7_surface_pt"] = c7_surface_point(
+                np.array(mesh.vertices), c7)
         sw_cm, sw_arc = measure_shoulder_width(
             joints, mesh=mesh, acromion_fn=find_acromion)
         measurements["shoulder_width_cm"] = sw_cm
@@ -445,7 +433,7 @@ def _measure_mhr(body, *, groups, render_path=None, title=""):
         measurements["sleeve_length_cm"] = measure_sleeve_length(
             joints, mesh=mesh, acromion_fn=find_acromion)
 
-    # ── Group F: Surface trace (shirt length to hip line) ────────────────
+    # ── Group F: Surface trace (shirt length) ────────────────────────────
     if GROUP_F in groups and joints:
         shirt_cm, shirt_pts = measure_shirt_length(
             joints, mesh, measurements.get("_inseam_z", 0),
@@ -454,10 +442,19 @@ def _measure_mhr(body, *, groups, render_path=None, title=""):
         if shirt_pts is not None:
             measurements["_shirt_length_pts"] = shirt_pts
 
+    # ── Group H: Back neck to waist (ISO 5.4.5) ──────────────────────────
+    if GROUP_H in groups and joints:
+        bnw_cm, bnw_pts = measure_back_neck_to_waist(
+            joints, mesh, measurements.get("_waist_z", 0),
+            c7_surface=measurements.get("_c7_surface_pt"))
+        measurements["back_neck_to_waist_cm"] = bnw_cm
+        if bnw_pts is not None:
+            measurements["_back_neck_to_waist_pts"] = bnw_pts
+
     # ── Visualization ────────────────────────────────────────────────────
     if joints:
         measurements["_debug_joints"] = {k: np.array(v) for k, v in joints.items()}
-    has_linear = GROUP_C in groups or GROUP_E in groups
+    has_linear = GROUP_C in groups or GROUP_E in groups or GROUP_H in groups
     if has_linear:
         measurements["_linear_polylines"] = extract_linear_measurement_polylines(
             mesh, measurements, joints or {})
