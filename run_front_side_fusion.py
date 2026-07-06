@@ -262,25 +262,26 @@ def _smooth_band_weight(height_pct, center, half_width):
 SIDE_SDF_BAND_HALF_WIDTH = 0.02953125
 SIDE_SDF_BAND_FEATHER_WIDTH = SIDE_SDF_BAND_HALF_WIDTH
 SIDE_SDF_BAND_CORE_WEIGHT = 1.0
-SIDE_SDF_OUTER_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 1.45
+SIDE_SDF_OUTER_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 0.90
+SIDE_SDF_BAND_EDGE_FALLOFF_POWER = 2.15
 SIDE_SDF_CONTAINMENT_PASSES = 5
 SIDE_SDF_CONTAINMENT_GAIN = 1.0
 SIDE_SDF_CONTAINMENT_MARGIN_PX = 2.0
 SIDE_SDF_CONTAINMENT_MAX_STEP_PX = 24.0
-SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS = 16
-SIDE_SDF_DISPLACEMENT_SMOOTH_ALPHA = 0.36
-SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND = 0.60
+SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS = 20
+SIDE_SDF_DISPLACEMENT_SMOOTH_ALPHA = 0.42
+SIDE_SDF_DISPLACEMENT_SMOOTH_BLEND = 0.72
 SIDE_SDF_EDGE_HEIGHT_SMOOTH_BINS = 220
-SIDE_SDF_EDGE_HEIGHT_SMOOTH_RADIUS_BINS = 9
-SIDE_SDF_EDGE_HEIGHT_SMOOTH_BLEND = 0.58
+SIDE_SDF_EDGE_HEIGHT_SMOOTH_RADIUS_BINS = 4
+SIDE_SDF_EDGE_HEIGHT_SMOOTH_BLEND = 0.72
 SIDE_SDF_ROW_EDGE_LOW_QUANTILE = 0.01
 SIDE_SDF_ROW_EDGE_HIGH_QUANTILE = 0.99
 SIDE_SDF_SOLVE_DATA_WEIGHT = 180.0
 SIDE_SDF_SOLVE_PIN_WEIGHT = 0.85
 SIDE_SDF_SOLVE_SMOOTH_LAMBDA = 1.2
 SIDE_SDF_TARGET_CORE_HALF_WIDTH = SIDE_SDF_BAND_HALF_WIDTH + SIDE_SDF_BAND_FEATHER_WIDTH
-SIDE_SDF_TARGET_FEATHER_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 3.0
-SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 2.5
+SIDE_SDF_TARGET_FEATHER_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 1.25
+SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH = SIDE_SDF_BAND_HALF_WIDTH * 1.25
 SIDE_SDF_SOLVE_SIDE_PIN_SCALE = 0.35
 SIDE_SDF_SOLVE_MIN_DIAGONAL = 1e-6
 SIDE_SDF_RESIDUAL_SOLVE_PASSES = 3
@@ -290,7 +291,7 @@ SIDE_SDF_SOLVE_EDGE_DATA_FLOOR = 0.20
 SIDE_SDF_SOLVE_EDGE_DATA_POWER = 2.0
 
 
-def _flat_band_with_feather(height_pct, center, half_width, feather_width):
+def _flat_band_with_feather(height_pct, center, half_width, feather_width, falloff_power=1.0):
     distance = np.abs(height_pct - float(center))
     weight = np.zeros_like(distance, dtype=np.float64)
     weight[distance <= float(half_width)] = SIDE_SDF_BAND_CORE_WEIGHT
@@ -299,12 +300,16 @@ def _flat_band_with_feather(height_pct, center, half_width, feather_width):
         feather = (distance > float(half_width)) & (distance <= float(half_width + feather_width))
         t = (distance[feather] - float(half_width)) / float(feather_width)
         smooth = t * t * (3.0 - 2.0 * t)
-        weight[feather] = SIDE_SDF_BAND_CORE_WEIGHT * (1.0 - smooth)
+        falloff = 1.0 - smooth
+        power = max(0.01, float(falloff_power))
+        if abs(power - 1.0) > 1e-8:
+            falloff = falloff ** power
+        weight[feather] = SIDE_SDF_BAND_CORE_WEIGHT * falloff
 
     return weight
 
 
-def _outside_band_smooth_weight(height_pct, center, half_width, feather_width, outer_width):
+def _outside_band_smooth_weight(height_pct, center, half_width, feather_width, outer_width, falloff_power=1.0):
     distance = np.abs(height_pct - float(center))
     start = float(half_width + feather_width)
     weight = np.zeros_like(distance, dtype=np.float64)
@@ -314,7 +319,11 @@ def _outside_band_smooth_weight(height_pct, center, half_width, feather_width, o
     outer = (distance > start) & (distance <= start + float(outer_width))
     t = (distance[outer] - start) / float(outer_width)
     smooth = t * t * (3.0 - 2.0 * t)
-    weight[outer] = 1.0 - smooth
+    falloff = 1.0 - smooth
+    power = max(0.01, float(falloff_power))
+    if abs(power - 1.0) > 1e-8:
+        falloff = falloff ** power
+    weight[outer] = falloff
     return weight
 
 
@@ -1079,19 +1088,37 @@ def deform_side_mesh_to_mask_profile(
     anchor_pcts = anchor_pcts or {}
     chest_center = required_anchor_pct(anchor_pcts, "chest")
     butt_center = required_anchor_pct(anchor_pcts, "butt")
-    chest_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH * 2.0
-    butt_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH * 2.0
+    chest_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH
+    butt_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH
     chest_outer_weight = _outside_band_smooth_weight(
-        pct, chest_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, 0.0, chest_outer_smooth_width
+        pct,
+        chest_center,
+        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
+        0.0,
+        chest_outer_smooth_width,
+        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
     )
     butt_outer_weight = _outside_band_smooth_weight(
-        pct, butt_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, 0.0, butt_outer_smooth_width
+        pct,
+        butt_center,
+        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
+        0.0,
+        butt_outer_smooth_width,
+        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
     )
     chest_target_weight = _flat_band_with_feather(
-        pct, chest_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, SIDE_SDF_TARGET_FEATHER_WIDTH
+        pct,
+        chest_center,
+        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
+        SIDE_SDF_TARGET_FEATHER_WIDTH,
+        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
     )
     butt_target_weight = _flat_band_with_feather(
-        pct, butt_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, SIDE_SDF_TARGET_FEATHER_WIDTH
+        pct,
+        butt_center,
+        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
+        SIDE_SDF_TARGET_FEATHER_WIDTH,
+        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
     )
     torso_core, torso_core_meta = compute_torso_core_mask(v, side_result)
     selected = in_image & torso_core & ((chest_target_weight > 1e-4) | (butt_target_weight > 1e-4))
@@ -1112,12 +1139,14 @@ def deform_side_mesh_to_mask_profile(
         chest_center,
         SIDE_SDF_TARGET_CORE_HALF_WIDTH,
         SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH,
+        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
     )
     butt_support_weight = _flat_band_with_feather(
         pct,
         butt_center,
         SIDE_SDF_TARGET_CORE_HALF_WIDTH,
         SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH,
+        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
     )
 
     def build_neighbor_lists(mesh_faces, vertex_count):
@@ -1570,11 +1599,8 @@ def deform_side_mesh_to_mask_profile(
     def smooth_displacement_over_mesh(dx_region, side_region_mask, region_weight, outer_weight):
         if mesh_neighbors is None or SIDE_SDF_DISPLACEMENT_SMOOTH_ITERS <= 0:
             return dx_region.copy(), np.zeros(v.shape[0], dtype=bool)
-        active = side_region_mask & (
-            (region_weight > 1e-4) |
-            (outer_weight > 1e-4) |
-            (np.abs(dx_region) > 1e-6)
-        )
+        band_gate = np.maximum(region_weight, outer_weight)
+        active = side_region_mask & (band_gate > 1e-4)
         source = active & (np.abs(dx_region) > 1e-6)
         if source.sum() < 8:
             return dx_region.copy(), np.zeros(v.shape[0], dtype=bool)
@@ -1590,7 +1616,7 @@ def deform_side_mesh_to_mask_profile(
                 nbr = nbr[active[nbr]]
                 if nbr.size < 3:
                     continue
-                local_weight = max(float(region_weight[idx]), float(outer_weight[idx]) * 0.5)
+                local_weight = float(band_gate[idx])
                 local_alpha = float(SIDE_SDF_DISPLACEMENT_SMOOTH_ALPHA) * np.clip(0.35 + local_weight, 0.35, 1.0)
                 nxt[idx] = (1.0 - local_alpha) * smoothed[idx] + local_alpha * float(np.mean(smoothed[nbr]))
             smoothed = nxt
@@ -1602,11 +1628,8 @@ def deform_side_mesh_to_mask_profile(
         return blended, changed
 
     def smooth_displacement_over_height(dx_region, side_region_mask, region_weight, outer_weight):
-        active = side_region_mask & (
-            (region_weight > 1e-4) |
-            (outer_weight > 1e-4) |
-            (np.abs(dx_region) > 1e-6)
-        )
+        band_gate = np.maximum(region_weight, outer_weight)
+        active = side_region_mask & (band_gate > 1e-4)
         if active.sum() < 8:
             return dx_region.copy(), np.zeros(v.shape[0], dtype=bool)
 
@@ -2258,6 +2281,20 @@ def load_mhr_body_preferring_fusion_mesh(params_json):
         joints=body.joints,
     )
 
+
+def save_clad_render_from_params(params_json, render_path, title):
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    clad_root = os.path.join(repo_root, "clad-body")
+    if os.path.isdir(clad_root) and clad_root not in sys.path:
+        sys.path.insert(0, clad_root)
+
+    from clad_body.measure import measure
+
+    body = load_mhr_body_preferring_fusion_mesh(params_json)
+    measure(body, preset="all", render_path=render_path, title=title)
+    return render_path
+
+
 def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target_height_m, output_dir):
     """Use CLAD on the un-SDF-ed side mesh to locate bust and butt height bands."""
     meta = {
@@ -2631,6 +2668,9 @@ def main():
 
     front_vertices = front_vertices.astype(np.float32)
     side_vertices = side_vertices.astype(np.float32)
+    side_vertices_no_sdf = side_vertices.copy()
+    side_result_no_sdf = _copy_result_dict(side_result)
+    side_result_no_sdf["pred_vertices"] = side_vertices_no_sdf.astype(np.float32)
 
     side_anchor_pcts, side_anchor_meta, side_anchor_paths = measure_untouched_side_anchor_pcts(
         side_result,
@@ -2741,11 +2781,13 @@ def main():
     print(f"  butt smooth/max     : {side_sdf_butt_smooth_count} / {side_sdf_butt_smooth_max_cm:.4f} cm")
     print(f"  butt contain/max    : {side_sdf_butt_contain_count} / {side_sdf_butt_contain_max_cm:.4f} cm")
 
-    # ---- orient both meshes into canonical upright space ----
+    # ---- orient meshes into canonical upright space ----
     front_oriented = center_and_orient_mesh(front_vertices)
+    side_no_sdf_oriented = center_and_orient_mesh(side_vertices_no_sdf)
     side_oriented = center_and_orient_mesh(side_vertices)
 
     front_upright = front_oriented["vertices_oriented"]
+    side_no_sdf_upright = side_no_sdf_oriented["vertices_oriented"]
     side_upright = side_oriented["vertices_oriented"]
 
     print("\nFront mesh:")
@@ -2753,25 +2795,46 @@ def main():
     print(f"  height before rotation : {float(front_oriented['height_before']):.6f}")
     print(f"  height after rotation  : {float(front_oriented['height_after']):.6f}")
 
-    print("\nSide mesh:")
+    print("\nSide mesh without SDF:")
+    print(f"  estimated up direction : {side_no_sdf_oriented['estimated_up_direction']}")
+    print(f"  height before rotation : {float(side_no_sdf_oriented['height_before']):.6f}")
+    print(f"  height after rotation  : {float(side_no_sdf_oriented['height_after']):.6f}")
+
+    print("\nSide mesh final:")
     print(f"  estimated up direction : {side_oriented['estimated_up_direction']}")
     print(f"  height before rotation : {float(side_oriented['height_before']):.6f}")
     print(f"  height after rotation  : {float(side_oriented['height_after']):.6f}")
 
     # ---- align side to front in canonical space ----
+    side_no_sdf_aligned, R_align_no_sdf, front_centroid_no_sdf, side_centroid_no_sdf = kabsch_align_vertices(
+        front_upright,
+        side_no_sdf_upright,
+    )
     side_aligned, R_align, front_centroid, side_centroid = kabsch_align_vertices(
         front_upright,
         side_upright,
     )
 
+    align_dist_no_sdf = np.linalg.norm(side_no_sdf_aligned - front_upright, axis=1)
     align_dist = np.linalg.norm(side_aligned - front_upright, axis=1)
 
-    print("\nAlignment stats:")
+    print("\nAlignment stats without SDF:")
+    print(f"  mean aligned distance   : {float(np.mean(align_dist_no_sdf)):.6f}")
+    print(f"  median aligned distance : {float(np.median(align_dist_no_sdf)):.6f}")
+    print(f"  max aligned distance    : {float(np.max(align_dist_no_sdf)):.6f}")
+
+    print("\nAlignment stats final:")
     print(f"  mean aligned distance   : {float(np.mean(align_dist)):.6f}")
     print(f"  median aligned distance : {float(np.median(align_dist)):.6f}")
     print(f"  max aligned distance    : {float(np.max(align_dist)):.6f}")
 
     # ---- fuse: keep front x,y ; take z from aligned side ----
+    fused_vertices_no_sdf = fuse_front_xy_with_side_z(front_upright, side_no_sdf_aligned)
+    fused_vertices_no_sdf, profile_depth_meta_no_sdf = enhance_profile_depth_from_front_width(
+        fused_vertices_no_sdf,
+        strength=float(args.profile_depth_correction_strength),
+        max_scale=float(args.profile_depth_correction_max_scale),
+    )
     fused_vertices = fuse_front_xy_with_side_z(front_upright, side_aligned)
     fused_vertices, profile_depth_meta = enhance_profile_depth_from_front_width(
         fused_vertices,
@@ -2779,10 +2842,21 @@ def main():
         max_scale=float(args.profile_depth_correction_max_scale),
     )
 
+    dist_fused_no_sdf_to_front = np.linalg.norm(fused_vertices_no_sdf - front_upright, axis=1)
+    dist_fused_no_sdf_to_side = np.linalg.norm(fused_vertices_no_sdf - side_no_sdf_aligned, axis=1)
     dist_fused_to_front = np.linalg.norm(fused_vertices - front_upright, axis=1)
     dist_fused_to_side = np.linalg.norm(fused_vertices - side_aligned, axis=1)
 
-    print("\nFusion stats:")
+    print("\nFusion stats without SDF:")
+    print(f"  mean fused->front distance : {float(np.mean(dist_fused_no_sdf_to_front)):.6f}")
+    print(f"  mean fused->side distance  : {float(np.mean(dist_fused_no_sdf_to_side)):.6f}")
+    print(
+        "  profile depth correction : "
+        f"bust x{float(profile_depth_meta_no_sdf['bust_scale']):.3f}, "
+        f"hip x{float(profile_depth_meta_no_sdf['hip_scale']):.3f}"
+    )
+
+    print("\nFusion stats final:")
     print(f"  mean fused->front distance : {float(np.mean(dist_fused_to_front)):.6f}")
     print(f"  mean fused->side distance  : {float(np.mean(dist_fused_to_side)):.6f}")
     print(
@@ -2794,6 +2868,62 @@ def main():
     # ---- scale fused mesh to requested height ----
     target_height_cm = float(args.target_height)
     target_height_m = target_height_cm / 100.0
+
+    fused_vertices_no_sdf_scaled, no_sdf_scale_factor, no_sdf_height_before_scale, no_sdf_height_after_scale = scale_mesh_to_target_height(
+        fused_vertices_no_sdf,
+        target_height_m,
+    )
+    no_sdf_result_unscaled = build_fused_result(
+        front_result=front_result,
+        side_result=side_result_no_sdf,
+        fused_vertices=fused_vertices_no_sdf,
+        target_height=target_height_cm,
+    )
+    no_sdf_result_scaled = scale_result_params(no_sdf_result_unscaled, float(no_sdf_scale_factor))
+    no_sdf_result_scaled["pred_vertices"] = fused_vertices_no_sdf_scaled.astype(np.float32)
+    no_sdf_result_scaled["fusion_applied_scale_factor"] = np.array(float(no_sdf_scale_factor), dtype=np.float64)
+    for key, value in profile_depth_meta_no_sdf.items():
+        no_sdf_result_scaled[f"fusion_profile_depth_{key}"] = value
+    for key, value in side_anchor_meta.items():
+        no_sdf_result_scaled[f"fusion_side_anchor_{key}"] = value
+    for key, value in side_anchor_paths.items():
+        if value:
+            no_sdf_result_scaled[f"fusion_side_anchor_{key}_path"] = np.array(value, dtype=object)
+    no_sdf_result_scaled["fusion_side_anchor_source"] = np.array(
+        "untouched_side_clad_mesh",
+        dtype=object,
+    )
+    no_sdf_result_scaled["fusion_side_sdf_profile_enabled"] = np.array(False, dtype=bool)
+    no_sdf_result_scaled["fusion_side_sdf_profile_reason"] = np.array("not_applied_no_sdf_reference", dtype=object)
+
+    no_sdf_clad_vertices = sam_upright_vertices_to_clad_canonical(fused_vertices_no_sdf_scaled)
+    no_sdf_clad_obj = os.path.join(output_dir, "front_fused_no_sdf_clad_geometry.obj")
+    no_sdf_clad_render = os.path.join(output_dir, "front_fused_no_sdf_clad_render.png")
+    no_sdf_params_json = os.path.join(output_dir, "front_fused_no_sdf_all_body_params_scaled.json")
+    save_mesh_obj(no_sdf_clad_vertices, estimator.faces, no_sdf_clad_obj)
+    no_sdf_result_scaled["fusion_apply_profile_depth_to_mhr"] = np.array(
+        bool(args.no_fused_vertex_override and float(args.profile_depth_correction_strength) > 0.0),
+    )
+    no_sdf_result_scaled["fusion_vertices_clad"] = no_sdf_clad_vertices.astype(np.float32)
+    no_sdf_result_scaled["fusion_faces_clad"] = np.asarray(estimator.faces, dtype=np.int32)
+    no_sdf_result_scaled["fusion_vertices_clad_coordinate_system"] = np.array(
+        "x_lateral_y_profile_z_up_meters",
+        dtype=object,
+    )
+    no_sdf_result_scaled["fusion_clad_render_path"] = np.array(no_sdf_clad_render, dtype=object)
+    if args.no_fused_vertex_override:
+        no_sdf_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(False)
+        no_sdf_result_scaled["fusion_rule"] = np.array(
+            "front_xy_original_side_z_profile_depth_mhr_restpose",
+            dtype=object,
+        )
+    else:
+        no_sdf_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(True)
+        no_sdf_result_scaled["fusion_rule"] = np.array(
+            "front_xy_original_side_z_profile_depth_fused_vertex_mesh",
+            dtype=object,
+        )
+    save_result_json(no_sdf_result_scaled, no_sdf_params_json)
 
     fused_vertices_scaled, scale_factor, fused_height_before_scale, fused_height_after_scale = scale_mesh_to_target_height(
         fused_vertices,
@@ -2838,9 +2968,13 @@ def main():
         fused_result_scaled["fusion_side_sdf_edited_render_path"] = np.array(side_sdf_edited_render, dtype=object)
     if side_sdf_row_debug_path:
         fused_result_scaled["fusion_side_sdf_profile_row_debug_path"] = np.array(side_sdf_row_debug_path, dtype=object)
+    fused_result_scaled["fusion_no_sdf_reference_params_path"] = np.array(no_sdf_params_json, dtype=object)
+    fused_result_scaled["fusion_no_sdf_reference_clad_obj_path"] = np.array(no_sdf_clad_obj, dtype=object)
+    fused_result_scaled["fusion_no_sdf_reference_clad_render_path"] = np.array(no_sdf_clad_render, dtype=object)
 
     fused_clad_vertices = sam_upright_vertices_to_clad_canonical(fused_vertices_scaled)
     fused_clad_obj = os.path.join(output_dir, "front_fused_clad_geometry.obj")
+    fused_clad_render = os.path.join(output_dir, "front_fused_final_clad_render.png")
     save_mesh_obj(fused_clad_vertices, estimator.faces, fused_clad_obj)
     fused_result_scaled["fusion_apply_profile_depth_to_mhr"] = np.array(
         bool(args.no_fused_vertex_override and float(args.profile_depth_correction_strength) > 0.0),
@@ -2851,6 +2985,7 @@ def main():
         "x_lateral_y_profile_z_up_meters",
         dtype=object,
     )
+    fused_result_scaled["fusion_clad_render_path"] = np.array(fused_clad_render, dtype=object)
     side_sdf_rule_part = (
         "side_sdf_profile_"
         if bool(np.asarray(side_sdf_profile_meta.get("enabled", False)).item())
@@ -2872,14 +3007,26 @@ def main():
     fused_params_json = os.path.join(output_dir, "front_fused_all_body_params_scaled.json")
     save_result_json(fused_result_scaled, fused_params_json)
 
-    print("\nScaling stats:")
+    save_clad_render_from_params(no_sdf_params_json, no_sdf_clad_render, "front_fused_no_sdf")
+    save_clad_render_from_params(fused_params_json, fused_clad_render, "front_fused_final")
+
+    print("\nScaling stats without SDF:")
+    print(f"  fused height before scale : {float(no_sdf_height_before_scale) * 100.0:.6f} cm")
+    print(f"  target fused height       : {float(no_sdf_height_after_scale) * 100.0:.6f} cm")
+    print(f"  applied scale factor      : {float(no_sdf_scale_factor):.6f}")
+
+    print("\nScaling stats final:")
     print(f"  fused height before scale : {float(fused_height_before_scale) * 100.0:.6f} cm")
     print(f"  target fused height       : {float(fused_height_after_scale) * 100.0:.6f} cm")
     print(f"  applied scale factor      : {float(scale_factor):.6f}")
 
     print("\nDone.")
-    print(f"Saved fused params JSON     : {fused_params_json}")
-    print(f"Saved fused CLAD OBJ        : {fused_clad_obj}")
+    print(f"Saved no-SDF params JSON    : {no_sdf_params_json}")
+    print(f"Saved no-SDF CLAD OBJ       : {no_sdf_clad_obj}")
+    print(f"Saved no-SDF CLAD render    : {no_sdf_clad_render}")
+    print(f"Saved final params JSON     : {fused_params_json}")
+    print(f"Saved final CLAD OBJ        : {fused_clad_obj}")
+    print(f"Saved final CLAD render     : {fused_clad_render}")
     print(f"Saved front render          : {front_raw_render}")
     print(f"Saved side render           : {side_raw_render}")
     if side_mask_path:
