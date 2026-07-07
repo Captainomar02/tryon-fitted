@@ -276,6 +276,8 @@ SIDE_SDF_EDGE_HEIGHT_SMOOTH_RADIUS_BINS = 4
 SIDE_SDF_EDGE_HEIGHT_SMOOTH_BLEND = 0.72
 SIDE_SDF_ROW_EDGE_LOW_QUANTILE = 0.01
 SIDE_SDF_ROW_EDGE_HIGH_QUANTILE = 0.99
+SIDE_SDF_ROW_EDGE_MIN_SAMPLES = 2
+SIDE_SDF_ROW_EDGE_STRONG_MIN_SAMPLES = 6
 SIDE_SDF_SOLVE_DATA_WEIGHT = 180.0
 SIDE_SDF_SOLVE_PIN_WEIGHT = 0.85
 SIDE_SDF_SOLVE_SMOOTH_LAMBDA = 1.2
@@ -728,6 +730,36 @@ def row_bounds_from_mask(mask, row_radius=4):
             left[y] = float(xs.min())
             right[y] = float(xs.max())
     return left, right
+
+
+def mask_runs_for_row(mask, y, row_radius=4):
+    h, _ = mask.shape[:2]
+    y0 = max(0, int(y) - int(row_radius))
+    y1 = min(h, int(y) + int(row_radius) + 1)
+    xs = np.nonzero(mask[y0:y1].any(axis=0))[0]
+    if xs.size == 0:
+        return []
+    split = np.nonzero(np.diff(xs) > 1)[0]
+    starts = np.r_[0, split + 1]
+    ends = np.r_[split, xs.size - 1]
+    return [(float(xs[s]), float(xs[e])) for s, e in zip(starts, ends)]
+
+
+def mask_edge_near_mesh_edge(mask, y, mesh_edge, side_sign, row_radius=4):
+    runs = mask_runs_for_row(mask, y, row_radius=row_radius)
+    if not runs or not np.isfinite(mesh_edge):
+        return np.nan
+
+    edge = float(mesh_edge)
+    tolerance = max(2.0, float(row_radius))
+    containing = [r for r in runs if (r[0] - tolerance) <= edge <= (r[1] + tolerance)]
+    if containing:
+        run = min(containing, key=lambda r: abs(edge - (0.5 * (r[0] + r[1]))))
+    else:
+        run = min(runs, key=lambda r: min(abs(edge - r[0]), abs(edge - r[1])))
+    return float(run[0] if int(side_sign) < 0 else run[1])
+
+
 def required_anchor_pct(anchor_pcts, key):
     try:
         value = float((anchor_pcts or {})[key])
@@ -961,24 +993,55 @@ def save_side_sdf_row_debug(
         cv2.line(canvas, (0, y1), (w + chart_w - 1, y1), color, 1, cv2.LINE_AA)
 
     def draw_region(region_mask, side_sign, base_color):
-        for y in range(0, h, 2):
+        min_samples = int(SIDE_SDF_ROW_EDGE_MIN_SAMPLES)
+        strong_min_samples = int(SIDE_SDF_ROW_EDGE_STRONG_MIN_SAMPLES)
+        mesh_edge_row = np.full(h, np.nan, dtype=np.float64)
+        raw_edge_row = np.full(h, np.nan, dtype=np.float64)
+        signed_gap_row = np.zeros(h, dtype=np.float64)
+        valid_row = np.zeros(h, dtype=bool)
+        sample_count = np.zeros(h, dtype=np.int32)
+
+        for y in range(h):
             near = region_mask & (np.abs(rows - y) <= int(row_radius))
-            if not near.any():
+            count = int(near.sum())
+            sample_count[y] = count
+            if count < min_samples:
                 continue
-            if not (np.isfinite(mask_left[y]) and np.isfinite(mask_right[y]) and np.isfinite(row_left[y]) and np.isfinite(row_right[y])):
-                continue
+            xs = proj[near, 0]
             if side_sign < 0:
-                mesh_edge = row_left[y]
-                raw_edge = row_min[y]
-                mask_edge = mask_left[y]
+                mesh_edge = float(np.quantile(xs, SIDE_SDF_ROW_EDGE_LOW_QUANTILE))
+                raw_edge = float(np.min(xs))
             else:
-                mesh_edge = row_right[y]
-                raw_edge = row_max[y]
-                mask_edge = mask_right[y]
+                mesh_edge = float(np.quantile(xs, SIDE_SDF_ROW_EDGE_HIGH_QUANTILE))
+                raw_edge = float(np.max(xs))
+            mask_edge = mask_edge_near_mesh_edge(
+                side_mask,
+                y,
+                mesh_edge,
+                side_sign,
+                row_radius=row_radius,
+            )
             if not (np.isfinite(mesh_edge) and np.isfinite(mask_edge)):
                 continue
+            mesh_edge_row[y] = mesh_edge
+            raw_edge_row[y] = raw_edge
+            signed_gap_row[y] = (mask_edge - mesh_edge) * float(side_sign)
+            valid_row[y] = abs(signed_gap_row[y]) > 1e-6
 
-            signed_gap = (mask_edge - mesh_edge) * float(side_sign)
+        strong_row = valid_row & (sample_count >= strong_min_samples)
+        weak_row = valid_row & ~strong_row
+        if np.any(weak_row) and np.any(strong_row):
+            filled = smooth_rows(signed_gap_row, strong_row, max(float(row_radius) * 2.5, 10.0))
+            signed_gap_row[weak_row] = filled[weak_row]
+            valid_row[weak_row & (np.abs(signed_gap_row) <= 1e-6)] = False
+
+        for y in range(0, h, 2):
+            if not valid_row[y] or not np.isfinite(mesh_edge_row[y]):
+                continue
+            mesh_edge = mesh_edge_row[y]
+            raw_edge = raw_edge_row[y]
+            signed_gap = signed_gap_row[y]
+            mask_edge = mesh_edge + signed_gap * float(side_sign)
             sample_xy = np.array([[mesh_edge, float(y)]], dtype=np.float64)
             sdf_at_edge = float(sample_image_bilinear(sdf, sample_xy)[0])
             abs_gap = abs(signed_gap)
@@ -1297,28 +1360,50 @@ def deform_side_mesh_to_mask_profile(
             "selected": selected_cur,
         }
 
-    def target_shift_by_row(profile_state, side_sign):
+    def target_shift_by_row(profile_state, side_sign, region_mask):
         shift = np.zeros(h, dtype=np.float64)
         valid = np.zeros(h, dtype=bool)
-        row_left_cur = profile_state["row_left"]
-        row_right_cur = profile_state["row_right"]
+        sample_count = np.zeros(h, dtype=np.int32)
+        proj_cur = profile_state["proj"]
+        rows_cur = profile_state["rows"]
+        region_mask = np.asarray(region_mask, dtype=bool)
+        min_samples = int(SIDE_SDF_ROW_EDGE_MIN_SAMPLES)
+        strong_min_samples = int(SIDE_SDF_ROW_EDGE_STRONG_MIN_SAMPLES)
         for y in range(h):
-            if not (
-                np.isfinite(mask_left[y]) and np.isfinite(mask_right[y]) and
-                np.isfinite(row_left_cur[y]) and np.isfinite(row_right_cur[y])
-            ):
+            near = region_mask & (np.abs(rows_cur - y) <= row_radius)
+            count = int(near.sum())
+            sample_count[y] = count
+            if count < min_samples:
                 continue
+            xs = proj_cur[near, 0]
             if side_sign < 0:
-                shift[y] = mask_left[y] - row_left_cur[y]
+                mesh_edge = float(np.quantile(xs, SIDE_SDF_ROW_EDGE_LOW_QUANTILE))
             else:
-                shift[y] = mask_right[y] - row_right_cur[y]
+                mesh_edge = float(np.quantile(xs, SIDE_SDF_ROW_EDGE_HIGH_QUANTILE))
+            mask_edge = mask_edge_near_mesh_edge(
+                side_mask,
+                y,
+                mesh_edge,
+                side_sign,
+                row_radius=row_radius,
+            )
+            if not (np.isfinite(mesh_edge) and np.isfinite(mask_edge)):
+                continue
+            shift[y] = float(mask_edge - mesh_edge)
             valid[y] = abs(shift[y]) > 1e-6
 
-        raw_shift = shift.copy()
         sigma_px = max(float(row_radius) * 2.5, 10.0)
+        strong_valid = valid & (sample_count >= strong_min_samples)
+        weak_valid = valid & ~strong_valid
+        if np.any(weak_valid) and np.any(strong_valid):
+            strong_fill = smooth_rows(shift, strong_valid, sigma_px)
+            shift[weak_valid] = strong_fill[weak_valid]
+            valid[weak_valid & (np.abs(shift) <= 1e-6)] = False
+            strong_valid = valid & (sample_count >= strong_min_samples)
+        raw_shift = shift.copy()
         smoothed = smooth_rows(raw_shift, valid, sigma_px)
         sign_flip = (
-            valid &
+            strong_valid &
             (np.abs(raw_shift) > 1e-6) &
             (np.abs(smoothed) > 1e-6) &
             (np.sign(raw_shift) != np.sign(smoothed))
@@ -1328,7 +1413,7 @@ def deform_side_mesh_to_mask_profile(
             raw_underfit = raw_shift * float(side_sign)
             smoothed_underfit = smoothed * float(side_sign)
             underfit_peak = (
-                valid &
+                strong_valid &
                 (raw_underfit > 1e-6) &
                 (raw_underfit > smoothed_underfit)
             )
@@ -1449,13 +1534,17 @@ def deform_side_mesh_to_mask_profile(
         chest_side_strength_pass = np.clip((anterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
         butt_side_strength_pass = np.clip((posterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
 
+        chest_region_mask_pass = chest_side_mask_pass & (chest_height_weight > 1e-4)
+        butt_region_mask_pass = butt_side_mask_pass & (butt_height_weight > 1e-4)
         chest_shift_row_pass, chest_valid_row_pass, chest_raw_shift_row_pass, chest_shift_sign_flip_row_pass = target_shift_by_row(
             profile_state,
             anterior_sign,
+            chest_region_mask_pass,
         )
         butt_shift_row_pass, butt_valid_row_pass, butt_raw_shift_row_pass, butt_shift_sign_flip_row_pass = target_shift_by_row(
             profile_state,
             posterior_sign,
+            butt_region_mask_pass,
         )
 
         chest_raw_pass_stats = signed_row_gap_stats(chest_raw_shift_row_pass, chest_valid_row_pass, anterior_sign)
@@ -1817,13 +1906,17 @@ def deform_side_mesh_to_mask_profile(
     final_butt_dx_stats = displacement_stats(dx_butt)
 
     final_profile_state = compute_profile_state(v)
+    final_chest_region_mask = final_profile_state["chest_side_mask"] & (chest_height_weight > 1e-4)
+    final_butt_region_mask = final_profile_state["butt_side_mask"] & (butt_height_weight > 1e-4)
     final_chest_shift_row, final_chest_valid_row, final_chest_raw_shift_row, _ = target_shift_by_row(
         final_profile_state,
         anterior_sign,
+        final_chest_region_mask,
     )
     final_butt_shift_row, final_butt_valid_row, final_butt_raw_shift_row, _ = target_shift_by_row(
         final_profile_state,
         posterior_sign,
+        final_butt_region_mask,
     )
     final_chest_row_gap = signed_row_gap_stats(final_chest_shift_row, final_chest_valid_row, anterior_sign)
     final_butt_row_gap = signed_row_gap_stats(final_butt_shift_row, final_butt_valid_row, posterior_sign)
@@ -1879,6 +1972,9 @@ def deform_side_mesh_to_mask_profile(
         "residual_butt_applied_max_abs_cm_by_pass": np.asarray(residual_butt_applied_max_abs_cm_by_pass, dtype=np.float64),
         "row_edge_low_quantile": np.array(float(SIDE_SDF_ROW_EDGE_LOW_QUANTILE), dtype=np.float64),
         "row_edge_high_quantile": np.array(float(SIDE_SDF_ROW_EDGE_HIGH_QUANTILE), dtype=np.float64),
+        "row_edge_min_samples": np.array(int(SIDE_SDF_ROW_EDGE_MIN_SAMPLES), dtype=np.int64),
+        "row_edge_strong_min_samples": np.array(int(SIDE_SDF_ROW_EDGE_STRONG_MIN_SAMPLES), dtype=np.int64),
+        "row_mask_edge_mode": np.array("local_component_near_mesh_edge", dtype=object),
         "chest_solve_changed_vertex_count": np.array(int(chest_solve_changed.sum()), dtype=np.int64),
         "butt_solve_changed_vertex_count": np.array(int(butt_solve_changed.sum()), dtype=np.int64),
         "chest_valid_row_count": np.array(int(chest_valid_row.sum()), dtype=np.int64),
@@ -2167,6 +2263,67 @@ def _fusion_target_height_m(params, fused_vertices):
     return float(fused_vertices[:, 2].max() - fused_vertices[:, 2].min())
 
 
+def _float_param(params, key, default=0.0):
+    value = params.get(key, default)
+    if isinstance(value, list):
+        value = value[0] if value else default
+    if isinstance(value, np.ndarray):
+        value = value.reshape(-1)[0] if value.size else default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _apply_profile_depth_to_clad_body(body, params):
+    if not _truthy_param(params.get("fusion_apply_profile_depth_to_mhr", False)):
+        return body
+
+    from clad_body.load.mhr import MhrBody
+
+    verts = np.asarray(body.mesh.vertices, dtype=np.float32).copy()
+    height = float(verts[:, 2].max() - verts[:, 2].min())
+    if height <= 1e-8:
+        return body
+
+    arm_mask = _arm_region_mask_for_clad(body.mesh, body.joints)
+    torso_mask = ~arm_mask if arm_mask.any() else np.ones(verts.shape[0], dtype=bool)
+    z_min = float(verts[:, 2].min())
+    pct = (verts[:, 2] - z_min) / height
+    corrections = [
+        ("bust", 0.725, 0.075, _float_param(params, "fusion_profile_depth_bust_scale", 1.0)),
+        ("hip", 0.50, 0.09, _float_param(params, "fusion_profile_depth_hip_scale", 1.0)),
+    ]
+
+    total_weight = np.zeros(verts.shape[0], dtype=np.float64)
+    for _, center, half_width, scale in corrections:
+        if scale <= 1.0:
+            continue
+        total_weight += _smooth_band_weight(pct, center, half_width) * (float(scale) - 1.0)
+    total_weight[~torso_mask] = 0.0
+
+    if np.max(total_weight) <= 0.0:
+        return body
+
+    bins = np.clip(np.floor(pct * 200).astype(np.int32), 0, 199)
+    y_center = np.zeros(verts.shape[0], dtype=np.float64)
+    for bin_id in np.unique(bins[torso_mask]):
+        bin_mask = torso_mask & (bins == bin_id)
+        if np.any(bin_mask):
+            y_center[bin_mask] = np.median(verts[bin_mask, 1])
+    active = total_weight > 0.0
+    verts[active, 1] = y_center[active] + (verts[active, 1] - y_center[active]) * (1.0 + total_weight[active])
+    verts[:, 2] -= float(verts[:, 2].min())
+
+    joints = body.joints
+    return MhrBody(
+        mesh=trimesh.Trimesh(vertices=verts, faces=np.asarray(body.mesh.faces), process=False),
+        source=f"profile_depth_mhr_restpose:{body.source}",
+        obj_path=body.obj_path,
+        sam3d_params=body.sam3d_params,
+        joints=joints,
+    )
+
 def _vertex_adjacency_for_clad(faces, n_vertices):
     neighbors = [set() for _ in range(n_vertices)]
     for a, b, c in np.asarray(faces, dtype=np.int32):
@@ -2242,8 +2399,83 @@ def _fused_transfer_mask_for_clad(mesh, joints):
     return ~_arm_region_mask_for_clad(mesh, joints)
 
 
+def _fused_transfer_weights_for_clad(mesh, joints, preserve_rings=6, blend_rings=12):
+    """Blend fused torso into CLAD A-pose without a hard arm seam."""
+    vertices = np.asarray(mesh.vertices)
+    arm = _arm_region_mask_for_clad(mesh, joints)
+    if not arm.any():
+        return np.ones(vertices.shape[0], dtype=np.float32), arm
+
+    adjacency = _vertex_adjacency_for_clad(np.asarray(mesh.faces, dtype=np.int32), vertices.shape[0])
+    max_dist = int(preserve_rings) + int(blend_rings)
+    dist = np.full(vertices.shape[0], -1, dtype=np.int32)
+    frontier = [int(i) for i in np.flatnonzero(arm)]
+    dist[frontier] = 0
+    head = 0
+    while head < len(frontier):
+        cur = frontier[head]
+        head += 1
+        if dist[cur] >= max_dist:
+            continue
+        for nxt in adjacency[cur]:
+            nxt = int(nxt)
+            if dist[nxt] >= 0:
+                continue
+            dist[nxt] = dist[cur] + 1
+            frontier.append(nxt)
+
+    weights = np.ones(vertices.shape[0], dtype=np.float32)
+    reached = dist >= 0
+    preserve = reached & (dist <= int(preserve_rings))
+    transition = reached & (dist > int(preserve_rings)) & (dist <= max_dist)
+    weights[preserve] = 0.0
+    if int(blend_rings) > 0:
+        weights[transition] = (
+            (dist[transition].astype(np.float32) - float(preserve_rings)) / float(blend_rings)
+        )
+    return np.clip(weights, 0.0, 1.0), arm
+
+
+def _normalize_fused_clad_vertices_for_measurement(params, fused_vertices):
+    vertices = np.asarray(fused_vertices, dtype=np.float32).copy()
+    current_height = float(vertices[:, 2].max() - vertices[:, 2].min())
+    target_height = _fusion_target_height_m(params, vertices)
+    if current_height > 1e-8 and target_height > 1e-8:
+        vertices *= float(target_height) / current_height
+    vertices[:, 2] -= float(vertices[:, 2].min())
+    center_xy = (vertices[:, :2].max(axis=0) + vertices[:, :2].min(axis=0)) * 0.5
+    vertices[:, 0] -= float(center_xy[0])
+    vertices[:, 1] -= float(center_xy[1])
+    return vertices.astype(np.float32)
+
+
+def _topology_transferred_joints_for_clad(rest_body, fused_vertices, nearest_count=8):
+    if not rest_body.joints:
+        return None
+
+    rest_vertices = np.asarray(rest_body.mesh.vertices, dtype=np.float64)
+    fused_vertices = np.asarray(fused_vertices, dtype=np.float64)
+    if rest_vertices.shape != fused_vertices.shape or rest_vertices.ndim != 2:
+        return rest_body.joints
+
+    k = max(1, min(int(nearest_count), rest_vertices.shape[0]))
+    joints = {}
+    for name, point in rest_body.joints.items():
+        point = np.asarray(point, dtype=np.float64)
+        dist2 = np.sum((rest_vertices - point[None, :]) ** 2, axis=1)
+        idx = np.argpartition(dist2, k - 1)[:k]
+        dist = np.sqrt(np.maximum(dist2[idx], 0.0))
+        if float(dist.min()) < 1e-8:
+            weights = (dist == dist.min()).astype(np.float64)
+        else:
+            weights = 1.0 / np.maximum(dist, 1e-6)
+        weights /= float(weights.sum())
+        joints[name] = np.sum(fused_vertices[idx] * weights[:, None], axis=0).astype(np.float32)
+    return joints
+
+
 def load_mhr_body_preferring_fusion_mesh(params_json):
-    """Use final fused torso geometry on upstream CLAD's A-pose measurement mesh."""
+    """Use the complete final fused SDF mesh as CLAD's measurement body."""
     from clad_body.load import load_mhr_from_params
     from clad_body.load.mhr import MhrBody
 
@@ -2252,34 +2484,212 @@ def load_mhr_body_preferring_fusion_mesh(params_json):
     with open(params_json) as f:
         params = json.load(f)
 
-    if not _truthy_param(params.get("fusion_prefer_vertices_for_clad", False)):
-        return body
+    vertices = params.get("fusion_vertices_clad")
+    faces = params.get("fusion_faces_clad")
+    fused_vertices_hint = (
+        np.asarray(vertices, dtype=np.float32)
+        if vertices is not None
+        else np.asarray(body.mesh.vertices, dtype=np.float32)
+    )
+    body = _scaled_mhr_body_to_height(body, _fusion_target_height_m(params, fused_vertices_hint))
+
+    if vertices is None or faces is None or _truthy_param(params.get("fusion_disable_full_fused_clad_measurement", False)):
+        return _apply_profile_depth_to_clad_body(body, params)
+
+    fused_vertices = _normalize_fused_clad_vertices_for_measurement(params, vertices)
+    fused_faces = np.asarray(faces, dtype=np.int32)
+    rest_vertices = np.asarray(body.mesh.vertices, dtype=np.float32)
+    rest_faces = np.asarray(body.mesh.faces, dtype=np.int32)
+    if fused_vertices.shape != rest_vertices.shape or fused_faces.shape != rest_faces.shape:
+        return _apply_profile_depth_to_clad_body(body, params)
+
+    mesh = trimesh.Trimesh(vertices=fused_vertices, faces=rest_faces, process=False)
+    return MhrBody(
+        mesh=mesh,
+        source=f"fusion_full_sdf_mesh:{os.path.basename(params_json)}",
+        obj_path=body.obj_path,
+        sam3d_params=body.sam3d_params,
+        joints=_topology_transferred_joints_for_clad(body, fused_vertices),
+    )
+
+
+def _joint_anchored_upperarm_for_clad(mesh, joints, height):
+    if not joints or height <= 0.0:
+        return None
+
+    from clad_body.measure._slicer import _perpendicular_limb_contour
+
+    side_results = []
+    for side in ("l", "r"):
+        shoulder = joints.get(f"{side}_shoulder")
+        elbow = joints.get(f"{side}_elbow")
+        if shoulder is None or elbow is None:
+            continue
+        shoulder = np.asarray(shoulder, dtype=np.float64)
+        elbow = np.asarray(elbow, dtype=np.float64)
+        axis = elbow - shoulder
+        length = float(np.linalg.norm(axis))
+        if length <= 1e-4:
+            continue
+        axis /= length
+
+        candidates = []
+        for t in np.linspace(0.38, 0.72, 8):
+            center = shoulder + (elbow - shoulder) * float(t)
+            pts = _perpendicular_limb_contour(mesh, center, axis, max_dist=0.16)
+            if pts is None or len(pts) < 3:
+                continue
+            closed = np.vstack([pts, pts[:1]])
+            circ = float(np.linalg.norm(np.diff(closed, axis=0), axis=1).sum())
+            if 0.12 <= circ <= 0.60:
+                candidates.append((circ, float(center[2])))
+        if candidates:
+            side_results.append(max(candidates, key=lambda item: item[0]))
+
+    if len(side_results) < 2:
+        return None
+    circ = float(np.mean([item[0] for item in side_results]))
+    z = float(np.mean([item[1] for item in side_results]))
+    return circ * 100.0, z, z / height * 100.0
+
+
+def _fused_torso_mesh_for_clad(params_json, body):
+    with open(params_json) as f:
+        params = json.load(f)
 
     vertices = params.get("fusion_vertices_clad")
     faces = params.get("fusion_faces_clad")
-    if vertices is None or faces is None:
-        return body
+    if vertices is None or faces is None or not body.joints:
+        return None
 
-    fused_vertices = np.asarray(vertices, dtype=np.float32)
+    fused_vertices = np.asarray(vertices, dtype=np.float32).copy()
     fused_faces = np.asarray(faces, dtype=np.int32)
     rest_faces = np.asarray(body.mesh.faces, dtype=np.int32)
     if fused_vertices.shape != np.asarray(body.mesh.vertices).shape or fused_faces.shape != rest_faces.shape:
-        return body
+        return None
 
-    body = _scaled_mhr_body_to_height(body, _fusion_target_height_m(params, fused_vertices))
-    measurement_vertices = np.asarray(body.mesh.vertices, dtype=np.float32).copy()
-    transfer_mask = _fused_transfer_mask_for_clad(body.mesh, body.joints)
-    measurement_vertices[transfer_mask] = fused_vertices[transfer_mask]
-    measurement_vertices[:, 2] -= float(measurement_vertices[:, 2].min())
+    current_height = float(fused_vertices[:, 2].max() - fused_vertices[:, 2].min())
+    target_height = _fusion_target_height_m(params, fused_vertices)
+    if current_height > 1e-8 and target_height > 1e-8:
+        fused_vertices *= float(target_height) / current_height
+    fused_vertices[:, 2] -= float(fused_vertices[:, 2].min())
 
-    mesh = trimesh.Trimesh(vertices=measurement_vertices, faces=rest_faces, process=False)
-    return MhrBody(
-        mesh=mesh,
-        source=f"fusion_torso_on_clad_apose:{os.path.basename(params_json)}",
-        obj_path=body.obj_path,
-        sam3d_params=body.sam3d_params,
-        joints=body.joints,
-    )
+    arm_mask = _arm_region_mask_for_clad(body.mesh, body.joints)
+    if not arm_mask.any():
+        return None
+    torso_faces = fused_faces[~arm_mask[fused_faces].any(axis=1)]
+    if torso_faces.size == 0:
+        return None
+    return trimesh.Trimesh(vertices=fused_vertices, faces=torso_faces, process=False)
+
+
+def _refine_measurements_with_fused_torso(measurements, body, torso_mesh):
+    mesh = body.mesh
+    height = float(np.asarray(mesh.vertices)[:, 2].max())
+    if height <= 0.0:
+        return measurements
+
+    upperarm = _joint_anchored_upperarm_for_clad(mesh, body.joints, height)
+    if upperarm is not None and (float(measurements.get("upperarm_cm", 0.0) or 0.0) <= 0.0):
+        measurements["upperarm_cm"], measurements["_upperarm_z"], measurements["_upperarm_pct"] = upperarm
+
+    if torso_mesh is None:
+        return measurements
+
+    from clad_body.measure._circumferences import REGIONS
+    from clad_body.measure._render import extract_measurement_contours
+    from clad_body.measure._slicer import MeshSlicer, torso_circumference_at_z
+
+    if "bust_cm" in measurements or "_bust_z" in measurements:
+        bust_zs = np.arange(height * 0.68, height * 0.76, 0.002)
+        if len(bust_zs) > 0:
+            slicer = MeshSlicer(torso_mesh)
+            bust_circs = np.array([
+                slicer.circumference_at_z(z, combine_fragments=True)
+                for z in bust_zs
+            ])
+            valid = bust_circs > 0.30
+            if valid.any():
+                idx = int(np.argmax(np.where(valid, bust_circs, -1.0)))
+                z = float(bust_zs[idx])
+                measurements["bust_cm"] = float(bust_circs[idx] * 100.0)
+                measurements["_bust_z"] = z
+                measurements["_bust_pct"] = z / height * 100.0
+
+    if "hip_cm" in measurements or "_hip_z" in measurements:
+        hip_region = REGIONS["hip"]
+        hip_zs = np.arange(
+            height * hip_region["low_pct"],
+            height * hip_region["high_pct"],
+            0.002,
+        )
+        if len(hip_zs) > 0:
+            hip_circs = np.array([
+                torso_circumference_at_z(
+                    torso_mesh,
+                    z,
+                    max_x_extent=0.80,
+                    combine_fragments=True,
+                )
+                for z in hip_zs
+            ])
+            valid = hip_circs > 0.30
+            if valid.any():
+                idx = int(np.argmax(np.where(valid, hip_circs, -1.0)))
+                z = float(hip_zs[idx])
+                measurements["hip_cm"] = float(hip_circs[idx] * 100.0)
+                measurements["_hip_z"] = z
+                measurements["_hip_pct"] = z / height * 100.0
+
+    waist_z = float(measurements.get("_waist_z", height * 0.61) or 0.0)
+    if waist_z > 0 and ("waist_cm" in measurements or "_waist_z" in measurements):
+        waist_circ = torso_circumference_at_z(
+            torso_mesh,
+            waist_z,
+            max_x_extent=0.60,
+            combine_fragments=True,
+        )
+        if waist_circ > 0.30:
+            measurements["waist_cm"] = float(waist_circ * 100.0)
+            measurements["_waist_z"] = waist_z
+            measurements["_waist_pct"] = waist_z / height * 100.0
+
+    hip_z = float(measurements.get("_hip_z", 0.0) or 0.0)
+    if hip_z > 0 and waist_z > hip_z and ("stomach_cm" in measurements or "_stomach_z" in measurements):
+        lo = hip_z + (waist_z - hip_z) * 0.20
+        hi = waist_z
+        stomach_zs = np.arange(lo, hi, 0.002)
+        if len(stomach_zs) > 0:
+            verts = np.asarray(torso_mesh.vertices)
+            best_z = None
+            best_front_y = float("inf")
+            for z in stomach_zs:
+                band = verts[np.abs(verts[:, 2] - z) < 0.002]
+                if len(band) < 3:
+                    continue
+                front_y = float(band[:, 1].min())
+                if front_y < best_front_y:
+                    best_front_y = front_y
+                    best_z = float(z)
+            if best_z is not None:
+                span = waist_z - hip_z
+                if span > 0 and (best_z < hip_z + span * 0.15 or best_z > waist_z - span * 0.15):
+                    best_z = float((hip_z + waist_z) * 0.5)
+                stomach_circ = torso_circumference_at_z(
+                    torso_mesh,
+                    best_z,
+                    max_x_extent=0.60,
+                    combine_fragments=True,
+                )
+                if stomach_circ > 0.30:
+                    measurements["stomach_cm"] = float(stomach_circ * 100.0)
+                    measurements["_stomach_z"] = best_z
+                    measurements["_stomach_pct"] = best_z / height * 100.0
+
+    measurements["contours"] = extract_measurement_contours(mesh, measurements, torso_mesh=torso_mesh)
+    measurements["_torso_mesh_source"] = "fusion_vertices_clad_torso_only"
+    measurements["_torso_mesh"] = torso_mesh
+    return measurements
 
 
 def save_clad_render_from_params(params_json, render_path, title):
@@ -2289,9 +2699,20 @@ def save_clad_render_from_params(params_json, render_path, title):
         sys.path.insert(0, clad_root)
 
     from clad_body.measure import measure
+    from clad_body.measure._render import render_4view
 
     body = load_mhr_body_preferring_fusion_mesh(params_json)
-    measure(body, preset="all", render_path=render_path, title=title)
+    torso_mesh = _fused_torso_mesh_for_clad(params_json, body)
+    measurements = measure(body, preset="all", render_path=None)
+    measurements = _refine_measurements_with_fused_torso(measurements, body, torso_mesh)
+    render_4view(
+        body.mesh,
+        measurements,
+        render_path,
+        title=title,
+        model_label="MHR",
+        torso_mesh=torso_mesh,
+    )
     return render_path
 
 
@@ -2326,8 +2747,9 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         side_anchor_params["pred_vertices"] = side_scaled.astype(np.float32)
         side_anchor_params["fusion_target_height"] = np.array(float(target_height_m * 100.0), dtype=np.float64)
         side_anchor_params["fusion_target_height_cm"] = np.array(float(target_height_m * 100.0), dtype=np.float64)
-        side_anchor_params["fusion_prefer_vertices_for_clad"] = np.array(True)
-        side_anchor_params["fusion_rule"] = np.array("side_untouched_clad_anchor_mesh", dtype=object)
+        side_anchor_params["fusion_prefer_vertices_for_clad"] = np.array(False)
+        side_anchor_params["fusion_allow_pose_space_vertex_override"] = np.array(False)
+        side_anchor_params["fusion_rule"] = np.array("side_untouched_mhr_restpose_clad_anchor", dtype=object)
         side_anchor_params["fusion_vertices_clad"] = side_clad_vertices.astype(np.float32)
         side_anchor_params["fusion_faces_clad"] = np.asarray(faces, dtype=np.int32)
         side_anchor_params["fusion_vertices_clad_coordinate_system"] = np.array(
@@ -2902,7 +3324,7 @@ def main():
     no_sdf_params_json = os.path.join(output_dir, "front_fused_no_sdf_all_body_params_scaled.json")
     save_mesh_obj(no_sdf_clad_vertices, estimator.faces, no_sdf_clad_obj)
     no_sdf_result_scaled["fusion_apply_profile_depth_to_mhr"] = np.array(
-        bool(args.no_fused_vertex_override and float(args.profile_depth_correction_strength) > 0.0),
+        bool(float(args.profile_depth_correction_strength) > 0.0),
     )
     no_sdf_result_scaled["fusion_vertices_clad"] = no_sdf_clad_vertices.astype(np.float32)
     no_sdf_result_scaled["fusion_faces_clad"] = np.asarray(estimator.faces, dtype=np.int32)
@@ -2911,18 +3333,16 @@ def main():
         dtype=object,
     )
     no_sdf_result_scaled["fusion_clad_render_path"] = np.array(no_sdf_clad_render, dtype=object)
-    if args.no_fused_vertex_override:
-        no_sdf_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(False)
-        no_sdf_result_scaled["fusion_rule"] = np.array(
-            "front_xy_original_side_z_profile_depth_mhr_restpose",
-            dtype=object,
-        )
-    else:
-        no_sdf_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(True)
-        no_sdf_result_scaled["fusion_rule"] = np.array(
-            "front_xy_original_side_z_profile_depth_fused_vertex_mesh",
-            dtype=object,
-        )
+    no_sdf_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(True)
+    no_sdf_result_scaled["fusion_allow_pose_space_vertex_override"] = np.array(True)
+    no_sdf_result_scaled["fusion_measurement_mesh_source"] = np.array(
+        "full_fused_sdf_mesh_with_topology_transferred_joints",
+        dtype=object,
+    )
+    no_sdf_result_scaled["fusion_rule"] = np.array(
+        "front_xy_original_side_z_profile_depth_full_fused_clad",
+        dtype=object,
+    )
     save_result_json(no_sdf_result_scaled, no_sdf_params_json)
 
     fused_vertices_scaled, scale_factor, fused_height_before_scale, fused_height_after_scale = scale_mesh_to_target_height(
@@ -2977,7 +3397,7 @@ def main():
     fused_clad_render = os.path.join(output_dir, "front_fused_final_clad_render.png")
     save_mesh_obj(fused_clad_vertices, estimator.faces, fused_clad_obj)
     fused_result_scaled["fusion_apply_profile_depth_to_mhr"] = np.array(
-        bool(args.no_fused_vertex_override and float(args.profile_depth_correction_strength) > 0.0),
+        bool(float(args.profile_depth_correction_strength) > 0.0),
     )
     fused_result_scaled["fusion_vertices_clad"] = fused_clad_vertices.astype(np.float32)
     fused_result_scaled["fusion_faces_clad"] = np.asarray(estimator.faces, dtype=np.int32)
@@ -2991,18 +3411,16 @@ def main():
         if bool(np.asarray(side_sdf_profile_meta.get("enabled", False)).item())
         else ""
     )
-    if args.no_fused_vertex_override:
-        fused_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(False)
-        fused_result_scaled["fusion_rule"] = np.array(
-            f"front_xy_{side_sdf_rule_part}side_z_profile_depth_mhr_restpose",
-            dtype=object,
-        )
-    else:
-        fused_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(True)
-        fused_result_scaled["fusion_rule"] = np.array(
-            f"front_xy_{side_sdf_rule_part}side_z_profile_depth_fused_vertex_mesh",
-            dtype=object,
-        )
+    fused_result_scaled["fusion_prefer_vertices_for_clad"] = np.array(True)
+    fused_result_scaled["fusion_allow_pose_space_vertex_override"] = np.array(True)
+    fused_result_scaled["fusion_measurement_mesh_source"] = np.array(
+        "full_fused_sdf_mesh_with_topology_transferred_joints",
+        dtype=object,
+    )
+    fused_result_scaled["fusion_rule"] = np.array(
+        f"front_xy_{side_sdf_rule_part}side_z_profile_depth_full_fused_clad",
+        dtype=object,
+    )
 
     fused_params_json = os.path.join(output_dir, "front_fused_all_body_params_scaled.json")
     save_result_json(fused_result_scaled, fused_params_json)
