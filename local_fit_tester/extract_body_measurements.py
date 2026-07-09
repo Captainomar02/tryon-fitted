@@ -158,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--measure-preset",
         default="all",
-        help="CLAD measurement preset passed to scripts/measure_mhr_params.py.",
+        help="CLAD measurement preset passed to scripts/measure_fused_mesh_clad.py.",
     )
     parser.add_argument(
         "--only",
@@ -225,14 +225,16 @@ def main() -> int:
     measure_cmd = _python_command(
         conda_exe,
         args.clad_conda_env,
-        REPO_ROOT / "scripts" / "measure_mhr_params.py",
+        REPO_ROOT / "scripts" / "measure_fused_mesh_clad.py",
     ) + [
-        "--params",
+        "--mesh",
         str(params_path),
         "--out-json",
         str(body_measurements_path),
         "--render",
         str(render_path),
+        "--height-cm",
+        str(float(args.height_cm)),
         "--preset",
         args.measure_preset,
     ]

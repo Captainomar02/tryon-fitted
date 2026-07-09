@@ -4,6 +4,7 @@ import os
 import argparse
 import shutil
 import sys
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -2188,529 +2189,63 @@ def scale_result_params(result, scale_factor):
 
 
 
-def _jsonable_measurement_value(value):
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, dict):
-        return {str(k): _jsonable_measurement_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable_measurement_value(v) for v in value]
-    if value.__class__.__name__ == "Trimesh":
-        return None
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return None
+_CLAD_MEASUREMENT_API = None
+
+
+def _load_clad_measurement_api():
+    """Load the shared fused-mesh-first CLAD measurement adapter."""
+    global _CLAD_MEASUREMENT_API
+    if _CLAD_MEASUREMENT_API is not None:
+        return _CLAD_MEASUREMENT_API
+
+    repo_root = Path(__file__).resolve().parent
+    clad_root = repo_root / "clad-body"
+    for import_root in (repo_root, clad_root):
+        if import_root.exists() and str(import_root) not in sys.path:
+            sys.path.insert(0, str(import_root))
+
+    from scripts.measure_fused_mesh_clad import (
+        apply_arm_excluded_torso_measurements,
+        fused_body,
+        jsonable,
+        measure,
+        render_4view,
+    )
+
+    _CLAD_MEASUREMENT_API = {
+        "measure": measure,
+        "render_4view": render_4view,
+        "jsonable": jsonable,
+        "fused_body": fused_body,
+        "apply_arm_excluded_torso_measurements": apply_arm_excluded_torso_measurements,
+    }
+    return _CLAD_MEASUREMENT_API
 
 
 def save_measurements_json(measurements, output_json_path):
-    json_dict = {}
-    for key, value in measurements.items():
-        json_value = _jsonable_measurement_value(value)
-        if json_value is not None:
-            json_dict[str(key)] = json_value
+    convert = _load_clad_measurement_api()["jsonable"]
     with open(output_json_path, "w") as f:
-        json.dump(json_dict, f, indent=2, sort_keys=True)
+        json.dump(convert(measurements), f, indent=2, sort_keys=True)
     return output_json_path
 
 
-def _truthy_param(value):
-    if isinstance(value, np.ndarray):
-        return bool(value.reshape(-1)[0]) if value.size else False
-    if isinstance(value, list):
-        return bool(value[0]) if value else False
-    return bool(value)
-
-
-def _scaled_mhr_body_to_height(body, target_height_m):
-    from clad_body.load.mhr import MhrBody
-
-    verts = np.asarray(body.mesh.vertices, dtype=np.float32).copy()
-    current_height = float(verts[:, 2].max() - verts[:, 2].min())
-    if current_height <= 1e-8 or target_height_m <= 1e-8:
-        return body
-
-    scale = float(target_height_m) / current_height
-    verts *= scale
-    verts[:, 2] -= float(verts[:, 2].min())
-
-    joints = None
-    if body.joints:
-        joints = {name: (np.asarray(pt, dtype=np.float32) * scale) for name, pt in body.joints.items()}
-
-    return MhrBody(
-        mesh=trimesh.Trimesh(vertices=verts, faces=np.asarray(body.mesh.faces), process=False),
-        source=f"scaled:{body.source}",
-        obj_path=body.obj_path,
-        sam3d_params=body.sam3d_params,
-        joints=joints,
-    )
-
-
-def _fusion_target_height_m(params, fused_vertices):
-    for key in ("fusion_target_height_cm", "fusion_target_height"):
-        value = params.get(key)
-        if isinstance(value, list):
-            value = value[0] if value else None
-        if isinstance(value, np.ndarray):
-            value = value.reshape(-1)[0] if value.size else None
-        if value is not None:
-            try:
-                return float(value) / 100.0
-            except (TypeError, ValueError):
-                pass
-    return float(fused_vertices[:, 2].max() - fused_vertices[:, 2].min())
-
-
-def _float_param(params, key, default=0.0):
-    value = params.get(key, default)
-    if isinstance(value, list):
-        value = value[0] if value else default
-    if isinstance(value, np.ndarray):
-        value = value.reshape(-1)[0] if value.size else default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _apply_profile_depth_to_clad_body(body, params):
-    if not _truthy_param(params.get("fusion_apply_profile_depth_to_mhr", False)):
-        return body
-
-    from clad_body.load.mhr import MhrBody
-
-    verts = np.asarray(body.mesh.vertices, dtype=np.float32).copy()
-    height = float(verts[:, 2].max() - verts[:, 2].min())
-    if height <= 1e-8:
-        return body
-
-    arm_mask = _arm_region_mask_for_clad(body.mesh, body.joints)
-    torso_mask = ~arm_mask if arm_mask.any() else np.ones(verts.shape[0], dtype=bool)
-    z_min = float(verts[:, 2].min())
-    pct = (verts[:, 2] - z_min) / height
-    corrections = [
-        ("bust", 0.725, 0.075, _float_param(params, "fusion_profile_depth_bust_scale", 1.0)),
-        ("hip", 0.50, 0.09, _float_param(params, "fusion_profile_depth_hip_scale", 1.0)),
-    ]
-
-    total_weight = np.zeros(verts.shape[0], dtype=np.float64)
-    for _, center, half_width, scale in corrections:
-        if scale <= 1.0:
-            continue
-        total_weight += _smooth_band_weight(pct, center, half_width) * (float(scale) - 1.0)
-    total_weight[~torso_mask] = 0.0
-
-    if np.max(total_weight) <= 0.0:
-        return body
-
-    bins = np.clip(np.floor(pct * 200).astype(np.int32), 0, 199)
-    y_center = np.zeros(verts.shape[0], dtype=np.float64)
-    for bin_id in np.unique(bins[torso_mask]):
-        bin_mask = torso_mask & (bins == bin_id)
-        if np.any(bin_mask):
-            y_center[bin_mask] = np.median(verts[bin_mask, 1])
-    active = total_weight > 0.0
-    verts[active, 1] = y_center[active] + (verts[active, 1] - y_center[active]) * (1.0 + total_weight[active])
-    verts[:, 2] -= float(verts[:, 2].min())
-
-    joints = body.joints
-    return MhrBody(
-        mesh=trimesh.Trimesh(vertices=verts, faces=np.asarray(body.mesh.faces), process=False),
-        source=f"profile_depth_mhr_restpose:{body.source}",
-        obj_path=body.obj_path,
-        sam3d_params=body.sam3d_params,
-        joints=joints,
-    )
-
-def _vertex_adjacency_for_clad(faces, n_vertices):
-    neighbors = [set() for _ in range(n_vertices)]
-    for a, b, c in np.asarray(faces, dtype=np.int32):
-        neighbors[int(a)].update((int(b), int(c)))
-        neighbors[int(b)].update((int(a), int(c)))
-        neighbors[int(c)].update((int(a), int(b)))
-    return [list(items) for items in neighbors]
-
-
-def _arm_region_mask_for_clad(mesh, joints):
-    vertices = np.asarray(mesh.vertices)
-    if not joints or "l_shoulder" not in joints or "r_shoulder" not in joints:
-        return np.zeros(vertices.shape[0], dtype=bool)
-
-    left = np.asarray(joints["l_shoulder"], dtype=np.float64)
-    right = np.asarray(joints["r_shoulder"], dtype=np.float64)
-    axis = left - right
-    axis[2] = 0.0
-    width = float(np.linalg.norm(axis))
-    if width <= 1e-8:
-        return np.zeros(vertices.shape[0], dtype=bool)
-
-    axis /= width
-    lateral = vertices.astype(np.float64) @ axis
-    low = min(float(left @ axis), float(right @ axis))
-    high = max(float(left @ axis), float(right @ axis))
-    outside_shoulders = (lateral < low) | (lateral > high)
-
-    arm_landmarks = [left, right]
-    for name in ("l_elbow", "r_elbow", "l_wrist", "r_wrist"):
-        if name in joints:
-            arm_landmarks.append(np.asarray(joints[name], dtype=np.float64))
-    arm_z = [float(pt[2]) for pt in arm_landmarks]
-    height = float(vertices[:, 2].max() - vertices[:, 2].min())
-    z_low = max(float(vertices[:, 2].min()), min(arm_z) - 0.16 * height)
-    z_high = min(float(vertices[:, 2].max()), max(arm_z) + 0.06 * height)
-
-    candidate = outside_shoulders & (vertices[:, 2] >= z_low) & (vertices[:, 2] <= z_high)
-    if not candidate.any():
-        return np.zeros(vertices.shape[0], dtype=bool)
-
-    seeds = np.zeros(vertices.shape[0], dtype=bool)
-    radius = max(0.07, width * 0.35)
-    for pt in arm_landmarks:
-        dist = np.linalg.norm(vertices.astype(np.float64) - pt[None, :], axis=1)
-        seeds |= candidate & (dist <= radius)
-    for name in ("l_wrist", "r_wrist"):
-        if name in joints:
-            pt = np.asarray(joints[name], dtype=np.float64)
-            dist = np.linalg.norm(vertices.astype(np.float64) - pt[None, :], axis=1)
-            seeds |= candidate & (dist <= max(0.11, width * 0.45))
-
-    seed_idx = np.flatnonzero(seeds)
-    if seed_idx.size == 0:
-        return candidate
-
-    adjacency = _vertex_adjacency_for_clad(np.asarray(mesh.faces, dtype=np.int32), vertices.shape[0])
-    arm = np.zeros(vertices.shape[0], dtype=bool)
-    stack = [int(i) for i in seed_idx]
-    arm[seed_idx] = True
-    while stack:
-        cur = stack.pop()
-        for nxt in adjacency[cur]:
-            if not candidate[nxt] or arm[nxt]:
-                continue
-            arm[nxt] = True
-            stack.append(int(nxt))
-    return arm
-
-
-def _fused_transfer_mask_for_clad(mesh, joints):
-    """Copy fused geometry everywhere except connected CLAD A-pose arms/hands."""
-    return ~_arm_region_mask_for_clad(mesh, joints)
-
-
-def _fused_transfer_weights_for_clad(mesh, joints, preserve_rings=6, blend_rings=12):
-    """Blend fused torso into CLAD A-pose without a hard arm seam."""
-    vertices = np.asarray(mesh.vertices)
-    arm = _arm_region_mask_for_clad(mesh, joints)
-    if not arm.any():
-        return np.ones(vertices.shape[0], dtype=np.float32), arm
-
-    adjacency = _vertex_adjacency_for_clad(np.asarray(mesh.faces, dtype=np.int32), vertices.shape[0])
-    max_dist = int(preserve_rings) + int(blend_rings)
-    dist = np.full(vertices.shape[0], -1, dtype=np.int32)
-    frontier = [int(i) for i in np.flatnonzero(arm)]
-    dist[frontier] = 0
-    head = 0
-    while head < len(frontier):
-        cur = frontier[head]
-        head += 1
-        if dist[cur] >= max_dist:
-            continue
-        for nxt in adjacency[cur]:
-            nxt = int(nxt)
-            if dist[nxt] >= 0:
-                continue
-            dist[nxt] = dist[cur] + 1
-            frontier.append(nxt)
-
-    weights = np.ones(vertices.shape[0], dtype=np.float32)
-    reached = dist >= 0
-    preserve = reached & (dist <= int(preserve_rings))
-    transition = reached & (dist > int(preserve_rings)) & (dist <= max_dist)
-    weights[preserve] = 0.0
-    if int(blend_rings) > 0:
-        weights[transition] = (
-            (dist[transition].astype(np.float32) - float(preserve_rings)) / float(blend_rings)
-        )
-    return np.clip(weights, 0.0, 1.0), arm
-
-
-def _normalize_fused_clad_vertices_for_measurement(params, fused_vertices):
-    vertices = np.asarray(fused_vertices, dtype=np.float32).copy()
-    current_height = float(vertices[:, 2].max() - vertices[:, 2].min())
-    target_height = _fusion_target_height_m(params, vertices)
-    if current_height > 1e-8 and target_height > 1e-8:
-        vertices *= float(target_height) / current_height
-    vertices[:, 2] -= float(vertices[:, 2].min())
-    center_xy = (vertices[:, :2].max(axis=0) + vertices[:, :2].min(axis=0)) * 0.5
-    vertices[:, 0] -= float(center_xy[0])
-    vertices[:, 1] -= float(center_xy[1])
-    return vertices.astype(np.float32)
-
-
-def _topology_transferred_joints_for_clad(rest_body, fused_vertices, nearest_count=8):
-    if not rest_body.joints:
-        return None
-
-    rest_vertices = np.asarray(rest_body.mesh.vertices, dtype=np.float64)
-    fused_vertices = np.asarray(fused_vertices, dtype=np.float64)
-    if rest_vertices.shape != fused_vertices.shape or rest_vertices.ndim != 2:
-        return rest_body.joints
-
-    k = max(1, min(int(nearest_count), rest_vertices.shape[0]))
-    joints = {}
-    for name, point in rest_body.joints.items():
-        point = np.asarray(point, dtype=np.float64)
-        dist2 = np.sum((rest_vertices - point[None, :]) ** 2, axis=1)
-        idx = np.argpartition(dist2, k - 1)[:k]
-        dist = np.sqrt(np.maximum(dist2[idx], 0.0))
-        if float(dist.min()) < 1e-8:
-            weights = (dist == dist.min()).astype(np.float64)
-        else:
-            weights = 1.0 / np.maximum(dist, 1e-6)
-        weights /= float(weights.sum())
-        joints[name] = np.sum(fused_vertices[idx] * weights[:, None], axis=0).astype(np.float32)
-    return joints
-
-
 def load_mhr_body_preferring_fusion_mesh(params_json):
-    """Use the complete final fused SDF mesh as CLAD's measurement body."""
-    from clad_body.load import load_mhr_from_params
-    from clad_body.load.mhr import MhrBody
-
-    body = load_mhr_from_params(params_json)
-
-    with open(params_json) as f:
-        params = json.load(f)
-
-    vertices = params.get("fusion_vertices_clad")
-    faces = params.get("fusion_faces_clad")
-    fused_vertices_hint = (
-        np.asarray(vertices, dtype=np.float32)
-        if vertices is not None
-        else np.asarray(body.mesh.vertices, dtype=np.float32)
-    )
-    body = _scaled_mhr_body_to_height(body, _fusion_target_height_m(params, fused_vertices_hint))
-
-    if vertices is None or faces is None or _truthy_param(params.get("fusion_disable_full_fused_clad_measurement", False)):
-        return _apply_profile_depth_to_clad_body(body, params)
-
-    fused_vertices = _normalize_fused_clad_vertices_for_measurement(params, vertices)
-    fused_faces = np.asarray(faces, dtype=np.int32)
-    rest_vertices = np.asarray(body.mesh.vertices, dtype=np.float32)
-    rest_faces = np.asarray(body.mesh.faces, dtype=np.int32)
-    if fused_vertices.shape != rest_vertices.shape or fused_faces.shape != rest_faces.shape:
-        return _apply_profile_depth_to_clad_body(body, params)
-
-    mesh = trimesh.Trimesh(vertices=fused_vertices, faces=rest_faces, process=False)
-    return MhrBody(
-        mesh=mesh,
-        source=f"fusion_full_sdf_mesh:{os.path.basename(params_json)}",
-        obj_path=body.obj_path,
-        sam3d_params=body.sam3d_params,
-        joints=_topology_transferred_joints_for_clad(body, fused_vertices),
-    )
-
-
-def _joint_anchored_upperarm_for_clad(mesh, joints, height):
-    if not joints or height <= 0.0:
-        return None
-
-    from clad_body.measure._slicer import _perpendicular_limb_contour
-
-    side_results = []
-    for side in ("l", "r"):
-        shoulder = joints.get(f"{side}_shoulder")
-        elbow = joints.get(f"{side}_elbow")
-        if shoulder is None or elbow is None:
-            continue
-        shoulder = np.asarray(shoulder, dtype=np.float64)
-        elbow = np.asarray(elbow, dtype=np.float64)
-        axis = elbow - shoulder
-        length = float(np.linalg.norm(axis))
-        if length <= 1e-4:
-            continue
-        axis /= length
-
-        candidates = []
-        for t in np.linspace(0.38, 0.72, 8):
-            center = shoulder + (elbow - shoulder) * float(t)
-            pts = _perpendicular_limb_contour(mesh, center, axis, max_dist=0.16)
-            if pts is None or len(pts) < 3:
-                continue
-            closed = np.vstack([pts, pts[:1]])
-            circ = float(np.linalg.norm(np.diff(closed, axis=0), axis=1).sum())
-            if 0.12 <= circ <= 0.60:
-                candidates.append((circ, float(center[2])))
-        if candidates:
-            side_results.append(max(candidates, key=lambda item: item[0]))
-
-    if len(side_results) < 2:
-        return None
-    circ = float(np.mean([item[0] for item in side_results]))
-    z = float(np.mean([item[1] for item in side_results]))
-    return circ * 100.0, z, z / height * 100.0
-
-
-def _fused_torso_mesh_for_clad(params_json, body):
-    with open(params_json) as f:
-        params = json.load(f)
-
-    vertices = params.get("fusion_vertices_clad")
-    faces = params.get("fusion_faces_clad")
-    if vertices is None or faces is None or not body.joints:
-        return None
-
-    fused_vertices = np.asarray(vertices, dtype=np.float32).copy()
-    fused_faces = np.asarray(faces, dtype=np.int32)
-    rest_faces = np.asarray(body.mesh.faces, dtype=np.int32)
-    if fused_vertices.shape != np.asarray(body.mesh.vertices).shape or fused_faces.shape != rest_faces.shape:
-        return None
-
-    current_height = float(fused_vertices[:, 2].max() - fused_vertices[:, 2].min())
-    target_height = _fusion_target_height_m(params, fused_vertices)
-    if current_height > 1e-8 and target_height > 1e-8:
-        fused_vertices *= float(target_height) / current_height
-    fused_vertices[:, 2] -= float(fused_vertices[:, 2].min())
-
-    arm_mask = _arm_region_mask_for_clad(body.mesh, body.joints)
-    if not arm_mask.any():
-        return None
-    torso_faces = fused_faces[~arm_mask[fused_faces].any(axis=1)]
-    if torso_faces.size == 0:
-        return None
-    return trimesh.Trimesh(vertices=fused_vertices, faces=torso_faces, process=False)
-
-
-def _refine_measurements_with_fused_torso(measurements, body, torso_mesh):
-    mesh = body.mesh
-    height = float(np.asarray(mesh.vertices)[:, 2].max())
-    if height <= 0.0:
-        return measurements
-
-    upperarm = _joint_anchored_upperarm_for_clad(mesh, body.joints, height)
-    if upperarm is not None and (float(measurements.get("upperarm_cm", 0.0) or 0.0) <= 0.0):
-        measurements["upperarm_cm"], measurements["_upperarm_z"], measurements["_upperarm_pct"] = upperarm
-
-    if torso_mesh is None:
-        return measurements
-
-    from clad_body.measure._circumferences import REGIONS
-    from clad_body.measure._render import extract_measurement_contours
-    from clad_body.measure._slicer import MeshSlicer, torso_circumference_at_z
-
-    if "bust_cm" in measurements or "_bust_z" in measurements:
-        bust_zs = np.arange(height * 0.68, height * 0.76, 0.002)
-        if len(bust_zs) > 0:
-            slicer = MeshSlicer(torso_mesh)
-            bust_circs = np.array([
-                slicer.circumference_at_z(z, combine_fragments=True)
-                for z in bust_zs
-            ])
-            valid = bust_circs > 0.30
-            if valid.any():
-                idx = int(np.argmax(np.where(valid, bust_circs, -1.0)))
-                z = float(bust_zs[idx])
-                measurements["bust_cm"] = float(bust_circs[idx] * 100.0)
-                measurements["_bust_z"] = z
-                measurements["_bust_pct"] = z / height * 100.0
-
-    if "hip_cm" in measurements or "_hip_z" in measurements:
-        hip_region = REGIONS["hip"]
-        hip_zs = np.arange(
-            height * hip_region["low_pct"],
-            height * hip_region["high_pct"],
-            0.002,
-        )
-        if len(hip_zs) > 0:
-            hip_circs = np.array([
-                torso_circumference_at_z(
-                    torso_mesh,
-                    z,
-                    max_x_extent=0.80,
-                    combine_fragments=True,
-                )
-                for z in hip_zs
-            ])
-            valid = hip_circs > 0.30
-            if valid.any():
-                idx = int(np.argmax(np.where(valid, hip_circs, -1.0)))
-                z = float(hip_zs[idx])
-                measurements["hip_cm"] = float(hip_circs[idx] * 100.0)
-                measurements["_hip_z"] = z
-                measurements["_hip_pct"] = z / height * 100.0
-
-    waist_z = float(measurements.get("_waist_z", height * 0.61) or 0.0)
-    if waist_z > 0 and ("waist_cm" in measurements or "_waist_z" in measurements):
-        waist_circ = torso_circumference_at_z(
-            torso_mesh,
-            waist_z,
-            max_x_extent=0.60,
-            combine_fragments=True,
-        )
-        if waist_circ > 0.30:
-            measurements["waist_cm"] = float(waist_circ * 100.0)
-            measurements["_waist_z"] = waist_z
-            measurements["_waist_pct"] = waist_z / height * 100.0
-
-    hip_z = float(measurements.get("_hip_z", 0.0) or 0.0)
-    if hip_z > 0 and waist_z > hip_z and ("stomach_cm" in measurements or "_stomach_z" in measurements):
-        lo = hip_z + (waist_z - hip_z) * 0.20
-        hi = waist_z
-        stomach_zs = np.arange(lo, hi, 0.002)
-        if len(stomach_zs) > 0:
-            verts = np.asarray(torso_mesh.vertices)
-            best_z = None
-            best_front_y = float("inf")
-            for z in stomach_zs:
-                band = verts[np.abs(verts[:, 2] - z) < 0.002]
-                if len(band) < 3:
-                    continue
-                front_y = float(band[:, 1].min())
-                if front_y < best_front_y:
-                    best_front_y = front_y
-                    best_z = float(z)
-            if best_z is not None:
-                span = waist_z - hip_z
-                if span > 0 and (best_z < hip_z + span * 0.15 or best_z > waist_z - span * 0.15):
-                    best_z = float((hip_z + waist_z) * 0.5)
-                stomach_circ = torso_circumference_at_z(
-                    torso_mesh,
-                    best_z,
-                    max_x_extent=0.60,
-                    combine_fragments=True,
-                )
-                if stomach_circ > 0.30:
-                    measurements["stomach_cm"] = float(stomach_circ * 100.0)
-                    measurements["_stomach_z"] = best_z
-                    measurements["_stomach_pct"] = best_z / height * 100.0
-
-    measurements["contours"] = extract_measurement_contours(mesh, measurements, torso_mesh=torso_mesh)
-    measurements["_torso_mesh_source"] = "fusion_vertices_clad_torso_only"
-    measurements["_torso_mesh"] = torso_mesh
-    return measurements
+    """Compatibility wrapper around the fresh fused-mesh measurement loader."""
+    body, _ = _load_clad_measurement_api()["fused_body"](Path(params_json), None)
+    return body
 
 
 def save_clad_render_from_params(params_json, render_path, title):
-    repo_root = os.path.dirname(os.path.abspath(__file__))
-    clad_root = os.path.join(repo_root, "clad-body")
-    if os.path.isdir(clad_root) and clad_root not in sys.path:
-        sys.path.insert(0, clad_root)
-
-    from clad_body.measure import measure
-    from clad_body.measure._render import render_4view
-
-    body = load_mhr_body_preferring_fusion_mesh(params_json)
-    torso_mesh = _fused_torso_mesh_for_clad(params_json, body)
-    measurements = measure(body, preset="all", render_path=None)
-    measurements = _refine_measurements_with_fused_torso(measurements, body, torso_mesh)
-    render_4view(
+    api = _load_clad_measurement_api()
+    body, _ = api["fused_body"](Path(params_json), None)
+    measurements = api["measure"](body, preset="all", render_path=None)
+    torso_mesh = api["apply_arm_excluded_torso_measurements"](measurements, body)
+    api["render_4view"](
         body.mesh,
         measurements,
         render_path,
         title=title,
-        model_label="MHR",
+        model_label="Fused SDF",
         torso_mesh=torso_mesh,
     )
     return render_path
@@ -2762,15 +2297,9 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         save_result_json(side_anchor_params, paths["params_json"])
         save_mesh_obj(side_clad_vertices, faces, paths["clad_obj"])
 
-        repo_root = os.path.dirname(os.path.abspath(__file__))
-        clad_root = os.path.join(repo_root, "clad-body")
-        if os.path.isdir(clad_root) and clad_root not in sys.path:
-            sys.path.insert(0, clad_root)
-
-        from clad_body.measure import measure
-
-        body = load_mhr_body_preferring_fusion_mesh(paths["params_json"])
-        measurements = measure(body, only=["bust_cm", "hip_cm"])
+        api = _load_clad_measurement_api()
+        body, _ = api["fused_body"](Path(paths["params_json"]), None, pose_arms=False)
+        measurements = api["measure"](body, only=["bust_cm", "hip_cm"])
         paths["measurements_json"] = os.path.join(output_dir, "side_untouched_clad_anchor_measurements.json")
         save_measurements_json(measurements, paths["measurements_json"])
 

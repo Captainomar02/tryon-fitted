@@ -274,7 +274,9 @@ def extract_measurement_contours(mesh, measurements, torso_mesh=None):
         z = measurements.get(f"_{name}_z", 0)
         if z > 0:
             if name == "hip":
-                cmesh, max_x, combine = mesh, 0.60, False
+                cmesh = torso_mesh or mesh
+                max_x = 0.95 if torso_mesh is not None else 0.60
+                combine = torso_mesh is not None
             elif name in ("bust", "underbust"):
                 cmesh = torso_mesh or mesh
                 max_x = MAX_TORSO_X_EXTENT

@@ -51,6 +51,14 @@ def _truthy_param(value: Any) -> bool:
     return bool(value)
 
 
+def _scalar_param(value: Any, default: Any = None) -> Any:
+    if isinstance(value, list):
+        return value[0] if value else default
+    if isinstance(value, np.ndarray):
+        return value.reshape(-1)[0].item() if value.size else default
+    return default if value is None else value
+
+
 def _scaled_body_to_height(body: MhrBody, target_height_m: float) -> MhrBody:
     verts = np.asarray(body.mesh.vertices, dtype=np.float32).copy()
     current_height = float(verts[:, 2].max() - verts[:, 2].min())
@@ -79,9 +87,7 @@ def _scaled_body_to_height(body: MhrBody, target_height_m: float) -> MhrBody:
 
 def _fusion_target_height_m(params: dict, fused_vertices: np.ndarray) -> float:
     for key in ("fusion_target_height_cm", "fusion_target_height"):
-        value = params.get(key)
-        if isinstance(value, list):
-            value = value[0] if value else None
+        value = _scalar_param(params.get(key))
         if value is not None:
             try:
                 return float(value) / 100.0
@@ -97,9 +103,7 @@ def _smooth_band_weight(height_pct: np.ndarray, center: float, half_width: float
 
 
 def _float_param(params: dict, key: str, default: float = 0.0) -> float:
-    value = params.get(key, default)
-    if isinstance(value, list):
-        value = value[0] if value else default
+    value = _scalar_param(params.get(key), default)
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -301,15 +305,82 @@ def _topology_transferred_joints(body: MhrBody, fused_vertices: np.ndarray, near
     return joints
 
 
+def _validate_mesh_arrays(vertices: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    vertices = np.asarray(vertices, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int32)
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise ValueError(f"Expected fused vertices with shape [N, 3], got {vertices.shape}")
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError(f"Expected fused faces with shape [M, 3], got {faces.shape}")
+    if len(vertices) == 0 or len(faces) == 0:
+        raise ValueError("Fused measurement mesh is empty")
+    if faces.min() < 0 or faces.max() >= len(vertices):
+        # Some OBJ-style exports are accidentally serialized 1-indexed.
+        if faces.min() == 1 and faces.max() == len(vertices):
+            faces = faces - 1
+        else:
+            raise ValueError(
+                f"Fused face indices out of bounds for {len(vertices)} vertices: "
+                f"{int(faces.min())}..{int(faces.max())}"
+            )
+    return vertices, faces
+
+
+def _fusion_mesh_arrays_from_params(params: dict, params_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
+    vertices = params.get("fusion_vertices_clad")
+    faces = params.get("fusion_faces_clad")
+    if vertices is not None and faces is not None:
+        return _validate_mesh_arrays(vertices, faces)
+
+    for key in (
+        "fusion_clad_obj_path",
+        "fusion_mesh_path",
+        "fusion_sdf_mesh_path",
+        "fusion_side_sdf_edited_obj_path",
+    ):
+        raw_path = _scalar_param(params.get(key))
+        if not raw_path:
+            continue
+        mesh_path = Path(str(raw_path)).expanduser()
+        if not mesh_path.is_absolute():
+            mesh_path = params_path.parent / mesh_path
+        if not mesh_path.exists():
+            continue
+        mesh = trimesh.load_mesh(str(mesh_path), process=False)
+        if isinstance(mesh, trimesh.Scene):
+            meshes = [geom for geom in mesh.geometry.values() if isinstance(geom, trimesh.Trimesh)]
+            if not meshes:
+                continue
+            mesh = trimesh.util.concatenate(meshes)
+        return _validate_mesh_arrays(mesh.vertices, mesh.faces)
+
+    return None
+
+
+def _source_joints_for_fused_mesh(body: MhrBody, fused_vertices: np.ndarray) -> dict | None:
+    transferred = _topology_transferred_joints(body, fused_vertices)
+    if transferred:
+        return transferred
+    if not body.joints:
+        return None
+    return {name: np.asarray(point, dtype=np.float32).copy() for name, point in body.joints.items()}
+
+
 def load_body_for_measurement(params_path: Path) -> MhrBody:
-    """Measure the complete final fused SDF mesh with matching CLAD landmarks."""
+    """Build the CLAD measurement body from the fused SDF mesh.
+
+    CLAD's MHR loader is still used for SAM3D parameters and landmarks, but
+    the measurement mesh itself comes directly from fusion. This avoids the
+    previous topology gate where non-identical fused meshes silently fell back
+    to the generated MHR rest-pose body.
+    """
     body = load_mhr_from_params(str(params_path))
 
     with params_path.open() as f:
         params = json.load(f)
 
-    vertices = params.get("fusion_vertices_clad")
-    faces = params.get("fusion_faces_clad")
+    mesh_arrays = _fusion_mesh_arrays_from_params(params, params_path)
+    vertices = mesh_arrays[0] if mesh_arrays is not None else None
     fused_vertices_hint = (
         np.asarray(vertices, dtype=np.float32)
         if vertices is not None
@@ -317,23 +388,18 @@ def load_body_for_measurement(params_path: Path) -> MhrBody:
     )
     body = _scaled_body_to_height(body, _fusion_target_height_m(params, fused_vertices_hint))
 
-    if vertices is None or faces is None or _truthy_param(params.get("fusion_disable_full_fused_clad_measurement", False)):
+    if mesh_arrays is None or _truthy_param(params.get("fusion_disable_full_fused_clad_measurement", False)):
         return _apply_profile_depth_to_body(body, params)
 
-    fused_vertices = _normalize_fused_vertices_for_measurement(params, np.asarray(vertices, dtype=np.float32))
-    fused_faces = np.asarray(faces, dtype=np.int32)
-    rest_vertices = np.asarray(body.mesh.vertices, dtype=np.float32)
-    rest_faces = np.asarray(body.mesh.faces, dtype=np.int32)
-    if fused_vertices.shape != rest_vertices.shape or fused_faces.shape != rest_faces.shape:
-        return _apply_profile_depth_to_body(body, params)
-
-    mesh = trimesh.Trimesh(vertices=fused_vertices, faces=rest_faces, process=False)
+    raw_vertices, fused_faces = mesh_arrays
+    fused_vertices = _normalize_fused_vertices_for_measurement(params, raw_vertices)
+    mesh = trimesh.Trimesh(vertices=fused_vertices, faces=fused_faces, process=False)
     return MhrBody(
         mesh=mesh,
         source=f"fusion_full_sdf_mesh:{params_path.name}",
         obj_path=body.obj_path,
         sam3d_params=body.sam3d_params,
-        joints=_topology_transferred_joints(body, fused_vertices),
+        joints=_source_joints_for_fused_mesh(body, fused_vertices),
     )
 
 def joint_anchored_upperarm_measurement(mesh: trimesh.Trimesh, joints: dict | None, height: float) -> tuple[float, float, float] | None:
