@@ -159,6 +159,7 @@ def scaled_reference_geometry(params_path: Path | None, height_m: float) -> tupl
 
 
 _ARM_SKINNING_CACHE: tuple[dict[str, np.ndarray], dict[str, np.ndarray]] | None = None
+_ARM_SKINNING_GROUP_CACHE: dict[str, np.ndarray] | None = None
 
 
 def _subprocess_env_with_torch_lib() -> dict[str, str]:
@@ -178,7 +179,7 @@ def _subprocess_env_with_torch_lib() -> dict[str, str]:
 
 def mhr_arm_skinning_masks(n_vertices: int) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]] | None:
     # Same-topology complete arm/hand masks from MHR skinning weights.
-    global _ARM_SKINNING_CACHE
+    global _ARM_SKINNING_CACHE, _ARM_SKINNING_GROUP_CACHE
     if _ARM_SKINNING_CACHE is not None:
         masks, scores = _ARM_SKINNING_CACHE
         if len(masks["l"]) == n_vertices:
@@ -198,22 +199,35 @@ vi = lbs.vert_indices_flattened.cpu().numpy().astype(np.int64)
 ji = lbs.skin_indices_flattened.cpu().numpy().astype(np.int64)
 wt = lbs.skin_weights_flattened.cpu().numpy().astype(np.float32)
 n_vertices = int(lbs.num_vertices)
-TOKENS = ("uparm", "lowarm", "wrist", "pinky", "ring", "middle", "index", "thumb")
+ARM_TOKENS = ("uparm", "lowarm", "wrist", "pinky", "ring", "middle", "index", "thumb")
+WRIST_TOKENS = ("wrist", "pinky", "ring", "middle", "index", "thumb")
 
-def side_score(prefix):
-    bones = [i for i, name in enumerate(names) if name.lower().startswith(prefix) and any(tok in name.lower() for tok in TOKENS)]
+def side_score(prefix, tokens):
+    bones = [i for i, name in enumerate(names) if name.lower().startswith(prefix) and any(tok in name.lower() for tok in tokens)]
     keep = np.isin(ji, np.asarray(bones, dtype=np.int64))
     score = np.bincount(vi[keep], weights=wt[keep], minlength=n_vertices).astype(np.float32)
     return score
 
-l_score = side_score("l_")
-r_score = side_score("r_")
+l_upper = side_score("l_", ("uparm",))
+l_lower = side_score("l_", ("lowarm",))
+l_wrist = side_score("l_", WRIST_TOKENS)
+r_upper = side_score("r_", ("uparm",))
+r_lower = side_score("r_", ("lowarm",))
+r_wrist = side_score("r_", WRIST_TOKENS)
+l_score = side_score("l_", ARM_TOKENS)
+r_score = side_score("r_", ARM_TOKENS)
 np.savez(
     sys.argv[1],
     l_score=l_score,
     r_score=r_score,
     l_mask=(l_score >= 0.05),
     r_mask=(r_score >= 0.05),
+    l_upper=l_upper,
+    l_lower=l_lower,
+    l_wrist=l_wrist,
+    r_upper=r_upper,
+    r_lower=r_lower,
+    r_wrist=r_wrist,
 )
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as sf:
@@ -237,6 +251,10 @@ np.savez(
         data = np.load(out_path)
         masks = {"l": data["l_mask"].astype(bool), "r": data["r_mask"].astype(bool)}
         scores = {"l": data["l_score"].astype(np.float32), "r": data["r_score"].astype(np.float32)}
+        _ARM_SKINNING_GROUP_CACHE = {
+            key: data[key].astype(np.float32)
+            for key in ("l_upper", "l_lower", "l_wrist", "r_upper", "r_lower", "r_wrist")
+        }
         _ARM_SKINNING_CACHE = masks, scores
         if len(masks["l"]) != n_vertices:
             return None
@@ -247,6 +265,94 @@ np.savez(
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def mhr_arm_skinning_groups(n_vertices: int) -> dict[str, np.ndarray] | None:
+    global _ARM_SKINNING_GROUP_CACHE
+    if _ARM_SKINNING_GROUP_CACHE is not None:
+        first = next(iter(_ARM_SKINNING_GROUP_CACHE.values()))
+        if len(first) == n_vertices:
+            return _ARM_SKINNING_GROUP_CACHE
+        return None
+    if mhr_arm_skinning_masks(n_vertices) is None:
+        return None
+    return _ARM_SKINNING_GROUP_CACHE
+
+
+def _median_landmark(vertices: np.ndarray, mask: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    if np.count_nonzero(mask) < 8:
+        return np.asarray(fallback, dtype=np.float32)
+    return np.median(vertices[mask], axis=0).astype(np.float32)
+
+
+def fused_mesh_arm_landmarks(
+    vertices: np.ndarray,
+    reference_vertices: np.ndarray | None,
+    reference_joints: dict[str, np.ndarray] | None,
+) -> tuple[dict[str, np.ndarray] | None, dict[str, Any]]:
+    meta: dict[str, Any] = {"enabled": False, "method": "mhr_skinning_fused_surface_landmarks"}
+    if reference_joints is None or reference_vertices is None or len(reference_vertices) != len(vertices):
+        meta["reason"] = "missing_same_topology_reference_geometry"
+        return reference_joints, meta
+
+    groups = mhr_arm_skinning_groups(len(vertices))
+    skinning = mhr_arm_skinning_masks(len(vertices))
+    if groups is None or skinning is None:
+        meta["reason"] = "missing_mhr_skinning_groups"
+        return reference_joints, meta
+    masks, _ = skinning
+
+    try:
+        from clad_body.measure.mhr import find_acromion
+    except Exception:
+        find_acromion = None
+
+    fused = {name: np.asarray(point, dtype=np.float32).copy() for name, point in reference_joints.items()}
+    per_side: dict[str, Any] = {}
+    for side, side_name in (("l", "left"), ("r", "right")):
+        shoulder_key = f"{side}_shoulder"
+        elbow_key = f"{side}_elbow"
+        wrist_key = f"{side}_wrist"
+        if shoulder_key not in reference_joints or elbow_key not in reference_joints or wrist_key not in reference_joints:
+            continue
+
+        upper = groups[f"{side}_upper"]
+        lower = groups[f"{side}_lower"]
+        wrist = groups[f"{side}_wrist"]
+        arm = masks[side]
+
+        shoulder_ref = np.asarray(reference_joints[shoulder_key], dtype=np.float32)
+        if find_acromion is not None:
+            shoulder = find_acromion(vertices, shoulder_ref, side=side_name).astype(np.float32)
+        else:
+            shoulder = shoulder_ref
+
+        elbow_ref = np.asarray(reference_joints[elbow_key], dtype=np.float32)
+        elbow_mask = (upper > 0.05) & (lower > 0.05)
+        if np.count_nonzero(elbow_mask) < 8:
+            elbow_mask = arm & (np.linalg.norm(reference_vertices - elbow_ref[None, :], axis=1) < 0.08)
+        elbow = _median_landmark(vertices, elbow_mask, elbow_ref)
+
+        wrist_ref = np.asarray(reference_joints[wrist_key], dtype=np.float32)
+        wrist_mask = (lower > 0.05) & (wrist > 0.05)
+        if np.count_nonzero(wrist_mask) < 8:
+            wrist_mask = arm & (np.linalg.norm(reference_vertices - wrist_ref[None, :], axis=1) < 0.08)
+        wrist_pt = _median_landmark(vertices, wrist_mask, wrist_ref)
+
+        fused[shoulder_key] = shoulder
+        fused[elbow_key] = elbow
+        fused[wrist_key] = wrist_pt
+        per_side[side] = {
+            "shoulder": shoulder,
+            "elbow": elbow,
+            "wrist": wrist_pt,
+            "elbow_vertices": int(np.count_nonzero(elbow_mask)),
+            "wrist_vertices": int(np.count_nonzero(wrist_mask)),
+        }
+
+    meta["enabled"] = bool(per_side)
+    meta["sides"] = per_side
+    return fused, meta
 
 
 def _smoothstep(edge0: float, edge1: float, value: np.ndarray) -> np.ndarray:
@@ -454,7 +560,8 @@ def fused_body(
     raw_vertices, faces, params = read_fused_source(source)
     height_m = target_height_m(params, height_cm, raw_vertices)
     vertices = canonicalize(raw_vertices, height_m)
-    joints, reference_vertices = scaled_reference_geometry(source if source.suffix.lower() == ".json" else None, height_m)
+    reference_joints, reference_vertices = scaled_reference_geometry(source if source.suffix.lower() == ".json" else None, height_m)
+    joints, landmark_meta = fused_mesh_arm_landmarks(vertices, reference_vertices, reference_joints)
 
     pose_meta: dict[str, Any] = {"enabled": False, "method": "disabled"}
     if pose_arms:
@@ -463,6 +570,7 @@ def fused_body(
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     if params:
         params["_fused_mesh_pose_edit"] = pose_meta
+        params["_fused_mesh_arm_landmarks"] = landmark_meta
     source_prefix = "fresh_fused_mesh_soft_apose" if pose_meta.get("enabled") else "fresh_fused_mesh"
     body = MhrBody(
         mesh=mesh,
@@ -510,6 +618,7 @@ def main() -> None:
     if params:
         measurements["_fusion_rule"] = scalar(params.get("fusion_rule"), "")
         measurements["_fused_mesh_pose_edit"] = params.get("_fused_mesh_pose_edit", {"enabled": False})
+        measurements["_fused_mesh_arm_landmarks"] = params.get("_fused_mesh_arm_landmarks", {"enabled": False})
 
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(jsonable(measurements), indent=2, sort_keys=True), encoding="utf-8")
