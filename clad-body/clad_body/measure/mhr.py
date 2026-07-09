@@ -371,6 +371,25 @@ def _measure_mhr(body, *, groups, render_path=None, title=""):
                     measurements["_stomach_z"] = best_z
                     measurements["_stomach_pct"] = best_z / height * 100
 
+        # Underbust/lower chest: narrowest stable torso slice between waist and bust.
+        bust_z = float(measurements.get("_bust_z", 0.0) or 0.0)
+        if bust_z > waist_z:
+            lo = max(waist_z + (bust_z - waist_z) * 0.35, height * 0.64)
+            hi = min(bust_z - 0.02, height * 0.73)
+            if hi > lo:
+                slicer = MeshSlicer(mesh)
+                zs_under = np.arange(lo, hi, 0.002)
+                circs = np.array([
+                    slicer.circumference_at_z(z, max_x_extent=MAX_TORSO_X_EXTENT)
+                    for z in zs_under
+                ])
+                valid = circs > 0.30
+                if valid.any():
+                    idx = int(np.argmin(np.where(valid, circs, np.inf)))
+                    measurements["underbust_cm"] = float(circs[idx] * 100.0)
+                    measurements["_underbust_z"] = float(zs_under[idx])
+                    measurements["_underbust_pct"] = float(zs_under[idx] / height * 100.0)
+
     # ── Group B: Limb sweeps ─────────────────────────────────────────────
     if GROUP_B in groups:
         thigh_cm, thigh_z, thigh_pct = measure_thigh(mesh, height)

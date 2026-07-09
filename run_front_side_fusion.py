@@ -292,6 +292,7 @@ SIDE_SDF_RESIDUAL_SOLVE_GAIN = 0.95
 SIDE_SDF_ROW_UNDERFIT_PEAK_PRESERVE = True
 SIDE_SDF_SOLVE_EDGE_DATA_FLOOR = 0.20
 SIDE_SDF_SOLVE_EDGE_DATA_POWER = 2.0
+SIDE_SDF_CHEST_FEATHER_PCT = float(os.environ.get("FUSION_SIDE_SDF_CHEST_FEATHER_PCT", "0.010"))
 
 
 def _flat_band_with_feather(height_pct, center, half_width, feather_width, falloff_power=1.0):
@@ -328,6 +329,57 @@ def _outside_band_smooth_weight(height_pct, center, half_width, feather_width, o
         falloff = falloff ** power
     weight[outer] = falloff
     return weight
+
+
+def _range_band_with_feather(height_pct, low, high, feather_width, falloff_power=1.0):
+    """Full weight inside [low, high], smoothly fading to zero outside."""
+    low = float(low)
+    high = float(high)
+    if high < low:
+        low, high = high, low
+    feather_width = max(0.0, float(feather_width))
+    height_pct = np.asarray(height_pct, dtype=np.float64)
+    weight = np.zeros_like(height_pct, dtype=np.float64)
+    weight[(height_pct >= low) & (height_pct <= high)] = SIDE_SDF_BAND_CORE_WEIGHT
+
+    if feather_width > 0.0:
+        below = (height_pct >= low - feather_width) & (height_pct < low)
+        t = (height_pct[below] - (low - feather_width)) / feather_width
+        smooth = t * t * (3.0 - 2.0 * t)
+        above = (height_pct > high) & (height_pct <= high + feather_width)
+        t2 = (height_pct[above] - high) / feather_width
+        smooth2 = t2 * t2 * (3.0 - 2.0 * t2)
+        power = max(0.01, float(falloff_power))
+        if abs(power - 1.0) > 1e-8:
+            smooth = smooth ** power
+            smooth2 = (1.0 - smooth2) ** power
+        else:
+            smooth2 = 1.0 - smooth2
+        weight[below] = SIDE_SDF_BAND_CORE_WEIGHT * smooth
+        weight[above] = SIDE_SDF_BAND_CORE_WEIGHT * smooth2
+
+    return weight
+
+
+def chest_band_bounds_from_anchors(anchor_pcts):
+    lower = required_anchor_pct(anchor_pcts, "chest_lower")
+    upper = required_anchor_pct(anchor_pcts, "chest_upper")
+    if upper < lower:
+        lower, upper = upper, lower
+    if (upper - lower) < 0.01:
+        raise ValueError(f"Invalid chest SDF band: lower={lower}, upper={upper}")
+    return lower, upper
+
+
+def chest_band_weight_from_anchors(height_pct, anchor_pcts):
+    low, high = chest_band_bounds_from_anchors(anchor_pcts)
+    return _range_band_with_feather(
+        height_pct,
+        low,
+        high,
+        SIDE_SDF_CHEST_FEATHER_PCT,
+        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
+    )
 
 
 def _band_extent(vertices, height_pct, low_pct, high_pct):
@@ -600,9 +652,27 @@ def save_side_anchor_debug_mask(
                 cv2.LINE_AA,
             )
 
+    def draw_anchor_range(name, low, high, color, label_y_offset):
+        low_row = pct_to_row(low)
+        high_row = pct_to_row(high)
+        band_rows = [r for r in (low_row, high_row) if np.isfinite(r)]
+        if len(band_rows) == 2:
+            y0 = int(np.clip(round(min(band_rows)), 0, h - 1))
+            y1 = int(np.clip(round(max(band_rows)), 0, h - 1))
+            band = overlay.copy()
+            cv2.rectangle(band, (0, y0), (w - 1, y1), color, thickness=-1)
+            overlay[:] = cv2.addWeighted(band, 0.18, overlay, 0.82, 0.0)
+            cv2.line(overlay, (0, y0), (w - 1, y0), color, 2, cv2.LINE_AA)
+            cv2.line(overlay, (0, y1), (w - 1, y1), color, 2, cv2.LINE_AA)
+            label = f"{name} {low * 100.0:.2f}-{high * 100.0:.2f}%"
+            text_y = int(np.clip(y0 + label_y_offset, 16, h - 8))
+            cv2.putText(overlay, label, (8, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
     chest_center = required_anchor_pct(anchor_pcts, "chest")
     butt_center = required_anchor_pct(anchor_pcts, "butt")
-    draw_anchor("bust", chest_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, (0, 80, 255), -8)
+    chest_low, chest_high = chest_band_bounds_from_anchors(anchor_pcts)
+    draw_anchor_range("chest full", chest_low, chest_high, (0, 80, 255), -8)
+    draw_anchor("bust", chest_center, 0.0, (0, 180, 255), 18)
     draw_anchor("butt", butt_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, (255, 80, 0), 20)
 
     out_path = os.path.join(output_dir, out_name)
@@ -916,12 +986,13 @@ def save_side_sdf_row_debug(
     try:
         chest_center = required_anchor_pct(anchor_pcts, "chest")
         butt_center = required_anchor_pct(anchor_pcts, "butt")
+        chest_low, chest_high = chest_band_bounds_from_anchors(anchor_pcts)
     except Exception:
         return None
 
     torso_core, _ = compute_torso_core_mask(v, side_result)
     debug_band_half_width = SIDE_SDF_TARGET_CORE_HALF_WIDTH
-    chest_height_weight = (np.abs(pct - chest_center) <= debug_band_half_width).astype(np.float64)
+    chest_height_weight = chest_band_weight_from_anchors(pct, anchor_pcts)
     butt_height_weight = (np.abs(pct - butt_center) <= debug_band_half_width).astype(np.float64)
     selected = in_image & torso_core & ((chest_height_weight > 1e-4) | (butt_height_weight > 1e-4))
     if not selected.any():
@@ -975,15 +1046,19 @@ def save_side_sdf_row_debug(
     cv2.putText(canvas, "row residual px", (chart_x0, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (60, 60, 60), 1, cv2.LINE_AA)
     cv2.putText(canvas, "right=needs outward", (chart_x0, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (60, 60, 60), 1, cv2.LINE_AA)
 
-    def band_rows(center):
-        near = in_image & (np.abs(pct - center) <= debug_band_half_width)
+    def band_rows_from_mask(mask):
+        near = in_image & mask
         if near.sum() < 4:
             return None
         ys = proj[near, 1]
         return int(np.clip(np.nanmin(ys), 0, h - 1)), int(np.clip(np.nanmax(ys), 0, h - 1))
 
-    for center, color in ((chest_center, (0, 120, 255)), (butt_center, (255, 120, 0))):
-        br = band_rows(center)
+    debug_bands = (
+        (((pct >= chest_low) & (pct <= chest_high)), (0, 120, 255)),
+        ((np.abs(pct - butt_center) <= debug_band_half_width), (255, 120, 0)),
+    )
+    for band_mask, color in debug_bands:
+        br = band_rows_from_mask(band_mask)
         if br is None:
             continue
         y0, y1 = br
@@ -1152,29 +1227,16 @@ def deform_side_mesh_to_mask_profile(
     anchor_pcts = anchor_pcts or {}
     chest_center = required_anchor_pct(anchor_pcts, "chest")
     butt_center = required_anchor_pct(anchor_pcts, "butt")
-    chest_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH
+    chest_full_low_pct, chest_full_high_pct = chest_band_bounds_from_anchors(anchor_pcts)
     butt_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH
-    chest_outer_weight = _outside_band_smooth_weight(
-        pct,
-        chest_center,
-        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
-        0.0,
-        chest_outer_smooth_width,
-        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
-    )
+    chest_target_weight = chest_band_weight_from_anchors(pct, anchor_pcts)
+    chest_outer_weight = np.zeros_like(chest_target_weight, dtype=np.float64)
     butt_outer_weight = _outside_band_smooth_weight(
         pct,
         butt_center,
         SIDE_SDF_TARGET_CORE_HALF_WIDTH,
         0.0,
         butt_outer_smooth_width,
-        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
-    )
-    chest_target_weight = _flat_band_with_feather(
-        pct,
-        chest_center,
-        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
-        SIDE_SDF_TARGET_FEATHER_WIDTH,
         SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
     )
     butt_target_weight = _flat_band_with_feather(
@@ -1198,13 +1260,7 @@ def deform_side_mesh_to_mask_profile(
     profile_fit_half_width = SIDE_SDF_TARGET_CORE_HALF_WIDTH + SIDE_SDF_TARGET_FEATHER_WIDTH
     chest_height_weight = chest_target_weight
     butt_height_weight = butt_target_weight
-    chest_support_weight = _flat_band_with_feather(
-        pct,
-        chest_center,
-        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
-        SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH,
-        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
-    )
+    chest_support_weight = chest_target_weight.copy()
     butt_support_weight = _flat_band_with_feather(
         pct,
         butt_center,
@@ -1891,6 +1947,7 @@ def deform_side_mesh_to_mask_profile(
 
     displacement_smooth_delta_chest = dx_chest - pre_smooth_dx_chest
     displacement_smooth_delta_butt = dx_butt - pre_smooth_dx_butt
+
     dx = dx_chest + dx_butt
 
     initial_chest_row_gap = signed_row_gap_stats(chest_shift_row, chest_valid_row, anterior_sign)
@@ -1944,6 +2001,10 @@ def deform_side_mesh_to_mask_profile(
         "profile_fit_half_width_pct": np.array(float(profile_fit_half_width * 100.0), dtype=np.float64),
         "target_core_half_width_pct": np.array(float(SIDE_SDF_TARGET_CORE_HALF_WIDTH * 100.0), dtype=np.float64),
         "target_feather_width_pct": np.array(float(SIDE_SDF_TARGET_FEATHER_WIDTH * 100.0), dtype=np.float64),
+        "chest_full_low_pct": np.array(float(chest_full_low_pct * 100.0), dtype=np.float64),
+        "chest_full_high_pct": np.array(float(chest_full_high_pct * 100.0), dtype=np.float64),
+        "chest_feather_width_pct": np.array(float(SIDE_SDF_CHEST_FEATHER_PCT * 100.0), dtype=np.float64),
+        "chest_band_source": np.array("clad_lower_chest_to_shoulder_line", dtype=object),
         "profile_fit_matches_anchor_debug_band": np.array(True, dtype=bool),
         "solve_reason": np.array(solve_reason, dtype=object),
         "solve_data_weight": np.array(float(SIDE_SDF_SOLVE_DATA_WEIGHT), dtype=np.float64),
@@ -2260,6 +2321,12 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         "hip_pct": np.array(0.0, dtype=np.float64),
         "bust_anchor_pct": np.array(0.0, dtype=np.float64),
         "hip_anchor_pct": np.array(0.0, dtype=np.float64),
+        "lower_chest_pct": np.array(0.0, dtype=np.float64),
+        "shoulder_line_pct": np.array(0.0, dtype=np.float64),
+        "chest_full_low_pct": np.array(0.0, dtype=np.float64),
+        "chest_full_high_pct": np.array(0.0, dtype=np.float64),
+        "lower_chest_source": np.array("missing", dtype=object),
+        "shoulder_line_source": np.array("missing", dtype=object),
     }
     paths = {
         "params_json": None,
@@ -2299,7 +2366,7 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
 
         api = _load_clad_measurement_api()
         body, _ = api["fused_body"](Path(paths["params_json"]), None, pose_arms=False)
-        measurements = api["measure"](body, only=["bust_cm", "hip_cm"])
+        measurements = api["measure"](body, only=["bust_cm", "hip_cm", "underbust_cm"])
         paths["measurements_json"] = os.path.join(output_dir, "side_untouched_clad_anchor_measurements.json")
         save_measurements_json(measurements, paths["measurements_json"])
 
@@ -2323,8 +2390,38 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         except Exception:
             pass
 
-        if not anchors:
-            meta["reason"] = np.array("missing_bust_hip_pct", dtype=object)
+        try:
+            lower_chest_pct = float(measurements.get("_underbust_pct", 0.0))
+            if 0.0 < lower_chest_pct < 100.0:
+                anchors["chest_lower"] = lower_chest_pct / 100.0
+                meta["lower_chest_pct"] = np.array(lower_chest_pct, dtype=np.float64)
+                meta["chest_full_low_pct"] = np.array(lower_chest_pct, dtype=np.float64)
+                meta["lower_chest_source"] = np.array("underbust_pct", dtype=object)
+        except Exception:
+            pass
+
+        try:
+            joints = measurements.get("_debug_joints") or {}
+            shoulder_zs = []
+            for name in ("l_shoulder", "r_shoulder"):
+                joint = np.asarray(joints.get(name), dtype=np.float64).reshape(-1)
+                if joint.size >= 3 and np.isfinite(joint[2]):
+                    shoulder_zs.append(float(joint[2]))
+            height_cm = float(measurements.get("height_cm", target_height_m * 100.0))
+            height_m = height_cm / 100.0 if height_cm > 0 else target_height_m
+            if shoulder_zs and height_m > 1e-8:
+                shoulder_line_pct = float(np.mean(shoulder_zs) / height_m * 100.0)
+                if 0.0 < shoulder_line_pct < 100.0:
+                    anchors["chest_upper"] = shoulder_line_pct / 100.0
+                    meta["shoulder_line_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
+                    meta["chest_full_high_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
+                    meta["shoulder_line_source"] = np.array("debug_joints_l_r_shoulder_mean", dtype=object)
+        except Exception:
+            pass
+
+        missing = [name for name in ("chest", "butt", "chest_lower", "chest_upper") if name not in anchors]
+        if missing:
+            meta["reason"] = np.array(f"missing_anchor_pct:{','.join(missing)}", dtype=object)
             return {}, meta, paths
 
         meta["enabled"] = np.array(True)
@@ -2455,7 +2552,7 @@ def main():
     parser.add_argument(
         "--side-sdf-profile-max-push-cm",
         type=float,
-        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM", "35.0")),
+        default=float(os.environ.get("FUSION_SIDE_SDF_PROFILE_MAX_PUSH_CM", "7.0")),
         help="Maximum side-profile displacement per vertex, in centimeters.",
     )
     parser.add_argument(
@@ -2631,7 +2728,7 @@ def main():
         output_dir,
     )
     measurement_anchor_pcts = dict(side_anchor_pcts)
-    missing_anchor_names = [name for name in ("chest", "butt") if name not in measurement_anchor_pcts]
+    missing_anchor_names = [name for name in ("chest", "butt", "chest_lower", "chest_upper") if name not in measurement_anchor_pcts]
     if missing_anchor_names:
         reason = np.asarray(side_anchor_meta.get("reason", "unknown")).item()
         raise RuntimeError(
@@ -2646,6 +2743,8 @@ def main():
     print(f"  hip pct      : {float(np.asarray(side_anchor_meta.get('hip_pct', 0.0)).item()):.4f} (CLAD)")
     print(f"  bust anchor  : {float(np.asarray(side_anchor_meta.get('bust_anchor_pct', 0.0)).item()):.4f} (SDF)")
     print(f"  hip anchor   : {float(np.asarray(side_anchor_meta.get('hip_anchor_pct', 0.0)).item()):.4f} (SDF)")
+    print(f"  lower chest  : {float(np.asarray(side_anchor_meta.get('lower_chest_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('lower_chest_source', 'unknown')).item()})")
+    print(f"  shoulder line: {float(np.asarray(side_anchor_meta.get('shoulder_line_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('shoulder_line_source', 'unknown')).item()})")
 
     side_anchor_debug_mask_path = save_side_anchor_debug_mask(
         side_mask,
