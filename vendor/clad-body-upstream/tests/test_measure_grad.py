@@ -1,0 +1,551 @@
+"""Tests for measure_grad — differentiable Anny body measurements.
+
+Verifies:
+  1. Forward equivalence: measure_grad values match measure() within tolerance
+     on all 6 testdata bodies.
+  2. Gradient flow: loss.backward() produces non-zero .grad on phenotype tensors.
+  3. ``only=`` filtering: returns exactly the requested keys.
+  4. Error on unsupported key.
+  5. Error when phenotype_kwargs are missing on the body.
+  6. No spurious UserWarning from clad_body during the measurement call.
+
+Run:
+    pytest tests/test_measure_grad.py -v
+"""
+
+import os
+import warnings
+
+import pytest
+
+from clad_body.load.anny import AnnyBody, load_anny_from_params
+from clad_body.measure import measure
+from clad_body.measure.anny import (
+    SUPPORTED_KEYS,
+    load_phenotype_params,
+    measure_grad,
+)
+
+TESTDATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "clad_body", "measure", "testdata", "anny"
+)
+
+ALL_SUBJECTS = [
+    "male_average",
+    "female_average",
+    "male_plus_size",
+    "female_curvy",
+    "female_slim",
+    "female_plus_size",
+]
+
+# Tight tolerance for the keys that share a code path with measure() — float32 drift only.
+TOLERANCE_CM = 0.05
+
+# bust_cm uses soft circumference (recentered + convex hull).  Calibrated to
+# A≈1.0, MAE=0.06 cm on 100 bodies.  The convex hull matches the reference
+# plane-sweep + convex-hull in measure() very closely.
+TOLERANCE_BUST_CM = 0.5
+
+# underbust_cm uses the same soft circumference.  Calibrated MAE=0.39 cm on
+# 100 bodies.  Slightly noisier than bust because underbust z estimation
+# (breast vertex min-z) varies more across body types.
+TOLERANCE_UNDERBUST_CM = 2.0
+
+# hip_cm uses soft circumference at the mean Z of BASE_MESH_HIP_VERTICES.
+# The convex hull bridges the gluteal cleft.  Calibrated on 100-body dataset
+# (A=1.0039, B=0.47): MAE 0.46 cm, max 1.39 cm.  Testdata max: 0.96 cm.
+TOLERANCE_HIP_CM = 1.5
+
+# thigh_cm uses soft circumference at 0.43 × mesh_height — exactly where
+# measure()'s plane-sweep reference is hard-capped, giving near-identity
+# agreement.  Per-leg edge sets keep the angular bins from mixing across
+# the two thighs.  Calibrated on 100 bodies: MAE 0.06 cm, max 0.18 cm.
+TOLERANCE_THIGH_CM = 0.5
+
+# knee_cm uses perpendicular-plane soft circumference at the kneecap centre
+# (= upperleg02.tail bone position), normal aligned with the femur–tibia
+# bisector.  Mirrors what the numpy reference :func:`measure_knee` slices in
+# joint-anchored mode.  Calibrated on 100 random bodies from data_10k_42:
+# MAE 0.24 cm, P95 0.51 cm, max 0.69 cm.  Tolerance pinned at 0.7 cm — at
+# the calibration max — so any further drift trips the regression.
+TOLERANCE_KNEE_CM = 0.7
+
+# calf_cm uses per-Z spread aggregate (Gaussian Z-binning of leg vertices,
+# spread = squared distance from per-leg axis centroid) → soft-argmax over
+# Z bins, with an anatomical prior pulling toward the 30 %-from-knee
+# fallback when the spread is monotonic (deflated calves) →
+# soft_circumference_plane perpendicular to tibia at the resolved Z.
+# Mirrors numpy ``measure_calf``'s phase-1 max-girth + boundary fallback
+# + phase-2 perpendicular slice.  Calibrated on 100 random bodies from
+# data_10k_42 (β=2000): MAE 0.08 cm, P95 0.23 cm, max 0.92 cm.  Pinned
+# at 1.0 cm — ~10 % headroom over the calibration max.
+TOLERANCE_CALF_CM = 1.0
+
+# upperarm_cm vertex loop is reasonable as a proxy but not ISO-accurate; allow < 1.5 cm.
+TOLERANCE_UPPERARM_CM = 1.5
+
+# inseam_cm in measure_grad reads a curated Anny perineum vertex pair (6319/12900)
+# whose Z directly tracks the ISO mesh-sweep crotch.  Empirical max error vs the
+# mesh sweep across a 118-case stress matrix (testdata + leg-length blendshape
+# sweeps + questionnaire grid + random local_changes): 0.187 cm.
+TOLERANCE_INSEAM_CM = 0.20
+
+# sleeve_length_cm in measure_grad uses the joint-chain approximation calibrated
+# against measure_sleeve_length_iso_reference that measure() now uses.  Max error: 0.55 cm.
+TOLERANCE_SLEEVE_CM = 0.65
+
+# shoulder_width_cm in measure_grad uses an anchored soft-argmax acromion
+# (Gaussian X-band around the upperarm01 midpoint, softmax over Z) plus a
+# closed-form quadratic arc through R-acromion → C7 vertex → L-acromion.
+# vs the numpy ISO path (argmax acromion + scipy cubic spline projected to
+# the back surface): testdata max 1.67 cm, 100-body real-distribution
+# RMS 1.39 cm with 91 % of bodies within ±2 cm.
+# See findings/shoulder_width_diff.md for the stability + sweep study.
+TOLERANCE_SHOULDER_WIDTH_CM = 2.0
+
+# stomach_cm uses soft-argmin over torso vertex Y in [hip_z, waist_z] to pick
+# the belly Z (the most-anterior torso vertex), then one soft_circumference
+# at that Z.  Validated on a 100-body random sample from
+# hmr/body-tuning/questionnaire/data_10k_42: MAE 0.93 cm, P95 2.83 cm,
+# max 3.61 cm, bias −0.30 cm.  The residual error comes from the soft-argmin
+# smoothly averaging over vertex clusters with near-identical anterior Y,
+# whereas the non-diff argmax picks a single mesh-topology-specific spike.
+TOLERANCE_STOMACH_CM = 4.0
+
+# mass_kg in measure_grad uses V × ρ̂(BF) — the same BF-corrected formula
+# as measure() (single source: bf_corrected_density()).  Residual diff
+# comes from soft-circ vs plane-sweep waist/hip/neck (the BF formula's
+# inputs), not from the density helper itself.  Empirically <0.5 kg on
+# testdata bodies; pinned at 1.0 kg with headroom.
+TOLERANCE_MASS_KG = 1.0
+
+# neck_cm in measure_grad slices perpendicular to the neck axis at a height-
+# proportional offset below neck02 bone head (the Adam's apple anchor), per
+# ISO §5.3.2 "just below the bulge."  Calibrated against measure() on 100
+# random bodies from data_10k_42 (MAE 0.19 cm, P95 0.44 cm, max 0.56 cm);
+# re-verified on 999 bodies (MAE 0.20 cm, P95 0.45 cm, max 1.01 cm).
+# Testdata max observed: 0.26 cm.  Tolerance 0.6 cm = ~2× that, room for
+# float precision drift without masking real regressions. See
+# NECK_BELOW_ADAMS_APPLE_COEF in _soft_circ.py for the derivation.
+TOLERANCE_NECK_CM = 0.6
+
+_KEY_TOLERANCE = {
+    "bust_cm": TOLERANCE_BUST_CM,
+    "underbust_cm": TOLERANCE_UNDERBUST_CM,
+    "hip_cm": TOLERANCE_HIP_CM,
+    "stomach_cm": TOLERANCE_STOMACH_CM,
+    "thigh_cm": TOLERANCE_THIGH_CM,
+    "knee_cm": TOLERANCE_KNEE_CM,
+    "calf_cm": TOLERANCE_CALF_CM,
+    "upperarm_cm": TOLERANCE_UPPERARM_CM,
+    "inseam_cm": TOLERANCE_INSEAM_CM,
+    "sleeve_length_cm": TOLERANCE_SLEEVE_CM,
+    "shoulder_width_cm": TOLERANCE_SHOULDER_WIDTH_CM,
+    "neck_cm": TOLERANCE_NECK_CM,
+    "mass_kg": TOLERANCE_MASS_KG,
+}
+
+
+def _load(name, *, requires_grad=False):
+    """Load a testdata body."""
+    params = load_phenotype_params(os.path.join(TESTDATA_DIR, name, "anny_params.json"))
+    return load_anny_from_params(params, requires_grad=requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# 1. Forward equivalence — all 6 bodies, all supported keys
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ALL_SUBJECTS)
+def test_forward_equivalence(name):
+    """measure_grad values match measure() within tolerance on all subjects."""
+    body = _load(name)
+
+    m_ref = measure(body, only=list(SUPPORTED_KEYS))
+    m_grad = measure_grad(body)
+
+    errors = {}
+    for key in SUPPORTED_KEYS:
+        ref_val = m_ref.get(key)
+        if ref_val is None:
+            continue
+        got = m_grad[key].item()
+        err = abs(got - ref_val)
+        tol = _KEY_TOLERANCE.get(key, TOLERANCE_CM)
+        if err > tol:
+            errors[key] = (got, ref_val, err, tol)
+
+    assert not errors, (
+        f"{name}: measure_grad diverges from measure() beyond tolerance:\n"
+        + "\n".join(
+            f"  {k}: got={v[0]:.4f}, ref={v[1]:.4f}, diff={v[2]:.4f} (tol={v[3]})"
+            for k, v in sorted(errors.items())
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1a. inseam_cm regression — leg-length blendshape must not break tracking
+# ---------------------------------------------------------------------------
+#
+# Pins the fix for the bone-tail formula drift bug. The earlier
+# bone-tail-plus-linear-correction `measure_inseam_from_joints` calibrated on
+# the 6 testdata bodies at native shape, and broke catastrophically (>10 cm
+# error) when `measure-{upper,lower}leg-height-incr` was pushed away from
+# zero — those blendshapes were added to BODY_LOCAL_CHANGES for length tuning
+# (see body-tuning/measurements_tuning/findings/anny_length_levers.md), but
+# the formula's calibration set never spanned them.  The vertex-pair
+# replacement reads the perineum directly so it can't drift like that.
+
+# ---------------------------------------------------------------------------
+# 1c. shoulder_width_cm regression — soft acromion must track on broad-shoulder
+#                                    bodies (the failure mode that motivated
+#                                    the soft-argmax + bone-anchor design)
+# ---------------------------------------------------------------------------
+#
+# An earlier fixed-vertex implementation matched the numpy reporting path on
+# female_average (the body its canonical landmark was picked from) but
+# under-measured by 4–9 cm on broad-shoulder males because the argmax acromion
+# drifted to a different vertex (v8259 vs v8219). The current soft-argmax +
+# upperarm01-midpoint anchor adapts via LBS — pin that on a sweep of the
+# `measure-shoulder-dist-incr` blendshape (the lever that most directly moves
+# the acromion laterally).
+
+@pytest.mark.parametrize(
+    "delta", [-0.5, 0.0, +0.5, +1.0],
+    ids=["shdr-0.5", "shdr+0.0", "shdr+0.5", "shdr+1.0"],
+)
+def test_shoulder_width_tracks_under_shoulder_dist_blendshape(delta):
+    """measure_grad['shoulder_width_cm'] tracks measure() across the full
+    range of the `measure-shoulder-dist-incr` blendshape on male_average.
+
+    male_average is the harder case: the female-biased canonical seed is
+    further from the male argmax acromion, so the soft band has to do real
+    work. Errors > tolerance here mean the band-anchor design has regressed.
+    """
+    params = load_phenotype_params(
+        os.path.join(TESTDATA_DIR, "male_average", "anny_params.json")
+    )
+    lc = dict(params.get("_local_changes", {}))
+    lc["measure-shoulder-dist-incr"] = float(delta)
+    params["_local_changes"] = lc
+    body = load_anny_from_params(params)
+
+    ref = measure(body, only=["shoulder_width_cm"])["shoulder_width_cm"]
+    grad = measure_grad(body, only=["shoulder_width_cm"])["shoulder_width_cm"].item()
+
+    err = abs(grad - ref)
+    assert err < TOLERANCE_SHOULDER_WIDTH_CM, (
+        f"shoulder-dist δ={delta:+.1f}: grad={grad:.3f} ref={ref:.3f} "
+        f"err={err:.3f} cm > tol={TOLERANCE_SHOULDER_WIDTH_CM} cm"
+    )
+
+
+def test_shoulder_width_smooth_under_irrelevant_blendshape():
+    """`measure-bust-circ-incr` should NOT change shoulder_width — the soft
+    acromion picks lateral landmarks, bust changes the front torso. The numpy
+    reporting path can show argmax jumps here; the differentiable path must
+    remain smooth (this is the property that makes it useful for optimisation
+    even where it diverges in absolute value from numpy).
+    """
+    import torch
+    params = load_phenotype_params(
+        os.path.join(TESTDATA_DIR, "female_average", "anny_params.json")
+    )
+    base_lc = dict(params.get("_local_changes", {}))
+
+    # 21 samples across [-1, 1]; max consecutive jump should stay tiny.
+    values = []
+    for v in [-1.0 + 0.1 * i for i in range(21)]:
+        lc = dict(base_lc)
+        lc["measure-bust-circ-incr"] = v
+        params["_local_changes"] = lc
+        body = load_anny_from_params(params)
+        with torch.no_grad():
+            sw = measure_grad(body, only=["shoulder_width_cm"])["shoulder_width_cm"].item()
+        values.append(sw)
+
+    max_jump_cm = max(abs(values[i + 1] - values[i]) for i in range(len(values) - 1))
+    span_cm = max(values) - min(values)
+    # Bust should barely affect shoulder width: well under 0.5 cm total swing,
+    # and certainly no >0.2 cm step jumps (which would indicate argmax-style
+    # discontinuity).
+    assert max_jump_cm < 0.2, (
+        f"shoulder_width_cm not smooth under measure-bust-circ-incr sweep: "
+        f"max consecutive jump = {max_jump_cm:.3f} cm (limit 0.2 cm). "
+        f"Values: {values}"
+    )
+    assert span_cm < 0.5, (
+        f"shoulder_width_cm has unexpectedly large dependence on bust: "
+        f"total range = {span_cm:.3f} cm (limit 0.5 cm)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1d. knee_cm regression — bone-anchored Z must track under leg-length
+#                          blendshapes (the entire reason knee is bone-
+#                          anchored instead of a fixed height fraction)
+# ---------------------------------------------------------------------------
+#
+# The previous fixed-fraction implementation (24-31 % height sweep, target
+# 27.5 %) drifted off the kneecap when ``measure-{upper,lower}leg-height-incr``
+# stretched the leg, because the search range stayed pinned to body height
+# while the actual joint moved.  The bone-anchored joint Z used by both
+# methods now should follow the joint, keeping numpy and soft in agreement
+# across the full blendshape range.
+
+# ---------------------------------------------------------------------------
+# 1e. calf_cm regression — joint-anchored search range and tibia-perpendicular
+#                          slice must follow the joints under leg-length and
+#                          calf-shape blendshapes
+# ---------------------------------------------------------------------------
+#
+# Calf has two failure modes the joint-anchored design is meant to prevent:
+#   (1) The legacy fixed 16–26 % height range can drift off the calf belly
+#       when ``measure-{upper,lower}leg-height-incr`` stretches the leg.
+#   (2) The per-Z spread proxy must keep tracking a moving gastrocnemius
+#       under ``measure-calf-circ-incr``.
+# The two parametrizations below pin both.
+
+@pytest.mark.parametrize(
+    "delta", [-0.5, 0.0, 0.5, 1.0],
+    ids=["leg-0.5", "leg+0.0", "leg+0.5", "leg+1.0"],
+)
+def test_calf_tracks_mesh_sweep_under_leg_length_blendshape(delta):
+    """measure_grad['calf_cm'] tracks measure() across the full range of
+    ``measure-{upper,lower}leg-height-incr`` blendshapes.
+
+    Both methods anchor the search range on bone Z (knee + ankle) and slice
+    perpendicular to the tibia; the agreement should hold uniformly as the
+    leg lengthens or shortens.
+    """
+    params = load_phenotype_params(
+        os.path.join(TESTDATA_DIR, "male_average", "anny_params.json")
+    )
+    lc = dict(params.get("_local_changes", {}))
+    lc["measure-upperleg-height-incr"] = delta
+    lc["measure-lowerleg-height-incr"] = delta
+    params["_local_changes"] = lc
+    body = load_anny_from_params(params)
+
+    ref = measure(body, only=["calf_cm"])["calf_cm"]
+    grad = measure_grad(body, only=["calf_cm"])["calf_cm"].item()
+
+    err = abs(grad - ref)
+    assert err < TOLERANCE_CALF_CM, (
+        f"leg-length δ={delta:+.1f}: grad={grad:.3f} ref={ref:.3f} "
+        f"err={err:.3f} cm > tol={TOLERANCE_CALF_CM} cm"
+    )
+
+
+@pytest.mark.parametrize(
+    "delta", [-0.7, 0.0, 0.7, 1.0],
+    ids=["calf-0.7", "calf+0.0", "calf+0.7", "calf+1.0"],
+)
+def test_calf_tracks_mesh_sweep_under_calf_blendshape(delta):
+    """measure_grad['calf_cm'] tracks measure() under the
+    ``measure-calf-circ-incr`` blendshape (the direct calf-girth lever
+    that tuning would push).
+    """
+    params = load_phenotype_params(
+        os.path.join(TESTDATA_DIR, "male_average", "anny_params.json")
+    )
+    lc = dict(params.get("_local_changes", {}))
+    lc["measure-calf-circ-incr"] = delta
+    params["_local_changes"] = lc
+    body = load_anny_from_params(params)
+
+    ref = measure(body, only=["calf_cm"])["calf_cm"]
+    grad = measure_grad(body, only=["calf_cm"])["calf_cm"].item()
+
+    err = abs(grad - ref)
+    assert err < TOLERANCE_CALF_CM, (
+        f"calf-circ δ={delta:+.1f}: grad={grad:.3f} ref={ref:.3f} "
+        f"err={err:.3f} cm > tol={TOLERANCE_CALF_CM} cm"
+    )
+
+
+@pytest.mark.parametrize(
+    "delta", [-0.5, 0.0, 0.5, 1.0],
+    ids=["leg-0.5", "leg+0.0", "leg+0.5", "leg+1.0"],
+)
+def test_knee_tracks_mesh_sweep_under_leg_length_blendshape(delta):
+    """measure_grad['knee_cm'] tracks measure() across the full range of
+    the ``measure-{upper,lower}leg-height-incr`` blendshapes.
+
+    Both methods anchor at ``upperleg02.tail`` and slice perpendicular to
+    the femur-tibia bisector, so the agreement should hold uniformly as the
+    leg lengthens or shortens.  A failure here means the bone anchor or the
+    bisector axis stopped updating with LBS.
+    """
+    params = load_phenotype_params(
+        os.path.join(TESTDATA_DIR, "male_average", "anny_params.json")
+    )
+    lc = dict(params.get("_local_changes", {}))
+    lc["measure-upperleg-height-incr"] = delta
+    lc["measure-lowerleg-height-incr"] = delta
+    params["_local_changes"] = lc
+    body = load_anny_from_params(params)
+
+    ref = measure(body, only=["knee_cm"])["knee_cm"]
+    grad = measure_grad(body, only=["knee_cm"])["knee_cm"].item()
+
+    err = abs(grad - ref)
+    assert err < TOLERANCE_KNEE_CM, (
+        f"leg-length δ={delta:+.1f}: grad={grad:.3f} ref={ref:.3f} "
+        f"err={err:.3f} cm > tol={TOLERANCE_KNEE_CM} cm"
+    )
+
+
+@pytest.mark.parametrize(
+    "delta", [0.0, 0.5, 1.0],
+    ids=["leg+0.0", "leg+0.5", "leg+1.0"],
+)
+def test_inseam_tracks_mesh_sweep_under_leg_length_blendshape(delta):
+    """measure_grad['inseam_cm'] must track measure()['inseam_cm'] across the
+    full range of the `measure-{upper,lower}leg-height-incr` blendshapes."""
+    params = load_phenotype_params(
+        os.path.join(TESTDATA_DIR, "male_average", "anny_params.json")
+    )
+    lc = dict(params.get("_local_changes", {}))
+    lc["measure-upperleg-height-incr"] = delta
+    lc["measure-lowerleg-height-incr"] = delta
+    params["_local_changes"] = lc
+    body = load_anny_from_params(params)
+
+    ref = measure(body, only=["inseam_cm"])["inseam_cm"]
+    grad = measure_grad(body, only=["inseam_cm"])["inseam_cm"].item()
+
+    err = abs(grad - ref)
+    assert err < TOLERANCE_INSEAM_CM, (
+        f"leg-length δ={delta:+.1f}: grad={grad:.3f} ref={ref:.3f} "
+        f"err={err:.3f} cm > tol={TOLERANCE_INSEAM_CM} cm"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1b. mass_kg identity — must match measure()'s BF-corrected value exactly
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ALL_SUBJECTS)
+def test_mass_kg_matches_measure_bf_corrected(name):
+    """measure_grad['mass_kg'] ≈ measure()['mass_kg'].
+
+    Both paths share ``bf_corrected_density()`` (single source).  Residual
+    divergence comes entirely from waist/hip/neck cm differences — soft-circ
+    in measure_grad vs plane-sweep in measure — flowing through log10 in the
+    Hodgdon density formula.  Empirically <0.2 kg on the testdata bodies.
+    """
+    body = _load(name)
+    # measure() returns BF-corrected mass_kg via bf_corrected_density().
+    m_ref = measure(body)
+    m_grad = measure_grad(body, only=["mass_kg"])
+
+    expected = m_ref["mass_kg"]
+    got = m_grad["mass_kg"].item()
+
+    assert abs(got - expected) < 0.5, (
+        f"{name}: measure_grad mass_kg={got:.4f}, "
+        f"measure mass_kg={expected:.4f}, diff={abs(got-expected):.4f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Gradient flow
+# ---------------------------------------------------------------------------
+
+def test_gradient_flow():
+    """Every SUPPORTED_KEY produces non-zero .grad on at least one phenotype tensor."""
+    body = _load("female_average", requires_grad=True)
+
+    m = measure_grad(body)
+    loss = sum(m.values())
+    loss.backward()
+
+    non_zero = {
+        label
+        for label, t in body.phenotype_kwargs.items()
+        if t.grad is not None and t.grad.abs().sum().item() > 0
+    }
+    assert non_zero, (
+        "No non-zero gradients on any phenotype tensor after loss.backward(). "
+        f"Labels: {list(body.phenotype_kwargs.keys())}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. ``only=`` filtering
+# ---------------------------------------------------------------------------
+
+def test_only_single_key():
+    """only=['inseam_cm'] returns exactly one key."""
+    body = _load("female_average")
+    result = measure_grad(body, only=["inseam_cm"])
+    assert set(result.keys()) == {"inseam_cm"}
+
+
+def test_only_none_returns_all_supported():
+    """only=None returns all SUPPORTED_KEYS."""
+    body = _load("female_average")
+    result = measure_grad(body, only=None)
+    assert set(result.keys()) == SUPPORTED_KEYS
+
+
+def test_only_unsupported_key_raises():
+    """Requesting an unsupported key raises ValueError listing SUPPORTED_KEYS."""
+    body = _load("female_average")
+    # wrist_cm has no measure_grad path yet — use it as a stable example
+    # of an unsupported key.
+    unsupported = "wrist_cm"
+    assert unsupported not in SUPPORTED_KEYS, (
+        f"Pick a different key — {unsupported} is now in SUPPORTED_KEYS"
+    )
+    with pytest.raises(ValueError) as exc_info:
+        measure_grad(body, only=[unsupported])
+    msg = str(exc_info.value)
+    assert unsupported in msg
+    for key in SUPPORTED_KEYS:
+        assert key in msg, f"SUPPORTED_KEYS entry '{key}' missing from error message"
+
+
+# ---------------------------------------------------------------------------
+# 4. Missing phenotype_kwargs
+# ---------------------------------------------------------------------------
+
+def test_missing_phenotype_kwargs_raises():
+    """A body without phenotype_kwargs (e.g. hand-built) raises ValueError."""
+    import numpy as np
+    body = AnnyBody(
+        vertices=np.zeros((10, 3), dtype=np.float32),
+        faces=np.zeros((1, 3), dtype=np.int32),
+        source="test",
+    )
+    with pytest.raises(ValueError, match="phenotype_kwargs"):
+        measure_grad(body)
+
+
+# ---------------------------------------------------------------------------
+# 5. No spurious warnings from clad_body
+# ---------------------------------------------------------------------------
+
+def test_no_warnings():
+    """measure_grad must not emit warnings from clad_body itself.
+
+    The Anny library emits a UserWarning about LBS skinning fallback (no NVidia Warp
+    installed) — expected infrastructure noise. We check that OUR code path doesn't
+    produce warnings that would indicate a broken gradient flow.
+    """
+    body = _load("female_slim")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        measure_grad(body)
+
+    our_warnings = [
+        w for w in caught
+        if issubclass(w.category, UserWarning) and "clad_body" in str(w.filename)
+    ]
+    assert not our_warnings, (
+        "measure_grad emitted unexpected UserWarning(s) from clad_body:\n"
+        + "\n".join(f"  {w.filename}:{w.lineno}: {w.message}" for w in our_warnings)
+    )

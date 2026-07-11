@@ -213,6 +213,59 @@ def center_and_orient_mesh(vertices, target_up=np.array([0.0, 1.0, 0.0], dtype=n
     }
 
 
+def yaw_normalize_from_front_landmarks(vertices, front_keypoints, centroid, upright_rotation):
+    """Rotate an upright front mesh so anatomical left/right becomes the X axis.
+
+    Upright alignment leaves yaw around Y unresolved. SAM/MHR's left/right
+    shoulder and hip landmarks provide the missing heading, so every fusion
+    reaches CLAD in the same front-facing coordinate frame.
+    """
+    points = np.asarray(front_keypoints, dtype=np.float64)
+    if points.ndim != 2 or points.shape[0] <= 10 or points.shape[1] != 3:
+        return vertices.astype(np.float32), np.eye(3, dtype=np.float64), {
+            "enabled": False, "reason": "front_landmarks_unavailable", "yaw_degrees": 0.0,
+        }
+
+    points = (points - centroid) @ upright_rotation.T
+    shoulder_lr = points[5] - points[6]
+    hip_lr = points[9] - points[10]
+    shoulder_lr[1] = 0.0
+    hip_lr[1] = 0.0
+    shoulder_norm = float(np.linalg.norm(shoulder_lr))
+    hip_norm = float(np.linalg.norm(hip_lr))
+    if shoulder_norm < 1e-6 and hip_norm < 1e-6:
+        return vertices.astype(np.float32), np.eye(3, dtype=np.float64), {
+            "enabled": False, "reason": "degenerate_front_landmarks", "yaw_degrees": 0.0,
+        }
+    if shoulder_norm < 1e-6:
+        lateral = hip_lr / hip_norm
+    elif hip_norm < 1e-6:
+        lateral = shoulder_lr / shoulder_norm
+    else:
+        shoulder_unit = shoulder_lr / shoulder_norm
+        hip_unit = hip_lr / hip_norm
+        if float(np.dot(shoulder_unit, hip_unit)) < 0.0:
+            hip_unit = -hip_unit
+        lateral = 0.65 * shoulder_unit + 0.35 * hip_unit
+        lateral /= max(float(np.linalg.norm(lateral)), 1e-8)
+
+    yaw = float(np.arctan2(lateral[2], lateral[0]))
+    c, s = np.cos(yaw), np.sin(yaw)
+    yaw_rotation = np.array(
+        [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+        dtype=np.float64,
+    )
+    normalized = vertices.astype(np.float64) @ yaw_rotation.T
+    return normalized.astype(np.float32), yaw_rotation, {
+        "enabled": True,
+        "reason": "front_shoulder_hip_landmarks",
+        "yaw_degrees": float(np.degrees(yaw)),
+        "shoulder_lateral_norm_m": shoulder_norm,
+        "hip_lateral_norm_m": hip_norm,
+    }
+
+
+
 def kabsch_align_vertices(front_vertices, side_vertices):
     """
     Align side mesh into front mesh frame using corresponding vertex indices.
@@ -2569,6 +2622,11 @@ def main():
             "When set, CLAD falls back to MHR rest-pose reconstruction plus profile correction."
         ),
     )
+    parser.add_argument(
+        "--no-yaw-normalization",
+        action="store_true",
+        help="Disable front-landmark yaw normalisation before front/side fusion.",
+    )
     args = parser.parse_args()
 
     input_dir = args.input_dir
@@ -2840,6 +2898,20 @@ def main():
     side_no_sdf_upright = side_no_sdf_oriented["vertices_oriented"]
     side_upright = side_oriented["vertices_oriented"]
 
+    if args.no_yaw_normalization:
+        yaw_rotation = np.eye(3, dtype=np.float64)
+        yaw_meta = {"enabled": False, "reason": "disabled_by_flag", "yaw_degrees": 0.0}
+    else:
+        front_upright, yaw_rotation, yaw_meta = yaw_normalize_from_front_landmarks(
+            front_upright,
+            front_result.get("pred_keypoints_3d"),
+            front_oriented["centroid"],
+            front_oriented["rotation_matrix"],
+        )
+        side_no_sdf_upright = (side_no_sdf_upright.astype(np.float64) @ yaw_rotation.T).astype(np.float32)
+        side_upright = (side_upright.astype(np.float64) @ yaw_rotation.T).astype(np.float32)
+    print(f"  yaw normalisation     : {yaw_meta['reason']} ({yaw_meta['yaw_degrees']:.2f} deg)")
+
     print("\nFront mesh:")
     print(f"  estimated up direction : {front_oriented['estimated_up_direction']}")
     print(f"  height before rotation : {float(front_oriented['height_before']):.6f}")
@@ -2932,6 +3004,9 @@ def main():
     no_sdf_result_scaled = scale_result_params(no_sdf_result_unscaled, float(no_sdf_scale_factor))
     no_sdf_result_scaled["pred_vertices"] = fused_vertices_no_sdf_scaled.astype(np.float32)
     no_sdf_result_scaled["fusion_applied_scale_factor"] = np.array(float(no_sdf_scale_factor), dtype=np.float64)
+    for key, value in yaw_meta.items():
+        no_sdf_result_scaled[f"fusion_yaw_normalization_{key}"] = np.array(value)
+    no_sdf_result_scaled["fusion_yaw_normalization_rotation_matrix"] = yaw_rotation.astype(np.float64)
     for key, value in profile_depth_meta_no_sdf.items():
         no_sdf_result_scaled[f"fusion_profile_depth_{key}"] = value
     for key, value in side_anchor_meta.items():
@@ -2987,6 +3062,9 @@ def main():
     fused_result_scaled = scale_result_params(fused_result_unscaled, float(scale_factor))
     fused_result_scaled["pred_vertices"] = fused_vertices_scaled.astype(np.float32)
     fused_result_scaled["fusion_applied_scale_factor"] = np.array(float(scale_factor), dtype=np.float64)
+    for key, value in yaw_meta.items():
+        fused_result_scaled[f"fusion_yaw_normalization_{key}"] = np.array(value)
+    fused_result_scaled["fusion_yaw_normalization_rotation_matrix"] = yaw_rotation.astype(np.float64)
     for key, value in profile_depth_meta.items():
         fused_result_scaled[f"fusion_profile_depth_{key}"] = value
     for key, value in side_sdf_profile_meta.items():

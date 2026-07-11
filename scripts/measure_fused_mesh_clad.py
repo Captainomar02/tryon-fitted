@@ -28,6 +28,7 @@ if str(CLAD_ROOT) not in sys.path:
 
 from clad_body.load.mhr import MhrBody, load_mhr_from_params
 from clad_body.measure import measure
+from clad_body.measure._lengths import measure_shoulder_width
 from clad_body.measure._render import render_4view
 from clad_body.measure._slicer import MeshSlicer
 
@@ -283,6 +284,38 @@ def _median_landmark(vertices: np.ndarray, mask: np.ndarray, fallback: np.ndarra
     if np.count_nonzero(mask) < 8:
         return np.asarray(fallback, dtype=np.float32)
     return np.median(vertices[mask], axis=0).astype(np.float32)
+
+
+def fused_c7_surface_point(vertices: np.ndarray, c7: np.ndarray) -> np.ndarray | None:
+    """Project C7 to upper-back skin while rejecting the head/neck back lobe."""
+    c7 = np.asarray(c7, dtype=np.float32)
+    # At C7 height, some fused meshes join the rear of the head to the torso
+    # slice. The unconstrained maximum-Y projection then creates a very deep
+    # shoulder-arc midpoint. A 12 cm posterior limit retains upper-back skin
+    # while rejecting that head/neck lobe.
+    max_y = float(c7[1]) + 0.12
+    for x_tol, z_tol in ((0.03, 0.01), (0.04, 0.03), (0.06, 0.06)):
+        near = vertices[
+            (np.abs(vertices[:, 0] - c7[0]) < x_tol)
+            & (np.abs(vertices[:, 2] - c7[2]) < z_tol)
+            & (vertices[:, 1] <= max_y)
+        ]
+        if len(near):
+            return np.array([c7[0], near[:, 1].max(), c7[2]], dtype=np.float32)
+    return None
+
+
+def fused_back_surface_point(vertices: np.ndarray, point: np.ndarray) -> np.ndarray | None:
+    """Move an acromion seed to the posterior shoulder surface at its X/Z."""
+    point = np.asarray(point, dtype=np.float32)
+    for x_tol, z_tol in ((0.02, 0.02), (0.04, 0.03), (0.06, 0.05)):
+        near = vertices[
+            (np.abs(vertices[:, 0] - point[0]) < x_tol)
+            & (np.abs(vertices[:, 2] - point[2]) < z_tol)
+        ]
+        if len(near):
+            return np.array([point[0], near[:, 1].max(), point[2]], dtype=np.float32)
+    return None
 
 
 def fused_mesh_arm_landmarks(
@@ -549,7 +582,108 @@ def apply_arm_excluded_torso_measurements(
         )
         set_measurement("stomach", circ, z)
 
+    # fused_mesh_arm_landmarks() already projects the shoulder joints to the
+    # acromion. Re-running find_acromion() can walk farther onto an upper arm.
+    # Use those one-pass landmarks and a C7 projection that rejects a fused
+    # rear-head lobe at the same height.
+    if wants("shoulder_width") and body.joints:
+        c7 = body.joints.get("c7")
+        c7_surface = fused_c7_surface_point(np.asarray(body.mesh.vertices), c7) if c7 is not None else None
+        shoulder_joints = dict(body.joints)
+        for key in ("l_shoulder", "r_shoulder"):
+            point = shoulder_joints.get(key)
+            if point is None:
+                continue
+            back_point = fused_back_surface_point(np.asarray(body.mesh.vertices), point)
+            if back_point is not None:
+                shoulder_joints[key] = back_point
+        shoulder_cm, shoulder_arc = measure_shoulder_width(
+            shoulder_joints,
+            mesh=body.mesh,
+            acromia_preprojected=True,
+            c7_surface_override=c7_surface,
+        )
+        if shoulder_cm > 0.0 and shoulder_arc is not None:
+            measurements["shoulder_width_cm"] = float(shoulder_cm)
+            measurements["_shoulder_arc_pts"] = shoulder_arc
+            polylines = measurements.get("_linear_polylines")
+            if isinstance(polylines, dict):
+                polylines["shoulder_width"] = shoulder_arc
+            debug_joints = measurements.get("_debug_joints")
+            if isinstance(debug_joints, dict):
+                for key in ("l_shoulder", "r_shoulder"):
+                    if key in shoulder_joints:
+                        debug_joints[key] = shoulder_joints[key]
+            measurements["_shoulder_measurement_source"] = "fused_mesh_one_pass_acromion_safe_c7"
+
     return torso_mesh
+
+
+def write_bust_diagnostic(
+    body: MhrBody,
+    measurements: dict[str, Any],
+    torso_mesh: trimesh.Trimesh | None,
+    output_dir: Path,
+    title: str,
+) -> None:
+    """Render and report the current bust loop beside a full-mesh candidate."""
+    if torso_mesh is None:
+        raise RuntimeError("Bust diagnostic requires the arm-excluded torso mesh")
+    z = float(measurements.get("_bust_z", 0.0) or 0.0)
+    if z <= 0.0:
+        raise RuntimeError("Bust diagnostic requires a computed bust height")
+
+    arm_excluded_cm = float(
+        MeshSlicer(torso_mesh).circumference_at_z(
+            z, max_x_extent=0.85, combine_fragments=True
+        ) * 100.0
+    )
+    full_candidate_cm = float(
+        MeshSlicer(body.mesh).circumference_at_z(
+            z, max_x_extent=0.85, combine_fragments=False
+        ) * 100.0
+    )
+    report = {
+        "bust_z_m": z,
+        "bust_height_pct": float(measurements.get("_bust_pct", 0.0) or 0.0),
+        "arm_excluded_bust_cm": arm_excluded_cm,
+        "full_mesh_largest_component_cm": full_candidate_cm,
+        "full_minus_arm_excluded_cm": full_candidate_cm - arm_excluded_cm,
+        "note": (
+            "The full-mesh candidate is diagnostic only: it can include arm-adjacent "
+            "geometry. The production measurement remains arm_excluded_bust_cm."
+        ),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "bust_comparison.json").write_text(
+        json.dumps(jsonable(report), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    base = {"height_cm": measurements["height_cm"], "_bust_z": z}
+    arm_measurements = {**base, "bust_cm": arm_excluded_cm}
+    full_measurements = {**base, "bust_cm": full_candidate_cm}
+    render_4view(
+        body.mesh,
+        arm_measurements,
+        str(output_dir / "bust_arm_excluded.png"),
+        title=f"{title} — A: arm-excluded (production)",
+        model_label="Bust diagnostic",
+        torso_mesh=torso_mesh,
+    )
+    render_4view(
+        body.mesh,
+        full_measurements,
+        str(output_dir / "bust_full_mesh_candidate.png"),
+        title=f"{title} — B: full-mesh candidate",
+        model_label="Bust diagnostic",
+        torso_mesh=None,
+    )
+    print(f"Saved bust diagnostic: {output_dir}")
+
+
+
+
 def fused_body(
     source: Path,
     height_cm: float | None,
@@ -587,6 +721,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mesh", "--params", dest="mesh", required=True, help="Fused params JSON or mesh file.")
     parser.add_argument("--out-json", required=True, help="Measurement JSON output path.")
     parser.add_argument("--render", default="", help="Optional 4-view render PNG output path.")
+    parser.add_argument(
+        "--bust-diagnostic-dir",
+        default="",
+        help="Optional directory for A/B arm-excluded versus full-mesh bust diagnostic renders.",
+    )
     parser.add_argument("--height-cm", type=float, default=0.0, help="Optional target height override in centimeters.")
     parser.add_argument("--preset", default="all", help="CLAD measurement preset.")
     parser.add_argument("--only", default="", help="Comma-separated measurement keys. Overrides preset.")
@@ -602,6 +741,7 @@ def main() -> None:
     source = Path(args.mesh).expanduser().resolve()
     out_json = Path(args.out_json).expanduser().resolve()
     render_path = Path(args.render).expanduser().resolve() if args.render else None
+    bust_diagnostic_dir = Path(args.bust_diagnostic_dir).expanduser().resolve() if args.bust_diagnostic_dir else None
     only = [item.strip() for item in args.only.split(",") if item.strip()] or None
 
     body, params = fused_body(
@@ -626,6 +766,8 @@ def main() -> None:
     if render_path is not None:
         render_path.parent.mkdir(parents=True, exist_ok=True)
         render_4view(body.mesh, measurements, str(render_path), title=source.stem, model_label="Fused SDF", torso_mesh=torso_mesh)
+    if bust_diagnostic_dir is not None:
+        write_bust_diagnostic(body, measurements, torso_mesh, bust_diagnostic_dir, source.stem)
 
     print(f"Saved measurements: {out_json}")
     if render_path is not None:

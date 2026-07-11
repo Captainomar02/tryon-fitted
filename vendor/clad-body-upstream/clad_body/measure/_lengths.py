@@ -197,8 +197,7 @@ def c7_surface_point(verts, c7):
     return None
 
 
-def _shoulder_arc_polyline(verts, l_acromion, r_acromion, c7, n_samples=30,
-                           c7_surface_override=None):
+def _shoulder_arc_polyline(verts, l_acromion, r_acromion, c7, n_samples=30):
     """Build a smooth surface-following polyline from R acromion → C7 → L acromion.
 
     Fits a cubic spline through the three waypoints in the XZ plane, then
@@ -233,9 +232,7 @@ def _shoulder_arc_polyline(verts, l_acromion, r_acromion, c7, n_samples=30,
     # position is inside the body. Use c7_surface_point so the arc and
     # back-neck-to-waist share the identical start landmark.
     wp_y = [float(r_acromion[1]), None, float(l_acromion[1])]
-    c7_surf = c7_surface_override
-    if c7_surf is None:
-        c7_surf = c7_surface_point(verts, c7)
+    c7_surf = c7_surface_point(verts, c7)
     wp_y[1] = float(c7_surf[1]) if c7_surf is not None else float(c7[1])
 
     cs_y = CubicSpline(dists, wp_y, bc_type='natural')
@@ -253,9 +250,7 @@ def _shoulder_arc_polyline(verts, l_acromion, r_acromion, c7, n_samples=30,
     return np.array(pts, dtype=np.float64)
 
 
-def measure_shoulder_width(joints, mesh=None, acromion_fn=None,
-                           acromia_preprojected=False,
-                           c7_surface_override=None):
+def measure_shoulder_width(joints, mesh=None, acromion_fn=None):
     """Measure shoulder width — arc length over upper back via C7.
 
     ISO 8559-1 5.4.2: tape follows contour of upper back between left and
@@ -270,8 +265,6 @@ def measure_shoulder_width(joints, mesh=None, acromion_fn=None,
         mesh: optional trimesh for surface acromion detection + arc measurement.
         acromion_fn: callable(verts, joint, side) → (3,) acromion position.
             Model-specific — Anny and MHR provide their own implementations.
-        acromia_preprojected: joints already contain surface acromion points.
-        c7_surface_override: optional C7 surface point for the arc midpoint.
 
     Returns:
         (shoulder_width_cm, arc_pts) — cm value and (N,3) polyline (or None).
@@ -283,16 +276,13 @@ def measure_shoulder_width(joints, mesh=None, acromion_fn=None,
     if l is None or r is None:
         return 0, None
 
-    if mesh is not None:
+    if mesh is not None and acromion_fn is not None:
         verts = np.array(mesh.vertices)
-        if acromion_fn is not None and not acromia_preprojected:
-            l = acromion_fn(verts, l, side="left")
-            r = acromion_fn(verts, r, side="right")
+        l = acromion_fn(verts, l, side="left")
+        r = acromion_fn(verts, r, side="right")
 
         if c7 is not None:
-            arc_pts = _shoulder_arc_polyline(
-                verts, l, r, c7, c7_surface_override=c7_surface_override
-            )
+            arc_pts = _shoulder_arc_polyline(verts, l, r, c7)
             if arc_pts is not None and len(arc_pts) >= 2:
                 diffs = np.diff(arc_pts, axis=0)
                 arc_len = float(np.sum(np.linalg.norm(diffs, axis=1)))

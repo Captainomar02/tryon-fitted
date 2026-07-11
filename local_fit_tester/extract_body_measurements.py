@@ -158,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--measure-preset",
         default="all",
-        help="CLAD measurement preset passed to scripts/measure_fused_mesh_clad.py.",
+        help="CLAD measurement preset passed to the upstream CLAD baseline adapter.",
     )
     parser.add_argument(
         "--only",
@@ -225,7 +225,7 @@ def main() -> int:
     measure_cmd = _python_command(
         conda_exe,
         args.clad_conda_env,
-        REPO_ROOT / "scripts" / "measure_fused_mesh_clad.py",
+        REPO_ROOT / "scripts" / "measure_fused_mesh_clad_upstream.py",
     ) + [
         "--mesh",
         str(params_path),
@@ -242,7 +242,7 @@ def main() -> int:
         measure_cmd.extend(["--only", args.only.strip()])
     if args.device.strip():
         measure_cmd.extend(["--device", args.device.strip()])
-    measure_env = _with_pythonpath(REPO_ROOT / "clad-body")
+    measure_env = _with_pythonpath(REPO_ROOT / "vendor" / "clad-body-upstream")
     _run(measure_cmd, cwd=REPO_ROOT, env=measure_env)
 
     if not body_measurements_path.exists():
