@@ -680,30 +680,32 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
     polylines = measurements.get("_linear_polylines")
     if isinstance(polylines, dict):
         polylines.pop("shirt_length", None)
-    # Platform regular-fit shirt target: 90% of the stable HPS/side-neck to
-    # full-hip surface trace.  This deliberately has no waist dependency.
-    hps_to_full_hip_cm, hps_to_full_hip_pts = (0.0, None)
-    if hip_z > 0:
-        hps_to_full_hip_cm, hps_to_full_hip_pts = measure_shirt_length(
-            body.joints or {}, body.mesh, hip_z - 0.02, measurements=measurements
+    # Regular-fit T-shirt target: 90% of the side-neck/HPS-to-crotch-level
+    # front surface trace. It deliberately has no waist or hip dependency.
+    hps_to_crotch_cm, hps_to_crotch_pts = (0.0, None)
+    crotch_z = float(measurements.get("_inseam_z", 0.0))
+    if crotch_z > 0:
+        hps_to_crotch_cm, hps_to_crotch_pts = measure_shirt_length(
+            body.joints or {}, body.mesh, crotch_z, measurements=measurements,
+            end_offset=0.0,
         )
-    regular_tshirt_cm, regular_tshirt_pts = truncate_polyline_at_fraction(hps_to_full_hip_pts, 0.90) if hps_to_full_hip_pts is not None else (0.0, None)
+    regular_tshirt_cm, regular_tshirt_pts = truncate_polyline_at_fraction(hps_to_crotch_pts, 0.90) if hps_to_crotch_pts is not None else (0.0, None)
     if regular_tshirt_pts is not None and regular_tshirt_cm > 0:
-        measurements["hps_to_full_hip_cm"] = float(hps_to_full_hip_cm)
+        measurements["hps_to_crotch_cm"] = float(hps_to_crotch_cm)
         measurements["regular_tshirt_length_cm"] = float(regular_tshirt_cm)
         measurements["shirt_length_cm"] = float(regular_tshirt_cm)
-        measurements["_hps_to_full_hip_pts"] = hps_to_full_hip_pts
+        measurements["_hps_to_crotch_pts"] = hps_to_crotch_pts
         measurements["_regular_tshirt_length_pts"] = regular_tshirt_pts
         measurements["_shirt_length_pts"] = regular_tshirt_pts
-        measurements["_shirt_length_source"] = "regular_fit_90pct_hps_to_full_hip_surface_trace"
-        measurements["_shirt_length_definition"] = "0.90 * hps_to_full_hip_surface_length"
+        measurements["_shirt_length_source"] = "regular_fit_90pct_hps_to_crotch_surface_trace"
+        measurements["_shirt_length_definition"] = "0.90 * hps_to_crotch_surface_length"
         polylines = measurements.get("_linear_polylines")
         if isinstance(polylines, dict):
             polylines["shirt_length"] = regular_tshirt_pts
         start_conf = str(measurements.get("_shirt_start", {}).get("confidence", "low"))
-        side_q = _quality(start_conf, "regular_fit_90pct_hps_to_full_hip_surface_trace")
+        side_q = _quality(start_conf, "regular_fit_90pct_hps_to_crotch_surface_trace")
     else:
-        side_q = _quality("low", "hps_to_full_hip_trace_failed")
+        side_q = _quality("low", "hps_to_crotch_trace_failed")
     quality.update({"bust": bust_q, "waist": waist_q, "hip": hip_q, "stomach": stomach_q, "inseam": inseam_q, "side_neck_to_waist": _quality("low", "replaced_by_regular_tshirt_length"), "regular_tshirt_length": side_q})
     measurements["_measurement_quality"] = quality
     measurements["_torso_arm_exclusion"] = torso_meta
@@ -736,7 +738,7 @@ def main() -> None:
     apply_distinct_stomach_measurement(measurements, body)
     apply_surface_crotch_length(measurements, body)
     torso_mesh = apply_production_core_measurements(measurements, body)
-    measurements.setdefault("_shirt_length_source", "regular_fit_90pct_hps_to_full_hip_surface_trace")
+    measurements.setdefault("_shirt_length_source", "regular_fit_90pct_hps_to_crotch_surface_trace")
     measurements["_shirt_start"] = shirt_start_meta
     measurements.update({
         "_measurement_engine": "datar-psa/clad-body@a2140a7",

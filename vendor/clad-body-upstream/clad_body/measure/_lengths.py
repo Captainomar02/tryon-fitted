@@ -443,7 +443,8 @@ def find_side_neck_point(slicer, c7_z):
     return np.array([float(lat[0]), float(lat[1]), float(c7_z)], dtype=np.float64)
 
 
-def measure_shirt_length(joints, mesh, crotch_z, measurements=None, step=0.005):
+def measure_shirt_length(joints, mesh, crotch_z, measurements=None, step=0.005,
+                         end_offset=0.02):
     """Measure shirt length — side neck to crotch along front body contour.
 
     3DLook "jacket length": distance from Side Neck Point to the thigh
@@ -459,8 +460,8 @@ def measure_shirt_length(joints, mesh, crotch_z, measurements=None, step=0.005):
          this zone, producing spurious front-surface samples.  The lower
          convex hull bridges cleanly from the start to the first stable
          chest-level sample.
-      3. **Front surface sweep** — from (c7_z − 5 cm) to 2 cm above
-         crotch Z.  At each Z, take most-anterior Y within ±2.5 cm of
+      3. **Front surface sweep** — from (c7_z − 5 cm) to ``end_offset``
+         above crotch Z. At each Z, take most-anterior Y within ±2.5 cm of
          ``side_neck_x``.
       4. **Lower convex hull ("not tight to skin")** — bridges
          concavities (waist dip), follows convex protrusions (bust, belly).
@@ -473,6 +474,9 @@ def measure_shirt_length(joints, mesh, crotch_z, measurements=None, step=0.005):
         crotch_z: Z coordinate of crotch (from measure_inseam), in metres.
         measurements: unused (kept for API compatibility).
         step: vertical step between sample planes (metres, default 5 mm).
+        end_offset: Vertical distance above ``crotch_z`` at which to end the
+            trace, in metres. Defaults to 2 cm for the legacy behaviour;
+            callers can use 0 for an exact crotch-level endpoint.
 
     Returns:
         (shirt_length_cm, polyline) — cm value and (N, 3) float32 array,
@@ -502,7 +506,7 @@ def measure_shirt_length(joints, mesh, crotch_z, measurements=None, step=0.005):
     # diagonal from the trap top to the first stable chest-level sample.
     x_band = 0.025
     skip_zone = 0.05
-    sweep_bottom = crotch_z + 0.02
+    sweep_bottom = crotch_z + end_offset
 
     front_ys = [sny]
     valid_zs = [snz]
