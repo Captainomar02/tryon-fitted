@@ -28,4 +28,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/tryon-fitted:latest
+          tags: ghcr.io/captainomar02/tryon-fitted:latest
