@@ -1,43 +1,19 @@
-# SAM 3D Body runtime dependencies for the Vast.ai Docker image.
-# The base image supplies CUDA-enabled torch/torchvision.
+# Only packages imported by the front/side body-measurement launch path.
+# Model weights are downloaded at instance start, never during Docker build.
 torch==2.8.0
 torchvision==0.23.0
-torchaudio==2.8.0
+numpy
 pymomentum-cpu==0.1.108.post0
 mhr==1.0.1
 pytorch-lightning
 pyrender
 opencv-python-headless
 yacs
-scikit-image
 einops
 timm
-dill
-pandas
-rich
 hydra-core
-hydra-submitit-launcher
-hydra-colorlog
-pyrootutils
-webdataset
 braceexpand
-chump
-networkx==3.2.1
 roma
-joblib
-seaborn
-wandb
-appdirs
-ffmpeg
-cython
-jsonlines
-pytest
-xtcocotools
-loguru
-optree
-fvcore
-pycocotools
-tensorboard
 huggingface_hub[cli]
 omegaconf
 trimesh
@@ -47,8 +23,6 @@ scipy
 transformers
 safetensors
 accelerate
-hatchling
-editables
 git+https://github.com/microsoft/MoGe.git
 iopath
 tqdm

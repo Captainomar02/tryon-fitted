@@ -26,11 +26,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /workspace
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
     ca-certificates \
-    cmake \
     curl \
-    ffmpeg \
     git \
     libegl1 \
     libglib2.0-0 \
@@ -38,16 +35,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglvnd0 \
     libxext6 \
     libxrender1 \
-    ninja-build \
     unzip \
-    wget \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements-vast.txt /tmp/requirements-vast.txt
 
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && python -m pip install --no-cache-dir numpy cython \
-    && python -m pip install --no-cache-dir xtcocotools --no-build-isolation \
     && python -m pip install --no-cache-dir -r /tmp/requirements-vast.txt \
     && rm /tmp/requirements-vast.txt
 

@@ -41,7 +41,3 @@ sandbox/
 *.png
 *.webp
 *.gif
-
-# Keep vendored CLAD test data and docs if they are text/json.
-!clad-body/**/*.json
-!clad-body/**/*.md

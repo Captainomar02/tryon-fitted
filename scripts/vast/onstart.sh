@@ -1,73 +1,80 @@
 #!/usr/bin/env bash
+# Minimal Vast.ai bootstrap for the front/side body-measurement command.
 set -euo pipefail
 
 APP_DIR="${APP_DIR:-/workspace/tryon-fitted}"
-APP_REPO_URL="${APP_REPO_URL:-https://github.com/Captainomar02/tryon-fitted.git}"
-APP_REF="${APP_REF:-main}"
-SAM3D_PREFETCH_RUNTIME_MODELS="${SAM3D_PREFETCH_RUNTIME_MODELS:-1}"
+CHECKPOINT_DIR="${SAM3D_CHECKPOINT_DIR:-${APP_DIR}/checkpoints/sam-3d-body-dinov3}"
+MHR_ASSETS_DIR="${MHR_ASSETS_DIR:-${APP_DIR}/checkpoints/mhr-assets/assets}"
+SAM2_DIR="${SAM2_DIR:-${APP_DIR}/external/sam2}"
+SAM2_REF="${SAM2_REF:-main}"
+HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
 
-if [[ ! -d "${APP_DIR}/.git" ]]; then
-  rm -rf "${APP_DIR}"
-  git clone --branch "${APP_REF}" "${APP_REPO_URL}" "${APP_DIR}"
-else
-  git -C "${APP_DIR}" fetch origin "${APP_REF}"
-  git -C "${APP_DIR}" checkout "${APP_REF}"
-  git -C "${APP_DIR}" pull --ff-only origin "${APP_REF}"
+export HF_HOME MHR_ASSETS_DIR SAM3D_SEGMENTOR="${SAM3D_SEGMENTOR:-sam2}"
+export SAM3D_SEGMENTOR_PATH="${SAM3D_SEGMENTOR_PATH:-${SAM2_DIR}}"
+
+mkdir -p "${CHECKPOINT_DIR}" "${MHR_ASSETS_DIR}" "${SAM2_DIR%/*}" "${HF_HOME}"
+
+echo '[bootstrap] Downloading the required SAM-3D checkpoint files...'
+python - "${CHECKPOINT_DIR}" <<'PY'
+import os
+import sys
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="facebook/sam-3d-body-dinov3",
+    local_dir=sys.argv[1],
+    allow_patterns=["model.ckpt", "model_config.yaml", "assets/mhr_model.pt"],
+    token=os.environ.get("HF_TOKEN") or None,
+)
+PY
+
+echo '[bootstrap] Downloading the required MHR LOD1 assets...'
+if [[ ! -s "${MHR_ASSETS_DIR}/corrective_blendshapes_lod1.npz" ]]; then
+  archive="$(mktemp)"
+  trap 'rm -f "${archive}"' EXIT
+  curl --fail --location --retry 3 \
+    --output "${archive}" \
+    https://github.com/facebookresearch/MHR/releases/download/v1.0.1/assets.zip
+  unzip -o "${archive}" \
+    assets/lod1.fbx assets/compact_v6_1.model assets/corrective_blendshapes_lod1.npz assets/LICENSE.txt \
+    -d "${APP_DIR}/checkpoints/mhr-assets"
+  rm -f "${archive}"
+  trap - EXIT
 fi
 
-cd "${APP_DIR}"
+# MHR.from_files() defaults to an assets directory beside the installed mhr package.
+MHR_PACKAGE_ASSETS="$(python - <<'PY'
+from pathlib import Path
+import mhr
+print(Path(mhr.__file__).resolve().parents[1] / 'assets')
+PY
+)"
+rm -rf "${MHR_PACKAGE_ASSETS}"
+ln -s "${MHR_ASSETS_DIR}" "${MHR_PACKAGE_ASSETS}"
 
-mkdir -p "${APP_DIR}/input" "${APP_DIR}/output" "${APP_DIR}/checkpoints"
-
-ensure_mhr_runtime_deps() {
-  if python - <<'PY_CHECK'
-import torch
-import torchvision
-import torchaudio
-import pymomentum.geometry  # noqa: F401
-import mhr  # noqa: F401
-def version_tuple(value):
-    return tuple(int(part) for part in value.split("+")[0].split(".")[:3])
-if version_tuple(torch.__version__) < (2, 8, 0):
-    raise SystemExit(1)
-if version_tuple(torchvision.__version__) < (0, 23, 0):
-    raise SystemExit(1)
-if version_tuple(torchaudio.__version__) < (2, 8, 0):
-    raise SystemExit(1)
-PY_CHECK
-  then
-    echo "MHR runtime deps already installed."
-    return
-  fi
-
-  echo "Installing missing MHR runtime deps into $(python -c 'import sys; print(sys.executable)')..."
-  python -m pip install \
-    torch==2.8.0 \
-    torchvision==0.23.0 \
-    torchaudio==2.8.0 \
-    pymomentum-cpu==0.1.108.post0 \
-    mhr==1.0.1
-
-  python - <<'PY_CHECK'
-import torch
-import torchvision
-import torchaudio
-import pymomentum.geometry  # noqa: F401
-import mhr  # noqa: F401
-print(f"MHR runtime deps ok: torch {torch.__version__}, torchvision {torchvision.__version__}, torchaudio {torchaudio.__version__}")
-PY_CHECK
-}
-
-ensure_mhr_runtime_deps
-python -m pip install -e "./clad-body[mhr,render]" --no-build-isolation --no-deps
-scripts/vast/download_checkpoints.sh
-scripts/vast/download_mhr_assets.sh
-scripts/vast/setup_sam2.sh
-
-if [[ "${SAM3D_PREFETCH_RUNTIME_MODELS}" == "1" ]]; then
-  python scripts/vast/prefetch_runtime_models.py
+echo '[bootstrap] Checking out only SAM2 runtime source and its required checkpoint...'
+if [[ ! -f "${SAM2_DIR}/sam2/build_sam.py" ]]; then
+  rm -rf "${SAM2_DIR}"
+  git clone --depth 1 --filter=blob:none --sparse --branch "${SAM2_REF}" \
+    https://github.com/facebookresearch/sam2.git "${SAM2_DIR}"
+  git -C "${SAM2_DIR}" sparse-checkout set sam2 setup.py pyproject.toml
 fi
+mkdir -p "${SAM2_DIR}/checkpoints"
+if [[ ! -s "${SAM2_DIR}/checkpoints/sam2.1_hiera_large.pt" ]]; then
+  curl --fail --location --retry 3 \
+    --output "${SAM2_DIR}/checkpoints/sam2.1_hiera_large.pt" \
+    https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+fi
+python -m pip install --no-cache-dir --no-deps -e "${SAM2_DIR}"
 
-echo "SAM 3D Body + CLAD Body + SAM2 container is ready."
-echo "Put front.* and side.* in ${APP_DIR}/input, then run:"
-echo "  scripts/vast/run_fusion_and_measure.sh ${APP_DIR}/input ${APP_DIR}/output 178"
+echo '[bootstrap] Prefetching the exact RT-DETR and MoGe2 runtime models...'
+python - <<'PY'
+import torch
+from transformers import RTDetrForObjectDetection, RTDetrImageProcessor
+from moge.model.v2 import MoGeModel
+
+RTDetrImageProcessor.from_pretrained('PekingU/rtdetr_r50vd_coco_o365')
+RTDetrForObjectDetection.from_pretrained('PekingU/rtdetr_r50vd_coco_o365')
+MoGeModel.from_pretrained('Ruicheng/moge-2-vitl-normal')
+print('[bootstrap] Required runtime models are ready.')
+PY
