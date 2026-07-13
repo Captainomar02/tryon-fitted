@@ -12,6 +12,15 @@ import torch
 import trimesh
 from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
 from tools.vis_utils import visualize_sample_together
+from fusion_quality import (
+    alignment_report,
+    make_quality_report,
+    projected_silhouette,
+    silhouette_report,
+    similarity_align,
+    torso_mask_from_landmarks,
+    validate_result,
+)
 
 
 def find_image(input_dir, stem):
@@ -307,6 +316,53 @@ def fuse_front_xy_with_side_z(front_vertices, side_vertices_aligned):
     return fused
 
 
+def _write_quality_report(path, report):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, sort_keys=True)
+
+
+def _select_single_subject(outputs, label):
+    """Select a clearly dominant full-body candidate; reject ambiguous scenes."""
+    if not isinstance(outputs, list) or not outputs:
+        return None, {"count": 0, "selected_index": None, "areas": []}, f"{label}_requires_subject"
+    candidates = [item for item in outputs if isinstance(item, dict) and item.get("bbox") is not None]
+    if len(candidates) != len(outputs):
+        return None, {"count": len(outputs), "selected_index": None, "areas": []}, f"{label}_invalid_subject_candidate"
+    areas = []
+    for item in candidates:
+        x0, y0, x1, y1 = np.asarray(item["bbox"], dtype=np.float64).reshape(-1)[:4]
+        areas.append(max(0.0, x1 - x0) * max(0.0, y1 - y0))
+    order = np.argsort(areas)[::-1]
+    selected = int(order[0])
+    meta = {"count": len(candidates), "selected_index": selected, "areas": [float(area) for area in areas]}
+    if len(candidates) > 1:
+        runner_up = max(areas[int(order[1])], 1.0)
+        meta["dominance_ratio"] = float(areas[selected] / runner_up)
+        if meta["dominance_ratio"] < 1.35:
+            return None, meta, f"{label}_ambiguous_multiple_subjects"
+    return candidates[selected], meta, None
+
+
+def _inverse_front_canonical(vertices, oriented, yaw_rotation):
+    """Map fusion-frame vertices into the original front estimator frame."""
+    upright = np.asarray(vertices, dtype=np.float64) @ np.asarray(yaw_rotation, dtype=np.float64)
+    return (upright @ np.asarray(oriented["rotation_matrix"], dtype=np.float64)) + np.asarray(oriented["centroid"], dtype=np.float64)
+
+
+def _inverse_side_canonical(vertices, oriented, yaw_rotation, transform):
+    """Map fusion-frame vertices into the original side estimator frame."""
+    v = np.asarray(vertices, dtype=np.float64)
+    source_yaw = ((v - np.asarray(transform["target_center"], dtype=np.float64)) / float(transform["scale"])) @ np.asarray(transform["rotation"], dtype=np.float64)
+    source_yaw += np.asarray(transform["source_center"], dtype=np.float64)
+    upright = source_yaw @ np.asarray(yaw_rotation, dtype=np.float64)
+    return (upright @ np.asarray(oriented["rotation_matrix"], dtype=np.float64)) + np.asarray(oriented["centroid"], dtype=np.float64)
+
+
+def _canonical_keypoints(keypoints, oriented, yaw_rotation):
+    points = np.asarray(keypoints, dtype=np.float64)
+    return ((points - np.asarray(oriented["centroid"], dtype=np.float64)) @ np.asarray(oriented["rotation_matrix"], dtype=np.float64).T) @ np.asarray(yaw_rotation, dtype=np.float64).T
+
+
 def _smooth_band_weight(height_pct, center, half_width):
     distance = np.abs(height_pct - float(center))
     weight = np.clip(1.0 - (distance / float(half_width)), 0.0, 1.0)
@@ -415,6 +471,12 @@ def _range_band_with_feather(height_pct, low, high, feather_width, falloff_power
 
 
 def chest_band_bounds_from_anchors(anchor_pcts):
+    """Return the anterior torso SDF range: hip through shoulder line.
+
+    The historical name remains for compatibility with the solver metadata,
+    but this is deliberately no longer chest-only: it covers chest, stomach,
+    and lower stomach down to the hip landmark.
+    """
     lower = required_anchor_pct(anchor_pcts, "chest_lower")
     upper = required_anchor_pct(anchor_pcts, "chest_upper")
     if upper < lower:
@@ -543,6 +605,42 @@ def sam_upright_vertices_to_clad_canonical(vertices):
     dst[:, 0] -= center_xy[0]
     dst[:, 1] -= center_xy[1]
     return dst.astype(np.float32)
+
+
+def sam_upright_points_to_clad_canonical(points, reference_vertices):
+    """Apply the mesh's CLAD coordinate conversion to posed joint points."""
+    src = np.asarray(points, dtype=np.float64)
+    ref = np.asarray(reference_vertices, dtype=np.float64)
+    dst = np.zeros_like(src, dtype=np.float64)
+    dst[:, 0] = src[:, 0]
+    dst[:, 1] = -src[:, 2]
+    dst[:, 2] = src[:, 1] - float(ref[:, 1].min())
+    ref_xy = np.column_stack([ref[:, 0], -ref[:, 2]])
+    center_xy = (ref_xy.max(axis=0) + ref_xy.min(axis=0)) * 0.5
+    dst[:, :2] -= center_xy
+    return dst.astype(np.float32)
+
+
+def bind_posed_joints_to_topology(joints, reference_vertices, count=32):
+    """Bind posed SAM3D joints to same-pose vertex indices before fusion."""
+    points = np.asarray(joints, dtype=np.float64)
+    vertices = np.asarray(reference_vertices, dtype=np.float64)
+    count = min(int(count), len(vertices))
+    indices = np.empty((len(points), count), dtype=np.int32)
+    weights = np.empty((len(points), count), dtype=np.float32)
+    distances = np.empty(len(points), dtype=np.float32)
+    for i, point in enumerate(points):
+        d = np.linalg.norm(vertices - point[None, :], axis=1)
+        selected = np.argpartition(d, count - 1)[:count]
+        selected = selected[np.argsort(d[selected])]
+        local = d[selected]
+        radius = max(float(local[-1]), 0.015)
+        w = np.exp(-0.5 * (local / radius) ** 2)
+        w /= max(float(w.sum()), 1e-12)
+        indices[i] = selected
+        weights[i] = w
+        distances[i] = float(local[0])
+    return indices, weights, distances
 
 
 def load_binary_mask(mask_path, expected_shape=None):
@@ -724,7 +822,7 @@ def save_side_anchor_debug_mask(
     chest_center = required_anchor_pct(anchor_pcts, "chest")
     butt_center = required_anchor_pct(anchor_pcts, "butt")
     chest_low, chest_high = chest_band_bounds_from_anchors(anchor_pcts)
-    draw_anchor_range("chest full", chest_low, chest_high, (0, 80, 255), -8)
+    draw_anchor_range("front torso (hip to shoulder)", chest_low, chest_high, (0, 80, 255), -8)
     draw_anchor("bust", chest_center, 0.0, (0, 180, 255), 18)
     draw_anchor("butt", butt_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, (255, 80, 0), 20)
 
@@ -2057,7 +2155,7 @@ def deform_side_mesh_to_mask_profile(
         "chest_full_low_pct": np.array(float(chest_full_low_pct * 100.0), dtype=np.float64),
         "chest_full_high_pct": np.array(float(chest_full_high_pct * 100.0), dtype=np.float64),
         "chest_feather_width_pct": np.array(float(SIDE_SDF_CHEST_FEATHER_PCT * 100.0), dtype=np.float64),
-        "chest_band_source": np.array("clad_lower_chest_to_shoulder_line", dtype=object),
+        "chest_band_source": np.array("clad_hip_to_shoulder_line_anterior_torso", dtype=object),
         "profile_fit_matches_anchor_debug_band": np.array(True, dtype=bool),
         "solve_reason": np.array(solve_reason, dtype=object),
         "solve_data_weight": np.array(float(SIDE_SDF_SOLVE_DATA_WEIGHT), dtype=np.float64),
@@ -2375,10 +2473,12 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         "bust_anchor_pct": np.array(0.0, dtype=np.float64),
         "hip_anchor_pct": np.array(0.0, dtype=np.float64),
         "lower_chest_pct": np.array(0.0, dtype=np.float64),
+        "torso_lower_pct": np.array(0.0, dtype=np.float64),
         "shoulder_line_pct": np.array(0.0, dtype=np.float64),
         "chest_full_low_pct": np.array(0.0, dtype=np.float64),
         "chest_full_high_pct": np.array(0.0, dtype=np.float64),
         "lower_chest_source": np.array("missing", dtype=object),
+        "torso_lower_source": np.array("missing", dtype=object),
         "shoulder_line_source": np.array("missing", dtype=object),
     }
     paths = {
@@ -2438,17 +2538,21 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
             if 0.0 < hip_pct < 100.0:
                 butt_pct = hip_pct / 100.0
                 anchors["butt"] = butt_pct
+                # Extend the anterior SDF/profile region through the stomach
+                # and lower stomach to the hip. torso_core excludes the legs.
+                anchors["chest_lower"] = butt_pct
                 meta["hip_pct"] = np.array(hip_pct, dtype=np.float64)
                 meta["hip_anchor_pct"] = np.array(butt_pct * 100.0, dtype=np.float64)
+                meta["torso_lower_pct"] = np.array(hip_pct, dtype=np.float64)
+                meta["torso_lower_source"] = np.array("hip_pct", dtype=object)
+                meta["chest_full_low_pct"] = np.array(hip_pct, dtype=np.float64)
         except Exception:
             pass
 
         try:
             lower_chest_pct = float(measurements.get("_underbust_pct", 0.0))
             if 0.0 < lower_chest_pct < 100.0:
-                anchors["chest_lower"] = lower_chest_pct / 100.0
                 meta["lower_chest_pct"] = np.array(lower_chest_pct, dtype=np.float64)
-                meta["chest_full_low_pct"] = np.array(lower_chest_pct, dtype=np.float64)
                 meta["lower_chest_source"] = np.array("underbust_pct", dtype=object)
         except Exception:
             pass
@@ -2627,6 +2731,12 @@ def main():
         action="store_true",
         help="Disable front-landmark yaw normalisation before front/side fusion.",
     )
+    parser.add_argument(
+        "--validation-policy",
+        choices=("strict", "warn", "off"),
+        default="strict",
+        help="Reject unsafe pairs, mark them untrusted, or retain legacy fusion behavior.",
+    )
     args = parser.parse_args()
 
     input_dir = args.input_dir
@@ -2650,6 +2760,7 @@ def main():
 
     os.makedirs(output_dir, exist_ok=True)
     clear_output_dir(output_dir)
+    quality_report_path = os.path.join(output_dir, "fusion_quality_report.json")
 
     front_image_path = find_image(input_dir, "front")
     side_image_path = find_image(input_dir, "side")
@@ -2719,9 +2830,10 @@ def main():
         bbox_thr=0.8,
         use_mask=use_sam_mask,
     )
-    if not (isinstance(front_outputs, list) and len(front_outputs) > 0 and isinstance(front_outputs[0], dict)):
-        raise RuntimeError("Front inference did not return expected outputs[0] dict")
-    front_result = front_outputs[0]
+    front_result, front_subject_meta, subject_error = _select_single_subject(front_outputs, "front")
+    if subject_error:
+        _write_quality_report(quality_report_path, make_quality_report(args.validation_policy, [subject_error], stage="front_subject_selection", front_subject=front_subject_meta))
+        raise RuntimeError(f"Front subject selection failed: {subject_error}. See {quality_report_path}")
 
     # ---- run side ----
     print("\nRunning side image...")
@@ -2730,11 +2842,15 @@ def main():
         bbox_thr=0.8,
         use_mask=use_sam_mask,
     )
-    if not (isinstance(side_outputs, list) and len(side_outputs) > 0 and isinstance(side_outputs[0], dict)):
-        raise RuntimeError("Side inference did not return expected outputs[0] dict")
-    side_result = side_outputs[0]
+    side_result, side_subject_meta, subject_error = _select_single_subject(side_outputs, "side")
+    if subject_error:
+        _write_quality_report(quality_report_path, make_quality_report(args.validation_policy, [subject_error], stage="side_subject_selection", side_subject=side_subject_meta))
+        raise RuntimeError(f"Side subject selection failed: {subject_error}. See {quality_report_path}")
 
+    front_image_bgr = cv2.imread(front_image_path)
     side_image_bgr = cv2.imread(side_image_path)
+    if front_image_bgr is None:
+        raise FileNotFoundError(f"Could not read front image: {front_image_path}")
     if side_image_bgr is None:
         raise FileNotFoundError(f"Could not read side image: {side_image_path}")
 
@@ -2743,6 +2859,14 @@ def main():
         if args.side_mask
         else result_mask_to_binary(side_result, side_image_bgr.shape)
     )
+    front_mask = result_mask_to_binary(front_result, front_image_bgr.shape)
+    input_errors = validate_result(front_result, front_mask, "front")
+    input_errors.extend(validate_result(side_result, side_mask, "side"))
+    if input_errors:
+        report = make_quality_report(args.validation_policy, input_errors, stage="input_validation")
+        _write_quality_report(quality_report_path, report)
+        if args.validation_policy == "strict":
+            raise RuntimeError(f"Fusion input validation failed: {', '.join(input_errors)}. See {quality_report_path}")
     side_mask_path, side_sdf_path, side_sdf_vis_path = save_mask_and_sdf(
         side_mask,
         output_dir,
@@ -2802,6 +2926,7 @@ def main():
     print(f"  bust anchor  : {float(np.asarray(side_anchor_meta.get('bust_anchor_pct', 0.0)).item()):.4f} (SDF)")
     print(f"  hip anchor   : {float(np.asarray(side_anchor_meta.get('hip_anchor_pct', 0.0)).item()):.4f} (SDF)")
     print(f"  lower chest  : {float(np.asarray(side_anchor_meta.get('lower_chest_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('lower_chest_source', 'unknown')).item()})")
+    print(f"  torso lower  : {float(np.asarray(side_anchor_meta.get('torso_lower_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('torso_lower_source', 'unknown')).item()})")
     print(f"  shoulder line: {float(np.asarray(side_anchor_meta.get('shoulder_line_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('shoulder_line_source', 'unknown')).item()})")
 
     side_anchor_debug_mask_path = save_side_anchor_debug_mask(
@@ -2912,6 +3037,16 @@ def main():
         side_upright = (side_upright.astype(np.float64) @ yaw_rotation.T).astype(np.float32)
     print(f"  yaw normalisation     : {yaw_meta['reason']} ({yaw_meta['yaw_degrees']:.2f} deg)")
 
+    front_pose_joints = np.asarray(front_result.get("pred_joint_coords"), dtype=np.float64)
+    if front_pose_joints.ndim != 2 or front_pose_joints.shape[1] != 3:
+        raise RuntimeError("Front inference has no valid posed pred_joint_coords for fused joint transfer")
+    front_pose_joints_upright = (
+        (front_pose_joints - front_oriented["centroid"]) @ front_oriented["rotation_matrix"].T
+    ) @ yaw_rotation.T
+    fusion_joint_bind_indices, fusion_joint_bind_weights, fusion_joint_bind_distances = bind_posed_joints_to_topology(
+        front_pose_joints_upright, front_upright
+    )
+
     print("\nFront mesh:")
     print(f"  estimated up direction : {front_oriented['estimated_up_direction']}")
     print(f"  height before rotation : {float(front_oriented['height_before']):.6f}")
@@ -2927,15 +3062,33 @@ def main():
     print(f"  height before rotation : {float(side_oriented['height_before']):.6f}")
     print(f"  height after rotation  : {float(side_oriented['height_after']):.6f}")
 
-    # ---- align side to front in canonical space ----
-    side_no_sdf_aligned, R_align_no_sdf, front_centroid_no_sdf, side_centroid_no_sdf = kabsch_align_vertices(
+    # ---- robust torso-only similarity alignment in canonical space ----
+    front_kps_canonical = _canonical_keypoints(front_result["pred_keypoints_3d"], front_oriented, yaw_rotation)
+    side_kps_canonical = _canonical_keypoints(side_result["pred_keypoints_3d"], side_oriented, yaw_rotation)
+    torso_mask = torso_mask_from_landmarks(front_upright, front_kps_canonical)
+    if torso_mask.sum() < 20:
+        quality_error = ["insufficient_torso_correspondences"]
+        _write_quality_report(quality_report_path, make_quality_report(args.validation_policy, quality_error, stage="alignment"))
+        if args.validation_policy == "strict":
+            raise RuntimeError(f"Fusion alignment validation failed: {quality_error[0]}. See {quality_report_path}")
+        torso_mask = np.ones(len(front_upright), dtype=bool)
+    side_no_sdf_aligned, align_transform_no_sdf = similarity_align(side_no_sdf_upright, front_upright, torso_mask)
+    side_aligned, align_transform = similarity_align(side_upright, front_upright, torso_mask)
+    alignment_quality = alignment_report(
         front_upright,
-        side_no_sdf_upright,
+        side_aligned,
+        torso_mask,
+        float(front_oriented["height_after"]),
+        align_transform,
     )
-    side_aligned, R_align, front_centroid, side_centroid = kabsch_align_vertices(
-        front_upright,
-        side_upright,
-    )
+    alignment_errors = list(alignment_quality["errors"])
+    if alignment_errors:
+        _write_quality_report(
+            quality_report_path,
+            make_quality_report(args.validation_policy, input_errors + alignment_errors, stage="alignment", alignment=alignment_quality),
+        )
+        if args.validation_policy == "strict":
+            raise RuntimeError(f"Fusion alignment validation failed: {', '.join(alignment_errors)}. See {quality_report_path}")
 
     align_dist_no_sdf = np.linalg.norm(side_no_sdf_aligned - front_upright, axis=1)
     align_dist = np.linalg.norm(side_aligned - front_upright, axis=1)
@@ -2987,6 +3140,35 @@ def main():
         f"hip x{float(profile_depth_meta['hip_scale']):.3f}"
     )
 
+    # Validate the actual fused surface against both source silhouettes.  The
+    # inverse transforms preserve each estimator's original camera convention.
+    front_fused_raw = _inverse_front_canonical(fused_vertices, front_oriented, yaw_rotation)
+    side_fused_raw = _inverse_side_canonical(fused_vertices, side_oriented, yaw_rotation, align_transform)
+    front_projection = projected_silhouette(
+        front_fused_raw, estimator.faces, front_result.get("pred_cam_t"), front_result.get("focal_length"), front_image_bgr.shape
+    )
+    side_projection = projected_silhouette(
+        side_fused_raw, estimator.faces, side_result.get("pred_cam_t"), side_result.get("focal_length"), side_image_bgr.shape
+    )
+    front_silhouette_quality = silhouette_report(front_projection, front_mask)
+    side_silhouette_quality = silhouette_report(side_projection, side_mask)
+    silhouette_errors = list(front_silhouette_quality["errors"]) + list(side_silhouette_quality["errors"])
+    all_quality_errors = input_errors + alignment_errors + silhouette_errors
+    quality_report = make_quality_report(
+        args.validation_policy,
+        all_quality_errors,
+        alignment=alignment_quality,
+        front_silhouette=front_silhouette_quality,
+        side_silhouette=side_silhouette_quality,
+        side_profile_moved_vertices=side_sdf_moved_count,
+        side_profile_max_push_cm=side_sdf_max_push_cm,
+        front_subject=front_subject_meta,
+        side_subject=side_subject_meta,
+    )
+    _write_quality_report(quality_report_path, quality_report)
+    if all_quality_errors and args.validation_policy == "strict":
+        raise RuntimeError(f"Fusion quality validation failed: {', '.join(sorted(set(all_quality_errors)))}. See {quality_report_path}")
+
     # ---- scale fused mesh to requested height ----
     target_height_cm = float(args.target_height)
     target_height_m = target_height_cm / 100.0
@@ -3022,6 +3204,13 @@ def main():
     no_sdf_result_scaled["fusion_side_sdf_profile_reason"] = np.array("not_applied_no_sdf_reference", dtype=object)
 
     no_sdf_clad_vertices = sam_upright_vertices_to_clad_canonical(fused_vertices_no_sdf_scaled)
+    no_sdf_front_reference_clad = sam_upright_vertices_to_clad_canonical(
+        (front_upright.astype(np.float64) * float(no_sdf_scale_factor)).astype(np.float32)
+    )
+    no_sdf_joint_coords_clad = sam_upright_points_to_clad_canonical(
+        front_pose_joints_upright * float(no_sdf_scale_factor),
+        front_upright.astype(np.float64) * float(no_sdf_scale_factor),
+    )
     no_sdf_clad_obj = os.path.join(output_dir, "front_fused_no_sdf_clad_geometry.obj")
     no_sdf_clad_render = os.path.join(output_dir, "front_fused_no_sdf_clad_render.png")
     no_sdf_params_json = os.path.join(output_dir, "front_fused_no_sdf_all_body_params_scaled.json")
@@ -3030,6 +3219,12 @@ def main():
         bool(float(args.profile_depth_correction_strength) > 0.0),
     )
     no_sdf_result_scaled["fusion_vertices_clad"] = no_sdf_clad_vertices.astype(np.float32)
+    no_sdf_result_scaled["fusion_front_reference_vertices_clad"] = no_sdf_front_reference_clad.astype(np.float32)
+    no_sdf_result_scaled["fusion_joint_coords_clad"] = no_sdf_joint_coords_clad.astype(np.float32)
+    no_sdf_result_scaled["fusion_joint_bind_indices"] = fusion_joint_bind_indices
+    no_sdf_result_scaled["fusion_joint_bind_weights"] = fusion_joint_bind_weights
+    no_sdf_result_scaled["fusion_joint_bind_nearest_distance_m"] = fusion_joint_bind_distances * float(no_sdf_scale_factor)
+    no_sdf_result_scaled["fusion_joint_order"] = np.array("sam3d_mhr_pred_joint_coords_127", dtype=object)
     no_sdf_result_scaled["fusion_faces_clad"] = np.asarray(estimator.faces, dtype=np.int32)
     no_sdf_result_scaled["fusion_vertices_clad_coordinate_system"] = np.array(
         "x_lateral_y_profile_z_up_meters",
@@ -3099,6 +3294,13 @@ def main():
     fused_result_scaled["fusion_no_sdf_reference_clad_render_path"] = np.array(no_sdf_clad_render, dtype=object)
 
     fused_clad_vertices = sam_upright_vertices_to_clad_canonical(fused_vertices_scaled)
+    fused_front_reference_clad = sam_upright_vertices_to_clad_canonical(
+        (front_upright.astype(np.float64) * float(scale_factor)).astype(np.float32)
+    )
+    fused_joint_coords_clad = sam_upright_points_to_clad_canonical(
+        front_pose_joints_upright * float(scale_factor),
+        front_upright.astype(np.float64) * float(scale_factor),
+    )
     fused_clad_obj = os.path.join(output_dir, "front_fused_clad_geometry.obj")
     fused_clad_render = os.path.join(output_dir, "front_fused_final_clad_render.png")
     save_mesh_obj(fused_clad_vertices, estimator.faces, fused_clad_obj)
@@ -3106,6 +3308,12 @@ def main():
         bool(float(args.profile_depth_correction_strength) > 0.0),
     )
     fused_result_scaled["fusion_vertices_clad"] = fused_clad_vertices.astype(np.float32)
+    fused_result_scaled["fusion_front_reference_vertices_clad"] = fused_front_reference_clad.astype(np.float32)
+    fused_result_scaled["fusion_joint_coords_clad"] = fused_joint_coords_clad.astype(np.float32)
+    fused_result_scaled["fusion_joint_bind_indices"] = fusion_joint_bind_indices
+    fused_result_scaled["fusion_joint_bind_weights"] = fusion_joint_bind_weights
+    fused_result_scaled["fusion_joint_bind_nearest_distance_m"] = fusion_joint_bind_distances * float(scale_factor)
+    fused_result_scaled["fusion_joint_order"] = np.array("sam3d_mhr_pred_joint_coords_127", dtype=object)
     fused_result_scaled["fusion_faces_clad"] = np.asarray(estimator.faces, dtype=np.int32)
     fused_result_scaled["fusion_vertices_clad_coordinate_system"] = np.array(
         "x_lateral_y_profile_z_up_meters",
@@ -3127,6 +3335,9 @@ def main():
         f"front_xy_{side_sdf_rule_part}side_z_profile_depth_full_fused_clad",
         dtype=object,
     )
+    fused_result_scaled["fusion_quality_report_path"] = np.array(quality_report_path, dtype=object)
+    fused_result_scaled["fusion_quality_status"] = np.array(quality_report["status"], dtype=object)
+    fused_result_scaled["fusion_quality_errors"] = np.asarray(quality_report["errors"], dtype=object)
 
     fused_params_json = os.path.join(output_dir, "front_fused_all_body_params_scaled.json")
     save_result_json(fused_result_scaled, fused_params_json)

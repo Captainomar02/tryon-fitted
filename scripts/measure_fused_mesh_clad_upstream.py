@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +29,94 @@ from clad_body.load.mhr import MhrBody, load_mhr_from_params  # noqa: E402
 from clad_body.measure import measure  # noqa: E402
 from clad_body.measure._render import render_4view  # noqa: E402
 import clad_body.measure._lengths as upstream_lengths  # noqa: E402
+
+
+_MHR_SKINNING_CACHE: dict[str, Any] | None = None
+_MHR_JOINT_NAMES_CACHE: list[str] | None = None
+
+
+def _mhr_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("torch")
+        if spec and spec.origin:
+            torch_lib = Path(spec.origin).resolve().parent / "lib"
+            current = env.get("LD_LIBRARY_PATH", "")
+            if str(torch_lib) not in current.split(":"):
+                env["LD_LIBRARY_PATH"] = f"{torch_lib}:{current}" if current else str(torch_lib)
+    except Exception:
+        pass
+    return env
+
+
+def _mhr_joint_names() -> list[str] | None:
+    global _MHR_JOINT_NAMES_CACHE
+    if _MHR_JOINT_NAMES_CACHE is not None:
+        return _MHR_JOINT_NAMES_CACHE
+    script = """
+import json
+import pymomentum.geometry  # noqa: F401
+from mhr.mhr import MHR
+model = MHR.from_files(device='cpu', wants_pose_correctives=False)
+print(json.dumps(list(model.character_torch.skeleton.joint_names)), flush=True)
+"""
+    try:
+        result = subprocess.run([sys.executable, "-c", script], cwd=str(REPO_ROOT), env=_mhr_subprocess_env(), capture_output=True, text=True, timeout=120)
+        if result.stdout:
+            names = json.loads(result.stdout.strip().splitlines()[-1])
+            _MHR_JOINT_NAMES_CACHE = [str(name) for name in names]
+            return _MHR_JOINT_NAMES_CACHE
+    except Exception:
+        pass
+    return None
+
+
+def _mhr_skinning_data() -> dict[str, Any] | None:
+    """Load the exact MHR vertex-to-joint weights for the 127-joint order."""
+    global _MHR_SKINNING_CACHE
+    if _MHR_SKINNING_CACHE is not None:
+        return _MHR_SKINNING_CACHE
+    script = """
+import os
+import sys
+import numpy as np
+import pymomentum.geometry  # noqa: F401
+from mhr.mhr import MHR
+model = MHR.from_files(device='cpu', wants_pose_correctives=False)
+lbs = model.character_torch.linear_blend_skinning
+names = np.asarray(model.character_torch.skeleton.joint_names)
+vi = lbs.vert_indices_flattened.cpu().numpy().copy()
+ji = lbs.skin_indices_flattened.cpu().numpy().copy()
+wt = lbs.skin_weights_flattened.cpu().numpy().copy()
+n = np.asarray([lbs.num_vertices])
+np.savez(sys.argv[1], names=names, vi=vi, ji=ji, wt=wt, n=n)
+os._exit(0)
+"""
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as sf:
+        sf.write(script)
+        script_path = sf.name
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as nf:
+        data_path = nf.name
+    try:
+        result = subprocess.run([sys.executable, script_path, data_path], cwd=str(REPO_ROOT), env=_mhr_subprocess_env(), capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            print(f"[measure-fused] MHR skinning unavailable (exit {result.returncode}): {result.stderr[-600:] or result.stdout[-600:]}", file=sys.stderr)
+            return None
+        data = np.load(data_path, allow_pickle=False)
+        _MHR_SKINNING_CACHE = {
+            "names": [str(name) for name in data["names"].tolist()],
+            "vi": data["vi"].astype(np.int64), "ji": data["ji"].astype(np.int64),
+            "wt": data["wt"].astype(np.float64), "vertex_count": int(data["n"][0]),
+        }
+        return _MHR_SKINNING_CACHE
+    except Exception as exc:
+        print(f"[measure-fused] MHR skinning unavailable: {exc}", file=sys.stderr)
+        return None
+    finally:
+        for path in (script_path, data_path):
+            try: os.unlink(path)
+            except OSError: pass
 
 
 def scalar(value: Any, default: Any = None) -> Any:
@@ -147,6 +238,336 @@ def transform_front_joints(params_path: Path, height_m: float, yaw_rotation: np.
     transform["yaw_post_rotation_xy_center_m"] = yaw_center_xy.tolist()
     return joints, transform
 
+
+def transfer_joints_to_fused_mesh(
+    joints: dict[str, np.ndarray],
+    reference_vertices: np.ndarray | None,
+    fused_vertices: np.ndarray,
+    height_m: float,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Carry front MHR landmarks through the saved same-topology fusion field.
+
+    Joints remain skeletal (they are not snapped to skin).  A compact Gaussian
+    neighbourhood over corresponding vertices transfers the local fused depth
+    edit while avoiding a global, unrelated surface displacement.
+    """
+    meta: dict[str, Any] = {"enabled": False, "reason": "missing_reference", "joints": {}}
+    if reference_vertices is None:
+        return joints, meta
+    ref = np.asarray(reference_vertices, dtype=np.float64)
+    fused = np.asarray(fused_vertices, dtype=np.float64)
+    if ref.shape != fused.shape or ref.ndim != 2 or ref.shape[1] != 3:
+        meta["reason"] = "reference_topology_mismatch"
+        return joints, meta
+    delta = fused - ref
+    radius = max(0.04, 0.09 * float(height_m))
+    max_shift = max(0.08, 0.15 * float(height_m))
+    transferred: dict[str, np.ndarray] = {}
+    invalid: list[str] = []
+    for name, point in joints.items():
+        p = np.asarray(point, dtype=np.float64)
+        distances = np.linalg.norm(ref - p[None, :], axis=1)
+        indices = np.argpartition(distances, min(63, len(distances) - 1))[: min(64, len(distances))]
+        local_dist = distances[indices]
+        weights = np.exp(-0.5 * (local_dist / radius) ** 2)
+        if float(weights.sum()) < 1e-8:
+            shift = np.zeros(3, dtype=np.float64)
+        else:
+            shift = np.sum(delta[indices] * weights[:, None], axis=0) / float(weights.sum())
+        magnitude = float(np.linalg.norm(shift))
+        accepted = magnitude <= max_shift
+        if not accepted:
+            invalid.append(name)
+            shift[:] = 0.0
+        transferred[name] = (p + shift).astype(np.float32)
+        meta["joints"][name] = {
+            "displacement_m": float(magnitude),
+            "nearest_reference_distance_m": float(local_dist.min()),
+            "accepted": accepted,
+        }
+    meta.update({
+        "enabled": True,
+        "reason": "ok" if not invalid else "implausible_joint_displacement",
+        "radius_m": radius,
+        "max_accepted_displacement_m": max_shift,
+        "invalid_joints": invalid,
+    })
+    return transferred, meta
+
+
+def transfer_posed_joints_by_skinning(
+    posed_joints: np.ndarray,
+    reference_vertices: np.ndarray | None,
+    fused_vertices: np.ndarray,
+    height_m: float,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Transfer all posed SAM3D joints through same-index fused deformation."""
+    meta: dict[str, Any] = {"enabled": False, "method": "mhr_lbs_same_topology_deformation", "joints": {}, "invalid_joints": []}
+    skinning = _mhr_skinning_data()
+    joints = np.asarray(posed_joints, dtype=np.float64)
+    if skinning is None or reference_vertices is None:
+        meta["reason"] = "missing_skinning_or_reference"
+        return {}, meta
+    ref, fused = np.asarray(reference_vertices, dtype=np.float64), np.asarray(fused_vertices, dtype=np.float64)
+    names = skinning["names"]
+    if ref.shape != fused.shape or len(ref) != skinning["vertex_count"] or joints.shape != (len(names), 3):
+        meta["reason"] = "posed_joint_or_topology_mismatch"
+        return {}, meta
+    delta = fused - ref
+    vi, ji, wt = skinning["vi"], skinning["ji"], skinning["wt"]
+    result: dict[str, np.ndarray] = {}
+    max_shift = 0.12 * float(height_m)
+    for index, name in enumerate(names):
+        rows = ji == index
+        vertices, weights = vi[rows], wt[rows]
+        weight_sum = float(weights.sum())
+        support = int(np.count_nonzero(weights > 0.01))
+        valid = support >= 4 and weight_sum > 1e-6
+        shift = np.sum(delta[vertices] * weights[:, None], axis=0) / weight_sum if valid else np.zeros(3)
+        magnitude = float(np.linalg.norm(shift))
+        if magnitude > max_shift:
+            valid = False
+            shift[:] = 0.0
+        result[name] = (joints[index] + shift).astype(np.float32)
+        meta["joints"][name] = {"index": index, "support_vertices": support, "support_weight": weight_sum, "displacement_m": magnitude, "accepted": bool(valid)}
+        if not valid:
+            meta["invalid_joints"].append(name)
+    meta.update({"enabled": True, "reason": "ok" if not meta["invalid_joints"] else "invalid_joint_support", "joint_count": len(names), "max_accepted_displacement_m": max_shift})
+    return result, meta
+
+
+def transfer_posed_joints_by_saved_bindings(
+    posed_joints: np.ndarray,
+    bind_indices: np.ndarray,
+    bind_weights: np.ndarray,
+    reference_vertices: np.ndarray | None,
+    fused_vertices: np.ndarray,
+    height_m: float,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Apply the fusion deformation through bindings made in the same posed mesh."""
+    meta: dict[str, Any] = {"enabled": False, "method": "sam3d_posed_same_topology_vertex_bindings", "joints": {}, "invalid_joints": []}
+    points = np.asarray(posed_joints, dtype=np.float64)
+    indices, weights = np.asarray(bind_indices, dtype=np.int64), np.asarray(bind_weights, dtype=np.float64)
+    if reference_vertices is None:
+        meta["reason"] = "missing_reference"
+        return {}, meta
+    ref, fused = np.asarray(reference_vertices, dtype=np.float64), np.asarray(fused_vertices, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3 or indices.shape != weights.shape or indices.shape[0] != len(points) or ref.shape != fused.shape:
+        meta["reason"] = "binding_shape_mismatch"
+        return {}, meta
+    if np.any(indices < 0) or np.any(indices >= len(ref)):
+        meta["reason"] = "binding_index_out_of_range"
+        return {}, meta
+    delta = fused - ref
+    names = _mhr_joint_names() or [f"joint_{i}" for i in range(len(points))]
+    result: dict[str, np.ndarray] = {}
+    max_shift = 0.12 * float(height_m)
+    for i, name in enumerate(names):
+        w = np.maximum(weights[i], 0.0)
+        total = float(w.sum())
+        shift = np.sum(delta[indices[i]] * w[:, None], axis=0) / total if total > 1e-8 else np.zeros(3)
+        magnitude = float(np.linalg.norm(shift))
+        valid = total > 0.99 and magnitude <= max_shift
+        if not valid:
+            shift[:] = 0.0
+            meta["invalid_joints"].append(name)
+        result[name] = (points[i] + shift).astype(np.float32)
+        meta["joints"][name] = {"index": i, "support_vertices": int(len(indices[i])), "support_weight": total, "displacement_m": magnitude, "accepted": bool(valid)}
+    meta.update({"enabled": True, "reason": "ok" if not meta["invalid_joints"] else "invalid_joint_binding", "joint_count": len(points), "max_accepted_displacement_m": max_shift})
+    return result, meta
+
+
+def shoulder_neck_surface_anchor(vertices: np.ndarray, left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Locate the posterior neck base between two validated acromions."""
+    points = np.asarray(vertices, dtype=np.float64)
+    height = float(np.ptp(points[:, 2]))
+    if height <= 0:
+        return None, {"reason": "invalid_mesh_height"}
+    left, right = np.asarray(left, dtype=np.float64), np.asarray(right, dtype=np.float64)
+    midpoint = (left + right) * 0.5
+    shoulder_top = max(float(left[2]), float(right[2]))
+    candidates = points[
+        (np.abs(points[:, 0] - midpoint[0]) <= 0.035 * height)
+        & (points[:, 2] >= shoulder_top)
+        & (points[:, 2] <= shoulder_top + 0.020 * height)
+    ]
+    if len(candidates) < 8:
+        return None, {"reason": "neck_base_surface_region_missing"}
+    # Restrict to the posterior portion of the neck band, then take the
+    # highest point in it.  This excludes the low upper-back surface and the
+    # head/face while retaining the actual neck-base transition.
+    posterior = candidates[candidates[:, 1] >= np.quantile(candidates[:, 1], 0.80)]
+    point = posterior[int(np.argmax(posterior[:, 2]))].copy()
+    point[0] = midpoint[0]
+    return point, {
+        "reason": "posterior_neck_base_between_acromions",
+        "shoulder_top_z_m": shoulder_top,
+        "search_count": int(len(candidates)),
+    }
+
+
+def surface_landmarks_from_skeleton(vertices: np.ndarray, skeletal: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Find anatomically constrained C7 and acromion points on fused skin.
+
+    C7 is a posterior *mid-neck* landmark.  It must not drift onto the
+    shoulder cap merely because that is the nearest visible surface.  The
+    acromions, conversely, are the lateral shoulder caps themselves and must
+    not be pushed backwards onto the scapular surface.
+    """
+    from clad_body.measure.mhr import find_acromion
+    out = dict(skeletal)
+    meta: dict[str, Any] = {"method": "fused_topology_surface_landmarks", "landmarks": {}, "invalid": []}
+    points = np.asarray(vertices, dtype=np.float64)
+    height = float(np.ptp(points[:, 2]))
+    c7 = skeletal.get("c7")
+    acromions: dict[str, np.ndarray] = {}
+    for prefix, side in (("l", "left"), ("r", "right")):
+        key = f"{prefix}_shoulder"
+        seed = skeletal.get(key)
+        acromion = find_acromion(vertices, seed, side=side) if seed is not None else None
+        if acromion is None or seed is None or height <= 0:
+            meta["invalid"].append(key)
+            continue
+        acromion = np.asarray(acromion, dtype=np.float64)
+        seed = np.asarray(seed, dtype=np.float64)
+        sign = 1.0 if side == "left" else -1.0
+        lateral = sign * (acromion[0] - seed[0])
+        plausible = lateral >= -0.005 and abs(acromion[2] - seed[2]) <= 0.06 * height
+        if not plausible:
+            meta["invalid"].append(key)
+            continue
+        # find_acromion already returns the actual outer shoulder skin point.
+        # Do not project it to the back surface: that was the source of the
+        # visibly rearward shoulder endpoints in the render.
+        out[key] = acromion.astype(np.float32)
+        acromions[key] = acromion
+        meta["landmarks"][key] = {
+            "type": "lateral_acromion_surface",
+            "accepted": True,
+            "point_m": acromion.tolist(),
+            "seed_distance_m": float(np.linalg.norm(acromion - seed)),
+            "lateral_offset_m": float(lateral),
+        }
+    c7_surface = None
+    c7_meta: dict[str, Any] = {}
+    if {"l_shoulder", "r_shoulder"} <= set(acromions):
+        c7_surface, c7_meta = shoulder_neck_surface_anchor(vertices, acromions["l_shoulder"], acromions["r_shoulder"])
+    if c7_surface is None:
+        meta["invalid"].append("c7")
+    else:
+        out["c7"] = c7_surface.astype(np.float32)
+        meta["landmarks"]["c7"] = {
+            "type": "posterior_neck_base_surface",
+            "accepted": True,
+            "point_m": c7_surface.tolist(),
+            "skeletal_seed_distance_m": float(np.linalg.norm(c7_surface - np.asarray(c7))) if c7 is not None else None,
+            **c7_meta,
+        }
+    meta["enabled"] = not meta["invalid"]
+    return out, meta
+
+
+def measure_hps_to_crotch_front_surface(
+    joints: dict[str, np.ndarray], mesh: trimesh.Trimesh, crotch_z: float, step: float = 0.005,
+) -> tuple[float, np.ndarray | None, dict[str, Any]]:
+    """Use CLAD's original ISO side-neck and convex front-surface trace.
+
+    The original implementation is deliberate: it starts at the neck-base
+    side-neck point, skips unstable shoulder-cap slices, and takes a lower
+    convex hull over the chest and stomach profile.  The prior replacement
+    re-invented this logic from shoulder-joint locations and consequently
+    started on the shoulder instead of the neck.
+    """
+    from clad_body.measure._slicer import MeshSlicer
+
+    if joints.get("c7") is None or crotch_z <= 0:
+        return 0.0, None, {"confidence": "low", "reason": "missing_neck_or_crotch"}
+    shoulder = joints.get("l_shoulder")
+    if shoulder is None:
+        return 0.0, None, {"confidence": "low", "reason": "missing_left_shoulder"}
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    height = float(np.ptp(vertices[:, 2]))
+    if height <= 0:
+        return 0.0, None, {"confidence": "low", "reason": "invalid_mesh_height"}
+    slicer = MeshSlicer(mesh)
+    shoulder = np.asarray(shoulder, dtype=np.float64)
+    # Follow the lateral silhouette upward from the acromion.  Use the inner
+    # part of the shoulder-to-neck contraction so the tape starts beside the
+    # neck and captures the main front torso, rather than riding near the
+    # shoulder cap like a sleeve seam.
+    zs = np.arange(float(shoulder[2]) + 0.002 * height, float(shoulder[2]) + 0.060 * height, 0.003)
+    samples: list[tuple[float, float, float]] = []
+    for z in zs:
+        contours = slicer.contours_at_z(float(z))
+        if not contours:
+            continue
+        points = np.vstack([np.asarray(contour[0], dtype=np.float64) for contour in contours])
+        side_points = points[points[:, 0] > 0]
+        if len(side_points) < 2:
+            continue
+        edge_x = float(side_points[:, 0].max())
+        edge = side_points[side_points[:, 0] >= edge_x - 0.010 * height]
+        samples.append((float(z), edge_x, float(edge[:, 1].min())))
+    if len(samples) < 5:
+        return 0.0, None, {"confidence": "low", "reason": "neck_transition_slices_missing"}
+    sample_array = np.asarray(samples, dtype=np.float64)
+    edge_start, edge_min = float(sample_array[0, 1]), float(sample_array[:, 1].min())
+    neck_contraction = 0.70
+    target_edge = edge_start - neck_contraction * (edge_start - edge_min)
+    transition_index = int(np.flatnonzero(sample_array[:, 1] <= target_edge)[0]) if np.any(sample_array[:, 1] <= target_edge) else int(np.argmin(abs(sample_array[:, 1] - target_edge)))
+    side_neck = np.asarray([sample_array[transition_index, 1], sample_array[transition_index, 2], sample_array[transition_index, 0]], dtype=np.float64)
+
+    # Delegate the front chest/stomach curvature to the upstream routine.  It
+    # skips the unstable shoulder cap and applies its established lower convex
+    # hull, but receives the anatomically corrected side-neck start above.
+    original_finder = upstream_lengths.find_side_neck_point
+    upstream_lengths.find_side_neck_point = lambda _slicer, _c7_z: side_neck.copy()
+    try:
+        length_cm, trace = upstream_lengths.measure_shirt_length(
+            joints, mesh, crotch_z, measurements=None, step=step, end_offset=0.0,
+        )
+    finally:
+        upstream_lengths.find_side_neck_point = original_finder
+    if trace is None or len(trace) < 3 or length_cm <= 0:
+        return 0.0, None, {"confidence": "low", "reason": "original_clad_side_neck_trace_failed"}
+    return float(length_cm), np.asarray(trace, dtype=np.float32), {
+        "confidence": "high",
+        "reason": "shoulder_to_neck_transition_then_original_clad_front_convex_hull",
+        "rendered_side": "left",
+        "start_point_m": np.asarray(trace[0], dtype=np.float64).tolist(),
+        "shoulder_to_neck_contraction": neck_contraction,
+        "shoulder_edge_x_m": edge_start,
+        "neck_edge_x_m": edge_min,
+        "trace_count": 1,
+    }
+
+
+def _canonical_clad_joints(all_joints: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    from clad_body.measure.mhr import MHR_JOINT_MAP
+    result: dict[str, np.ndarray] = {}
+    for canonical, candidates in MHR_JOINT_MAP.items():
+        for name in candidates:
+            if name in all_joints:
+                result[canonical] = all_joints[name]
+                break
+    return result
+
+
+def suppress_measurements_for_invalid_joints(measurements: dict[str, Any], joint_meta: dict[str, Any], surface_meta: dict[str, Any]) -> list[str]:
+    """Keep torso outputs while removing values whose required landmarks failed."""
+    invalid = set(joint_meta.get("invalid_joints", [])) | set(surface_meta.get("invalid", []))
+    suppressed: list[str] = []
+    if {"c_neck", "l_uparm", "r_uparm", "c7", "l_shoulder", "r_shoulder"} & invalid:
+        for key in ("shoulder_width_cm", "shirt_length_cm", "regular_tshirt_length_cm", "hps_to_crotch_cm"):
+            if key in measurements:
+                measurements.pop(key, None)
+                suppressed.append(key)
+    if {"l_lowarm", "r_lowarm", "l_wrist", "r_wrist"} & invalid:
+        if "sleeve_length_cm" in measurements:
+            measurements.pop("sleeve_length_cm", None)
+            suppressed.append("sleeve_length_cm")
+    return suppressed
+
 def fused_body(source: Path, height_cm: float | None) -> tuple[MhrBody, dict[str, Any], dict[str, Any]]:
     raw_vertices, faces, params = read_source(source)
     if not params:
@@ -157,7 +578,34 @@ def fused_body(source: Path, height_cm: float | None) -> tuple[MhrBody, dict[str
     yaw_rotation = np.asarray(raw_yaw, dtype=np.float32) if raw_yaw is not None else None
     if yaw_rotation is not None and yaw_rotation.shape != (3, 3):
         yaw_rotation = None
-    joints, front_transform = transform_front_joints(source, height_m, yaw_rotation)
+    reference_raw = params.get("fusion_front_reference_vertices_clad")
+    posed_raw = params.get("fusion_joint_coords_clad")
+    bind_indices_raw = params.get("fusion_joint_bind_indices")
+    bind_weights_raw = params.get("fusion_joint_bind_weights")
+    reference_vertices = None
+    if reference_raw is not None:
+        try:
+            reference_vertices, reference_transform = canonicalize_with_transform(np.asarray(reference_raw, dtype=np.float32), height_m)
+        except Exception:
+            reference_vertices = None
+            reference_transform = None
+    else:
+        reference_transform = None
+    if posed_raw is None or bind_indices_raw is None or bind_weights_raw is None or reference_transform is None:
+        all_joints, joint_transfer = {}, {"enabled": False, "reason": "missing_fusion_joint_coords"}
+    else:
+        posed = np.asarray(posed_raw, dtype=np.float32).copy()
+        posed *= float(reference_transform["scale"])
+        posed[:, 2] -= float(reference_transform["z_offset_m"])
+        posed[:, :2] -= np.asarray(reference_transform["xy_center_offset_m"], dtype=np.float32)
+        all_joints, joint_transfer = transfer_posed_joints_by_saved_bindings(
+            posed, np.asarray(bind_indices_raw), np.asarray(bind_weights_raw), reference_vertices, vertices, height_m
+        )
+    joints = _canonical_clad_joints(all_joints)
+    joints, surface_landmarks = surface_landmarks_from_skeleton(vertices, joints) if joints else (joints, {"enabled": False, "invalid": ["all"]})
+    params["_fused_joint_transfer"] = joint_transfer
+    params["_fused_joint_landmarks"] = surface_landmarks
+    params["_fused_joint_coords"] = all_joints
     body = MhrBody(
         mesh=trimesh.Trimesh(vertices=vertices, faces=faces, process=False),
         source=f"fused_sdf_with_front_mhr_joints:{source.name}",
@@ -165,7 +613,7 @@ def fused_body(source: Path, height_cm: float | None) -> tuple[MhrBody, dict[str
         sam3d_params=params,
         joints=joints,
     )
-    return body, fused_transform, front_transform
+    return body, fused_transform, {"source": "saved_sam3d_posed_joint_coords"}
 
 
 
@@ -320,6 +768,49 @@ def apply_surface_sleeve_length(measurements: dict[str, Any], body: MhrBody) -> 
         debug_joints[f"{prefix}_shoulder"] = shown[2][0].astype(np.float32)
         debug_joints[f"{prefix}_elbow"] = shown[2][1].astype(np.float32)
         debug_joints[f"{prefix}_wrist"] = shown[2][2].astype(np.float32)
+
+
+def apply_surface_shoulder_width(measurements: dict[str, Any], body: MhrBody) -> None:
+    """Measure the upper shoulder seam through a visible neck-centre anchor.
+
+    The anatomical C7 joint can sit below both shoulder caps.  It remains in
+    the saved skeleton, but is not suitable as the control point for this
+    garment shoulder line.  Instead, find the posterior neck/shoulder
+    transition on the fused surface and require it to be at shoulder height
+    or higher.
+    """
+    if not body.joints or not {"l_shoulder", "r_shoulder"} <= set(body.joints):
+        return
+    left = np.asarray(body.joints["l_shoulder"], dtype=np.float64)
+    right = np.asarray(body.joints["r_shoulder"], dtype=np.float64)
+    height = float(np.ptp(np.asarray(body.mesh.vertices)[:, 2]))
+    if height <= 0:
+        return
+    neck_anchor, _ = shoulder_neck_surface_anchor(np.asarray(body.mesh.vertices), left, right)
+    if neck_anchor is None:
+        # Do not silently reintroduce a sagging centre when neck geometry is
+        # missing: use a conservative raised midpoint and record the fallback.
+        neck_anchor = (left + right) * 0.5
+        neck_anchor[2] = max(float(left[2]), float(right[2])) + 0.008 * height
+
+    # Two shallow quadratic segments preserve a genuine neck-centre curve
+    # while making it impossible for the shoulder path to drape downward.
+    left_control = (left + neck_anchor) * 0.5
+    right_control = (right + neck_anchor) * 0.5
+    left_control[2] = max(left_control[2], left[2], neck_anchor[2])
+    right_control[2] = max(right_control[2], right[2], neck_anchor[2])
+    t = np.linspace(0.0, 1.0, 16)[:, None]
+    right_half = ((1.0 - t) ** 2) * right + 2.0 * (1.0 - t) * t * right_control + (t ** 2) * neck_anchor
+    left_half = ((1.0 - t) ** 2) * neck_anchor + 2.0 * (1.0 - t) * t * left_control + (t ** 2) * left
+    arc = np.vstack([right_half, left_half[1:]])
+    width_cm = float(np.linalg.norm(np.diff(arc, axis=0), axis=1).sum() * 100.0)
+    measurements["shoulder_width_cm"] = float(width_cm)
+    measurements["_shoulder_arc_pts"] = np.asarray(arc, dtype=np.float32)
+    measurements["_shoulder_width_source"] = "validated_acromion_to_upper_neck_surface_seam"
+    measurements["_shoulder_neck_anchor_m"] = neck_anchor.astype(np.float32)
+    polylines = measurements.get("_linear_polylines")
+    if isinstance(polylines, dict):
+        polylines["shoulder_width"] = np.asarray(arc, dtype=np.float32)
 
 
 
@@ -579,7 +1070,6 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
     """Publish validated torso, perineum, and side-neck-to-waist measurements."""
     from measure_fused_mesh_clad import arm_excluded_torso_mesh
     from clad_body.measure._slicer import MeshSlicer
-    from clad_body.measure._lengths import measure_shirt_length
 
     quality: dict[str, Any] = {}
     torso_mesh, torso_meta = arm_excluded_torso_mesh(body.mesh)
@@ -680,14 +1170,15 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
     polylines = measurements.get("_linear_polylines")
     if isinstance(polylines, dict):
         polylines.pop("shirt_length", None)
-    # Regular-fit T-shirt target: 90% of the side-neck/HPS-to-crotch-level
-    # front surface trace. It deliberately has no waist or hip dependency.
+    # Regular-fit T-shirt target: 90% of a high-point-shoulder path which
+    # crosses the anterior chest before running down the front torso.  It
+    # deliberately has no waist or hip dependency.
     hps_to_crotch_cm, hps_to_crotch_pts = (0.0, None)
+    shirt_start_meta: dict[str, Any] = {"confidence": "low", "reason": "crotch_unavailable"}
     crotch_z = float(measurements.get("_inseam_z", 0.0))
     if crotch_z > 0:
-        hps_to_crotch_cm, hps_to_crotch_pts = measure_shirt_length(
-            body.joints or {}, body.mesh, crotch_z, measurements=measurements,
-            end_offset=0.0,
+        hps_to_crotch_cm, hps_to_crotch_pts, shirt_start_meta = measure_hps_to_crotch_front_surface(
+            body.joints or {}, body.mesh, crotch_z,
         )
     regular_tshirt_cm, regular_tshirt_pts = truncate_polyline_at_fraction(hps_to_crotch_pts, 0.90) if hps_to_crotch_pts is not None else (0.0, None)
     if regular_tshirt_pts is not None and regular_tshirt_cm > 0:
@@ -697,15 +1188,17 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         measurements["_hps_to_crotch_pts"] = hps_to_crotch_pts
         measurements["_regular_tshirt_length_pts"] = regular_tshirt_pts
         measurements["_shirt_length_pts"] = regular_tshirt_pts
-        measurements["_shirt_length_source"] = "regular_fit_90pct_hps_to_crotch_surface_trace"
+        measurements["_shirt_length_source"] = "regular_fit_90pct_hps_front_surface_trace"
         measurements["_shirt_length_definition"] = "0.90 * hps_to_crotch_surface_length"
+        measurements["_shirt_start"] = shirt_start_meta
         polylines = measurements.get("_linear_polylines")
         if isinstance(polylines, dict):
             polylines["shirt_length"] = regular_tshirt_pts
         start_conf = str(measurements.get("_shirt_start", {}).get("confidence", "low"))
-        side_q = _quality(start_conf, "regular_fit_90pct_hps_to_crotch_surface_trace")
+        side_q = _quality(start_conf, "regular_fit_90pct_hps_front_surface_trace")
     else:
         side_q = _quality("low", "hps_to_crotch_trace_failed")
+        measurements["_shirt_start"] = shirt_start_meta
     quality.update({"bust": bust_q, "waist": waist_q, "hip": hip_q, "stomach": stomach_q, "inseam": inseam_q, "side_neck_to_waist": _quality("low", "replaced_by_regular_tshirt_length"), "regular_tshirt_length": side_q})
     measurements["_measurement_quality"] = quality
     measurements["_torso_arm_exclusion"] = torso_meta
@@ -732,21 +1225,36 @@ def main() -> None:
     render_path = Path(args.render).expanduser().resolve() if args.render else None
     only = [key.strip() for key in args.only.split(",") if key.strip()] or None
     body, fused_transform, front_transform = fused_body(source, args.height_cm or None)
-    shirt_start_meta = install_landmark_constrained_neck_start(body.joints or {}, body.mesh)
     measurements = measure(body, preset=None if only else args.preset, only=only, render_path=None)
+    apply_surface_shoulder_width(measurements, body)
     apply_surface_sleeve_length(measurements, body)
     apply_distinct_stomach_measurement(measurements, body)
     apply_surface_crotch_length(measurements, body)
     torso_mesh = apply_production_core_measurements(measurements, body)
-    measurements.setdefault("_shirt_length_source", "regular_fit_90pct_hps_to_crotch_surface_trace")
-    measurements["_shirt_start"] = shirt_start_meta
+    joint_meta = body.sam3d_params.get("_fused_joint_transfer", {})
+    surface_meta = body.sam3d_params.get("_fused_joint_landmarks", {})
+    suppressed = suppress_measurements_for_invalid_joints(measurements, joint_meta, surface_meta)
+    # Render the shoulder-neck anchor as the white dot.  The true C7 remains
+    # in the saved fused joint set; this is explicitly a garment seam anchor.
+    debug_joints = measurements.get("_debug_joints")
+    if isinstance(debug_joints, dict):
+        shoulder_neck_anchor = measurements.get("_shoulder_neck_anchor_m")
+        if shoulder_neck_anchor is not None:
+            debug_joints["c7"] = np.asarray(shoulder_neck_anchor, dtype=np.float32)
+    measurements.setdefault("_shirt_length_source", "regular_fit_90pct_hps_front_surface_trace")
     measurements.update({
         "_measurement_engine": "datar-psa/clad-body@a2140a7",
         "_measurement_mesh_source": "fused_sdf_mesh",
-        "_joint_landmark_source": "front_mhr_params_transformed_to_fused_frame",
-        "_joint_transform_source": "front_mhr_params_scaled_centered_and_fusion_yaw" if front_transform.get("yaw_rotation_applied") is not None else "front_mhr_params_scaled_centered",
+        "_joint_landmark_source": "front_sam3d_posed_joints_with_mhr_skinning_same_topology_deformation",
+        "_joint_transform_source": front_transform.get("source", "saved_sam3d_posed_joint_coords"),
         "_fused_mesh_transform": fused_transform,
         "_front_mhr_joint_transform": front_transform,
+        "_fused_joint_transfer": joint_meta,
+        "_fused_joint_landmarks": surface_meta,
+        "_joint_validation": joint_meta,
+        "_suppressed_measurements": suppressed,
+        "_fusion_quality_status": scalar(body.sam3d_params.get("fusion_quality_status"), "unknown"),
+        "_fusion_quality_errors": body.sam3d_params.get("fusion_quality_errors", []),
         "_measurement_mesh_vertices": len(body.mesh.vertices),
         "_measurement_mesh_faces": len(body.mesh.faces),
         "_fusion_rule": scalar(body.sam3d_params.get("fusion_rule"), ""),

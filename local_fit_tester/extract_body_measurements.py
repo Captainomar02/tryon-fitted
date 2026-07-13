@@ -176,6 +176,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="json",
         help="Print a JSON summary or only output paths.",
     )
+    parser.add_argument(
+        "--validation-policy",
+        choices=["strict", "warn", "off"],
+        default="strict",
+        help="Fusion quality policy. Strict rejects incompatible photo pairs before measurement.",
+    )
     return parser
 
 
@@ -197,6 +203,7 @@ def main() -> int:
     fusion_output_dir = run_dir / "fusion_output"
     body_measurements_path = run_dir / "body_measurements.json"
     render_path = run_dir / "clad_body_render.png"
+    quality_report_path = fusion_output_dir / "fusion_quality_report.json"
 
     input_dir.mkdir(parents=True, exist_ok=True)
     fusion_output_dir.mkdir(parents=True, exist_ok=True)
@@ -215,6 +222,8 @@ def main() -> int:
         str(input_dir),
         "--output-dir",
         str(fusion_output_dir),
+        "--validation-policy",
+        args.validation_policy,
     ]
     _run(fusion_cmd, cwd=REPO_ROOT)
 
@@ -254,6 +263,7 @@ def main() -> int:
         print(f"params_json={params_path}")
         print(f"measurements_json={body_measurements_path}")
         print(f"render_png={render_path}")
+        print(f"quality_report_json={quality_report_path}")
         print(f"run_dir={run_dir}")
     else:
         payload = {
@@ -261,6 +271,7 @@ def main() -> int:
             "params_json": str(params_path),
             "measurements_json": str(body_measurements_path),
             "render_png": str(render_path),
+            "quality_report_json": str(quality_report_path),
             "body_measurements_cm": _load_json(body_measurements_path),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
