@@ -22,7 +22,7 @@ import trimesh
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CLAD_ROOT = REPO_ROOT / "vendor" / "clad-body-upstream"
+CLAD_ROOT = REPO_ROOT / "clad-body"
 if not CLAD_ROOT.is_dir():
     raise RuntimeError(f"Required CLAD runtime package is missing: {CLAD_ROOT}")
 if str(CLAD_ROOT) not in sys.path:
