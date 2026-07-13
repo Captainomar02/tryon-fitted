@@ -33,6 +33,7 @@ import clad_body.measure._lengths as upstream_lengths  # noqa: E402
 
 _MHR_SKINNING_CACHE: dict[str, Any] | None = None
 _MHR_JOINT_NAMES_CACHE: list[str] | None = None
+BUST_FULL_TORSO_WIDTH_FACTOR = float(os.environ.get("FUSION_BUST_FULL_TORSO_WIDTH_FACTOR", "1.15"))
 
 
 def _mhr_subprocess_env() -> dict[str, str]:
@@ -1081,19 +1082,93 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         return None
 
     slicer = MeshSlicer(torso_mesh)
+    full_slicer = MeshSlicer(body.mesh)
 
-    def select_max(name: str, low: float, high: float, extent: float) -> tuple[float, float, dict[str, Any]]:
+    def centered_full_torso_circumference(z: float, extent: float, torso_extent_limit: float) -> tuple[float, int, float]:
+        """Use the intact, centred torso loop when arms are separate slices.
+
+        Removing arm faces can open the upper torso mesh at the axilla.  At a
+        bust height where the full mesh has a single large centred component
+        and separate small arm components, the full component is the more
+        complete torso circumference.
+        """
+        contours = full_slicer.contours_at_z(float(z))
+        centered = [
+            (points, x_extent) for points, x_extent, x_center in contours
+            if x_extent < torso_extent_limit and x_extent >= 0.12 and abs(x_center) <= 0.14 * height
+        ]
+        if len(centered) != 1:
+            return 0.0, len(centered), 0.0
+        points, x_extent = centered[0]
+        try:
+            from scipy.spatial import ConvexHull
+            return float(ConvexHull(points).area), 1, float(x_extent)
+        except Exception:
+            closed = np.vstack([points, points[:1]])
+            return float(np.linalg.norm(np.diff(closed, axis=0), axis=1).sum()), 1, float(x_extent)
+
+    def select_max(name: str, low: float, high: float, extent: float, *, prefer_full_centered: bool = False) -> tuple[float, float, dict[str, Any], str]:
         zs = np.arange(low, high, 0.002)
-        circs = np.asarray([
-            slicer.circumference_at_z(float(z), max_x_extent=extent, combine_fragments=True)
-            for z in zs
-        ])
+        if prefer_full_centered:
+            # First pass: get the protected arm-excluded torso width through
+            # the lower part of this person's bust range.  This is the
+            # baseline; the intact full-mesh loop is allowed to be only a
+            # configurable multiple of it before it is considered arm-merged.
+            arm_excluded_widths = []
+            for z in zs:
+                fragments = [points for points, x_extent, _ in slicer.contours_at_z(float(z)) if x_extent < extent]
+                if fragments:
+                    combined = np.vstack(fragments)
+                    arm_excluded_widths.append(float(combined[:, 0].max() - combined[:, 0].min()))
+                else:
+                    arm_excluded_widths.append(np.nan)
+            arm_excluded_widths = np.asarray(arm_excluded_widths, dtype=np.float64)
+            raw_components = []
+            for z in zs:
+                candidates = [
+                    (x_extent, x_center) for _, x_extent, x_center in full_slicer.contours_at_z(float(z))
+                    if x_extent >= 0.12 and abs(x_center) <= 0.14 * height
+                ]
+                raw_components.append(candidates[0][0] if len(candidates) == 1 else np.nan)
+            raw_components = np.asarray(raw_components, dtype=np.float64)
+            lower_count = max(4, len(arm_excluded_widths) // 3)
+            lower_band = arm_excluded_widths[:lower_count]
+            baseline_samples = lower_band[np.isfinite(lower_band)]
+            baseline_source = "arm_excluded_lower_bust_torso_width"
+            if len(baseline_samples) < 3:
+                baseline_samples = raw_components[np.isfinite(raw_components)]
+                baseline_source = "full_mesh_fallback_no_arm_excluded_baseline"
+            if len(baseline_samples) >= 3:
+                torso_width_baseline = float(np.percentile(baseline_samples, 50))
+                torso_extent_limit = min(float(extent), torso_width_baseline * BUST_FULL_TORSO_WIDTH_FACTOR)
+            else:
+                torso_width_baseline = 0.0
+                torso_extent_limit = float(extent)
+                baseline_source = "unavailable"
+            values = [centered_full_torso_circumference(float(z), extent, torso_extent_limit) for z in zs]
+            circs = np.asarray([value[0] for value in values])
+            components = np.asarray([value[1] for value in values])
+            component_widths = np.asarray([value[2] for value in values])
+            fallback_circs = np.asarray([
+                slicer.circumference_at_z(float(z), max_x_extent=extent, combine_fragments=True)
+                for z in zs
+            ])
+            used_full = circs > 0.30
+            circs = np.where(used_full, circs, fallback_circs)
+            components = np.where(used_full, components, np.asarray([len(slicer.contours_at_z(float(z))) for z in zs]))
+        else:
+            circs = np.asarray([
+                slicer.circumference_at_z(float(z), max_x_extent=extent, combine_fragments=True)
+                for z in zs
+            ])
+            components = np.asarray([len(slicer.contours_at_z(float(z))) for z in zs])
+            component_widths = np.zeros_like(circs)
         valid = circs > 0.30
         if not valid.any():
-            return 0.0, 0.0, _quality("low", "no_valid_torso_contour")
+            return 0.0, 0.0, _quality("low", "no_valid_torso_contour"), "unavailable", {}
         index = int(np.argmax(np.where(valid, circs, -1.0)))
         z = float(zs[index])
-        fragments = len(slicer.contours_at_z(z))
+        fragments = int(components[index])
         edge = index <= 2 or index >= len(zs) - 3
         confidence = "high" if fragments == 1 and not edge else "medium"
         reasons = []
@@ -1101,12 +1176,31 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             reasons.append("fragmented_slice")
         if edge:
             reasons.append("selected_search_boundary")
-        return float(circs[index]), z, _quality(confidence, *reasons)
+        source = "arm_excluded_torso_mesh"
+        if prefer_full_centered and bool(used_full[index]):
+            reasons.append("intact_centered_full_mesh_torso_component")
+            source = "intact_centered_full_mesh_torso_component"
+        elif prefer_full_centered:
+            reasons.append("arm_excluded_fallback_no_unambiguous_full_torso_component")
+        details = {
+            "full_torso_width_baseline_m": float(torso_width_baseline) if prefer_full_centered else None,
+            "full_torso_width_limit_m": float(torso_extent_limit) if prefer_full_centered else None,
+            "full_torso_width_factor": float(BUST_FULL_TORSO_WIDTH_FACTOR) if prefer_full_centered else None,
+            "full_torso_width_baseline_source": baseline_source if prefer_full_centered else None,
+            "selected_full_torso_width_m": float(component_widths[index]) if prefer_full_centered and bool(used_full[index]) else None,
+        }
+        return float(circs[index]), z, _quality(confidence, *reasons), source, details
 
-    bust_m, bust_z, bust_q = select_max("bust", 0.68 * height, 0.76 * height, 0.85)
-    hip_m, hip_z, hip_q = select_max("hip", 0.46 * height, 0.54 * height, 0.95)
+    bust_m, bust_z, bust_q, bust_source, bust_details = select_max("bust", 0.68 * height, 0.76 * height, 0.85, prefer_full_centered=True)
+    hip_m, hip_z, hip_q, _, _ = select_max("hip", 0.46 * height, 0.54 * height, 0.95)
     if bust_m:
-        measurements.update({"bust_cm": bust_m * 100.0, "_bust_z": bust_z, "_bust_pct": bust_z / height * 100.0})
+        measurements.update({
+            "bust_cm": bust_m * 100.0,
+            "_bust_z": bust_z,
+            "_bust_pct": bust_z / height * 100.0,
+            "_bust_measurement_source": bust_source,
+            "_bust_full_torso_component": bust_details,
+        })
     if hip_m:
         measurements.update({"hip_cm": hip_m * 100.0, "_hip_z": hip_z, "_hip_pct": hip_z / height * 100.0})
 
@@ -1263,7 +1357,10 @@ def main() -> None:
     out_json.write_text(json.dumps(jsonable(measurements), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if render_path is not None:
         render_path.parent.mkdir(parents=True, exist_ok=True)
-        render_4view(body.mesh, measurements, str(render_path), title=source.stem, model_label="Fused SDF / upstream CLAD", torso_mesh=torso_mesh)
+        # The bust is intentionally taken from the intact full-mesh torso
+        # component, so render from that same mesh rather than the arm-cut
+        # mesh that created the visible undercut.
+        render_4view(body.mesh, measurements, str(render_path), title=source.stem, model_label="Fused SDF / upstream CLAD", torso_mesh=None)
     print(f"Saved measurements: {out_json}")
     if render_path is not None:
         print(f"Saved render      : {render_path}")
