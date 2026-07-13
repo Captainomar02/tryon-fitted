@@ -7,3 +7,5 @@ local_fit_tester/runs/
 .cache/
 __pycache__/
 *.py[cod]
+tryon-3d-main/
+tryon-3d-main.zip
