@@ -1365,8 +1365,19 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         edge = z <= low + 0.004 or z >= high - 0.004
         return circumference, z, _quality("medium" if edge else "high", "selected_search_boundary" if edge else "centred_pelvis_component")
 
+    # The traditional 68–76% window can end before the actual bust maximum
+    # on a short-shouldered or broad-chested body.  Search until just below
+    # the transferred shoulder line, while retaining a conservative 80%
+    # ceiling so the neck/shoulder shelf cannot become the bust.
+    shoulder_zs = [
+        float(np.asarray(body.joints[key], dtype=np.float64)[2])
+        for key in ("l_shoulder", "r_shoulder")
+        if body.joints and key in body.joints
+    ]
+    shoulder_limited_high = float(np.mean(shoulder_zs) - 0.020 * height) if shoulder_zs else 0.80 * height
+    bust_high = float(np.clip(shoulder_limited_high, 0.76 * height, 0.80 * height))
     bust_m, bust_z, bust_q, bust_source, bust_details = select_max(
-        "bust", 0.68 * height, 0.76 * height, 0.85, arm_excluded_only=True,
+        "bust", 0.68 * height, bust_high, 0.85, arm_excluded_only=True,
     )
     hip_m, hip_z, hip_q = centered_hip_circumference(0.40 * height, 0.60 * height)
     if bust_m:
@@ -1376,6 +1387,8 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             "_bust_pct": bust_z / height * 100.0,
             "_bust_measurement_source": bust_source,
             "_bust_full_torso_component": bust_details,
+            "_bust_search_high_pct": bust_high / height * 100.0,
+            "_bust_search_high_source": "shoulder_line_minus_2pct_height_capped_76_to_80pct",
         })
     if hip_m:
         measurements.update({"hip_cm": hip_m * 100.0, "_hip_z": hip_z, "_hip_pct": hip_z / height * 100.0})
