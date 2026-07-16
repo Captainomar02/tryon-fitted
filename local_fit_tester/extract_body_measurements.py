@@ -23,6 +23,11 @@ def _err(message: str) -> None:
 
 
 def _copy_image(src: Path, dst: Path) -> None:
+    # The fit HTTP service has already written uploads to this exact input
+    # location.  Avoid shutil.SameFileError when the extractor receives that
+    # path instead of an external source image.
+    if src.resolve(strict=False) == dst.resolve(strict=False):
+        return
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dst)
 

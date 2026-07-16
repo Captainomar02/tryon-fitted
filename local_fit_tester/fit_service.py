@@ -56,6 +56,7 @@ def canonical_measurements(clad: dict[str, Any]) -> dict[str, Any]:
         ("neck_cm", "neck_circumference"),
         ("stomach_cm", "stomach_circumference"),
         ("waist_cm", "stomach_circumference"),
+        ("waist_cm", "waist_circumference"),
         ("thigh_cm", "thigh_circumference"),
         ("shoulder_width_cm", "shoulder_to_shoulder_length"),
         ("sleeve_length_cm", "arm_length"),
