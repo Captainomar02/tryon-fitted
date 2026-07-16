@@ -1365,20 +1365,24 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         edge = z <= low + 0.004 or z >= high - 0.004
         return circumference, z, _quality("medium" if edge else "high", "selected_search_boundary" if edge else "centred_pelvis_component")
 
-    # The traditional 68–76% window can end before the actual bust maximum
-    # on a short-shouldered or broad-chested body.  Search until just below
-    # the transferred shoulder line, while retaining a conservative 80%
-    # ceiling so the neck/shoulder shelf cannot become the bust.
-    shoulder_zs = [
-        float(np.asarray(body.joints[key], dtype=np.float64)[2])
-        for key in ("l_shoulder", "r_shoulder")
-        if body.joints and key in body.joints
-    ]
-    shoulder_limited_high = float(np.mean(shoulder_zs) - 0.020 * height) if shoulder_zs else 0.80 * height
-    bust_high = float(np.clip(shoulder_limited_high, 0.76 * height, 0.80 * height))
-    bust_m, bust_z, bust_q, bust_source, bust_details = select_max(
-        "bust", 0.68 * height, bust_high, 0.85, arm_excluded_only=True,
+    # Exact upstream CLAD rule (clad_body.measure._circumferences): use the
+    # arm-excluded torso mesh, then sweep from waist/68% up to the smaller of
+    # waist+30cm and 80% height.  This fused mesh cannot always derive an ISO
+    # waist contour, so preserve CLAD MHR's original 61% waist fallback.
+    from clad_body.measure._circumferences import torso_sweep_bust_hips
+    upstream_waist_z = float(measurements.get("_waist_z", 0.61 * height) or 0.61 * height)
+    bust_cm, bust_z, _, _ = torso_sweep_bust_hips(
+        body.mesh, torso_mesh, upstream_waist_z, height,
+        bust_anchor_z=None, hip_anchor_z=None,
     )
+    bust_m = float(bust_cm) / 100.0
+    bust_q = _quality("high" if bust_m > 0.30 else "low", "upstream_clad_torso_sweep_bust_hips")
+    bust_source = "datar_psa_clad_body_torso_sweep_bust_hips"
+    bust_details = {
+        "waist_z_m": upstream_waist_z,
+        "search_low_pct": max(upstream_waist_z, 0.68 * height) / height * 100.0,
+        "search_high_pct": min(upstream_waist_z + 0.30, 0.80 * height) / height * 100.0,
+    }
     hip_m, hip_z, hip_q = centered_hip_circumference(0.40 * height, 0.60 * height)
     if bust_m:
         measurements.update({
@@ -1387,8 +1391,8 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             "_bust_pct": bust_z / height * 100.0,
             "_bust_measurement_source": bust_source,
             "_bust_full_torso_component": bust_details,
-            "_bust_search_high_pct": bust_high / height * 100.0,
-            "_bust_search_high_source": "shoulder_line_minus_2pct_height_capped_76_to_80pct",
+            "_bust_search_high_pct": bust_details["search_high_pct"],
+            "_bust_search_high_source": "upstream_clad_torso_sweep_bust_hips",
         })
     if hip_m:
         measurements.update({"hip_cm": hip_m * 100.0, "_hip_z": hip_z, "_hip_pct": hip_z / height * 100.0})
