@@ -33,7 +33,10 @@ import clad_body.measure._lengths as upstream_lengths  # noqa: E402
 
 _MHR_SKINNING_CACHE: dict[str, Any] | None = None
 _MHR_JOINT_NAMES_CACHE: list[str] | None = None
+_ARM_SKINNING_CACHE: tuple[dict[str, np.ndarray], dict[str, np.ndarray]] | None = None
+_ARM_SKINNING_GROUP_CACHE: dict[str, np.ndarray] | None = None
 BUST_FULL_TORSO_WIDTH_FACTOR = float(os.environ.get("FUSION_BUST_FULL_TORSO_WIDTH_FACTOR", "1.15"))
+ARM_MASK_CACHE_PATH = REPO_ROOT / "checkpoints" / "mhr-assets" / "assets" / "arm_skinning_masks.npz"
 
 
 def _mhr_subprocess_env() -> dict[str, str]:
@@ -92,6 +95,8 @@ ji = lbs.skin_indices_flattened.cpu().numpy().copy()
 wt = lbs.skin_weights_flattened.cpu().numpy().copy()
 n = np.asarray([lbs.num_vertices])
 np.savez(sys.argv[1], names=names, vi=vi, ji=ji, wt=wt, n=n)
+# MHR/Momentum can fault during interpreter teardown after a successful save.
+# np.savez has already closed the archive, so skip native destructors.
 os._exit(0)
 """
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as sf:
@@ -118,6 +123,118 @@ os._exit(0)
         for path in (script_path, data_path):
             try: os.unlink(path)
             except OSError: pass
+
+
+def mhr_arm_skinning_masks(n_vertices: int) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]] | None:
+    """Return complete arm/hand masks from MHR skinning weights."""
+    global _ARM_SKINNING_CACHE, _ARM_SKINNING_GROUP_CACHE
+    if _ARM_SKINNING_CACHE is not None:
+        masks, scores = _ARM_SKINNING_CACHE
+        return (masks, scores) if len(masks["l"]) == n_vertices else None
+    if ARM_MASK_CACHE_PATH.is_file():
+        try:
+            data = np.load(ARM_MASK_CACHE_PATH, allow_pickle=False)
+            masks = {"l": data["l_mask"].astype(bool), "r": data["r_mask"].astype(bool)}
+            scores = {"l": data["l_score"].astype(np.float32), "r": data["r_score"].astype(np.float32)}
+            if len(masks["l"]) == n_vertices:
+                _ARM_SKINNING_GROUP_CACHE = {
+                    key: data[key].astype(np.float32)
+                    for key in ("l_upper", "l_lower", "l_wrist", "r_upper", "r_lower", "r_wrist")
+                }
+                _ARM_SKINNING_CACHE = (masks, scores)
+                return masks, scores
+        except (KeyError, OSError, ValueError):
+            pass
+    data = _mhr_skinning_data()
+    if data is None or data["vertex_count"] != n_vertices:
+        return None
+    names, vi, ji, wt = data["names"], data["vi"], data["ji"], data["wt"]
+
+    def score(prefix: str, tokens: tuple[str, ...]) -> np.ndarray:
+        bones = [i for i, name in enumerate(names) if name.lower().startswith(prefix) and any(token in name.lower() for token in tokens)]
+        keep = np.isin(ji, np.asarray(bones, dtype=np.int64))
+        return np.bincount(vi[keep], weights=wt[keep], minlength=n_vertices).astype(np.float32)
+
+    arm_tokens = ("uparm", "lowarm", "wrist", "pinky", "ring", "middle", "index", "thumb")
+    wrist_tokens = ("wrist", "pinky", "ring", "middle", "index", "thumb")
+    _ARM_SKINNING_GROUP_CACHE = {
+        "l_upper": score("l_", ("uparm",)), "l_lower": score("l_", ("lowarm",)), "l_wrist": score("l_", wrist_tokens),
+        "r_upper": score("r_", ("uparm",)), "r_lower": score("r_", ("lowarm",)), "r_wrist": score("r_", wrist_tokens),
+    }
+    scores = {"l": score("l_", arm_tokens), "r": score("r_", arm_tokens)}
+    masks = {side: values >= 0.05 for side, values in scores.items()}
+    _ARM_SKINNING_CACHE = (masks, scores)
+    return masks, scores
+
+
+def mhr_arm_skinning_groups(n_vertices: int) -> dict[str, np.ndarray] | None:
+    return _ARM_SKINNING_GROUP_CACHE if mhr_arm_skinning_masks(n_vertices) is not None else None
+
+
+def arm_excluded_torso_mesh(mesh: trimesh.Trimesh, joints: dict[str, np.ndarray] | None = None) -> tuple[trimesh.Trimesh | None, dict[str, Any]]:
+    """Remove arm faces from transferred shoulder/elbow/wrist landmarks.
+
+    This stays in the fused mesh's coordinate system and avoids the unstable
+    native Momentum skinning extractor that previously disabled chest loops.
+    """
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    meta: dict[str, Any] = {"enabled": False, "method": "joint_chain_arm_face_removal"}
+    arm_mask = np.zeros(len(vertices), dtype=bool)
+    height = float(np.ptp(vertices[:, 2]))
+    # A forearm can be much thinner than the upper arm adjacent to the bust.
+    # The floor is height-relative (not body-specific) and prevents that
+    # forearm estimate from leaking upper-arm vertices into a chest slice.
+    min_radius, max_radius = 0.045 * height, 0.090 * height
+
+    def point_to_segment_distance(start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        direction = end - start
+        length_sq = float(direction @ direction)
+        if length_sq <= 1e-10:
+            return np.full(len(vertices), np.inf), np.zeros(len(vertices))
+        fraction = np.clip(((vertices - start) @ direction) / length_sq, 0.0, 1.0)
+        closest = start + fraction[:, None] * direction
+        return np.linalg.norm(vertices - closest, axis=1), fraction
+
+    side_radii: dict[str, float] = {}
+    if joints:
+        for side in ("l", "r"):
+            chain = [joints.get(f"{side}_shoulder"), joints.get(f"{side}_elbow"), joints.get(f"{side}_wrist")]
+            if any(point is None for point in chain):
+                continue
+            chain = [np.asarray(point, dtype=np.float64) for point in chain]
+            # Measure this person's forearm radius away from the torso, then
+            # use a modest margin so the entire arm surface is excluded.
+            forearm_distance, forearm_fraction = point_to_segment_distance(chain[1], chain[2])
+            midpoint_x = float((chain[1][0] + chain[2][0]) * 0.5)
+            outward = 1.0 if side == "l" else -1.0
+            samples = forearm_distance[
+                (forearm_fraction >= 0.15) & (forearm_fraction <= 0.85)
+                & (outward * (vertices[:, 0] - midpoint_x) >= -0.015 * height)
+                & (forearm_distance >= 0.010 * height) & (forearm_distance <= 0.160 * height)
+            ]
+            if len(samples) >= 30:
+                radius = float(np.clip(np.percentile(samples, 75) * 1.15, min_radius, max_radius))
+                source = "mesh_adaptive_forearm_radius"
+            else:
+                radius = float(np.clip(0.060 * height, min_radius, max_radius))
+                source = "height_scaled_radius_fallback"
+            side_radii[side] = radius
+            for start, end in zip(chain, chain[1:]):
+                distance, _ = point_to_segment_distance(start, end)
+                arm_mask |= distance <= radius
+            meta[f"{side}_arm_radius_m"] = radius
+            meta[f"{side}_arm_radius_source"] = source
+    if not arm_mask.any():
+        meta.update({"reason": "missing_arm_joint_chains_full_mesh_fallback", "fallback": True})
+        return mesh.copy(), meta
+    faces = np.asarray(mesh.faces, dtype=np.int32)
+    keep_faces = ~arm_mask[faces].any(axis=1)
+    kept = int(np.count_nonzero(keep_faces))
+    meta.update({"enabled": kept > 0, "removed_vertices": int(np.count_nonzero(arm_mask)), "kept_faces": kept, "removed_faces": int(len(faces) - kept)})
+    if kept <= 0:
+        meta["reason"] = "all_faces_removed"
+        return None, meta
+    return trimesh.Trimesh(vertices=vertices, faces=faces[keep_faces], process=False), meta
 
 
 def scalar(value: Any, default: Any = None) -> Any:
@@ -405,6 +522,20 @@ def shoulder_neck_surface_anchor(vertices: np.ndarray, left: np.ndarray, right: 
         "shoulder_top_z_m": shoulder_top,
         "search_count": int(len(candidates)),
     }
+
+
+def posterior_surface_projection(vertices: np.ndarray, point: np.ndarray) -> np.ndarray | None:
+    """Project a landmark to rear skin at its lateral/height location."""
+    point = np.asarray(point, dtype=np.float64)
+    for x_tol, z_tol in ((0.018, 0.018), (0.035, 0.030), (0.060, 0.055)):
+        nearby = vertices[
+            (np.abs(vertices[:, 0] - point[0]) <= x_tol)
+            & (np.abs(vertices[:, 2] - point[2]) <= z_tol)
+        ]
+        if len(nearby):
+            # In CLAD canonical space, more-negative Y is the posterior skin.
+            return np.array([point[0], float(nearby[:, 1].min()), point[2]], dtype=np.float64)
+    return None
 
 
 def surface_landmarks_from_skeleton(vertices: np.ndarray, skeletal: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
@@ -722,33 +853,21 @@ def _arm_group_surface_anchor(vertices: np.ndarray, mask: np.ndarray, center: np
 
 
 def apply_surface_sleeve_length(measurements: dict[str, Any], body: MhrBody) -> None:
-    """Measure/render sleeve from topology-labelled fused arm skin regions."""
+    """Measure/render sleeves from transferred skin landmarks without Momentum."""
     if "sleeve_length_cm" not in measurements or not body.joints:
         return
     from clad_body.measure.mhr import find_acromion
-    from measure_fused_mesh_clad import mhr_arm_skinning_groups
 
     vertices = np.asarray(body.mesh.vertices, dtype=np.float64)
-    groups = mhr_arm_skinning_groups(len(vertices))
-    if groups is None:
-        measurements["_sleeve_length_source"] = "upstream_joint_chain_fallback"
-        return
-
     traces = []
     for prefix, side_name, side_sign in (("l", "left", 1.0), ("r", "right", -1.0)):
         shoulder = body.joints.get(f"{prefix}_shoulder")
-        if shoulder is None:
+        elbow = body.joints.get(f"{prefix}_elbow")
+        wrist = body.joints.get(f"{prefix}_wrist")
+        if shoulder is None or elbow is None or wrist is None:
             continue
-        elbow_mask = (groups[f"{prefix}_upper"] > 0.05) & (groups[f"{prefix}_lower"] > 0.05)
-        wrist_mask = (groups[f"{prefix}_lower"] > 0.05) & (groups[f"{prefix}_wrist"] > 0.05)
-        if np.count_nonzero(elbow_mask) < 8 or np.count_nonzero(wrist_mask) < 8:
-            continue
-        elbow_center = np.median(vertices[elbow_mask], axis=0)
-        wrist_center = np.median(vertices[wrist_mask], axis=0)
         acromion = find_acromion(vertices, np.asarray(shoulder), side=side_name)
-        elbow_skin = _arm_group_surface_anchor(vertices, elbow_mask, elbow_center, side_sign)
-        wrist_skin = _arm_group_surface_anchor(vertices, wrist_mask, wrist_center, side_sign)
-        trace = np.asarray([acromion, elbow_skin, wrist_skin], dtype=np.float64)
+        trace = np.asarray([acromion, elbow, wrist], dtype=np.float64)
         length_cm = float(np.linalg.norm(np.diff(trace, axis=0), axis=1).sum() * 100.0)
         traces.append((prefix, length_cm, trace))
 
@@ -758,7 +877,7 @@ def apply_surface_sleeve_length(measurements: dict[str, Any], body: MhrBody) -> 
     mean_cm = float(np.mean([item[1] for item in traces]))
     shown = min(traces, key=lambda item: abs(item[1] - mean_cm))
     measurements["sleeve_length_cm"] = mean_cm
-    measurements["_sleeve_length_source"] = "mhr_skinning_topology_outer_arm_surface_chain"
+    measurements["_sleeve_length_source"] = "transferred_joint_outer_arm_chain"
     measurements["_sleeve_rendered_side"] = shown[0]
     polylines = measurements.get("_linear_polylines")
     if isinstance(polylines, dict):
@@ -782,12 +901,17 @@ def apply_surface_shoulder_width(measurements: dict[str, Any], body: MhrBody) ->
     """
     if not body.joints or not {"l_shoulder", "r_shoulder"} <= set(body.joints):
         return
-    left = np.asarray(body.joints["l_shoulder"], dtype=np.float64)
-    right = np.asarray(body.joints["r_shoulder"], dtype=np.float64)
+    vertices = np.asarray(body.mesh.vertices, dtype=np.float64)
+    left_seed = np.asarray(body.joints["l_shoulder"], dtype=np.float64)
+    right_seed = np.asarray(body.joints["r_shoulder"], dtype=np.float64)
+    left = posterior_surface_projection(vertices, left_seed)
+    right = posterior_surface_projection(vertices, right_seed)
+    left = left_seed if left is None else left
+    right = right_seed if right is None else right
     height = float(np.ptp(np.asarray(body.mesh.vertices)[:, 2]))
     if height <= 0:
         return
-    neck_anchor, _ = shoulder_neck_surface_anchor(np.asarray(body.mesh.vertices), left, right)
+    neck_anchor, _ = shoulder_neck_surface_anchor(vertices, left, right)
     if neck_anchor is None:
         # Do not silently reintroduce a sagging centre when neck geometry is
         # missing: use a conservative raised midpoint and record the fallback.
@@ -807,7 +931,7 @@ def apply_surface_shoulder_width(measurements: dict[str, Any], body: MhrBody) ->
     width_cm = float(np.linalg.norm(np.diff(arc, axis=0), axis=1).sum() * 100.0)
     measurements["shoulder_width_cm"] = float(width_cm)
     measurements["_shoulder_arc_pts"] = np.asarray(arc, dtype=np.float32)
-    measurements["_shoulder_width_source"] = "validated_acromion_to_upper_neck_surface_seam"
+    measurements["_shoulder_width_source"] = "posterior_surface_acromion_to_upper_neck_seam"
     measurements["_shoulder_neck_anchor_m"] = neck_anchor.astype(np.float32)
     polylines = measurements.get("_linear_polylines")
     if isinstance(polylines, dict):
@@ -1069,11 +1193,10 @@ def _clear_waist_dependent_measurements(measurements: dict[str, Any]) -> None:
         polylines.pop("shirt_length", None)
 def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBody) -> trimesh.Trimesh | None:
     """Publish validated torso, perineum, and side-neck-to-waist measurements."""
-    from measure_fused_mesh_clad import arm_excluded_torso_mesh
     from clad_body.measure._slicer import MeshSlicer
 
     quality: dict[str, Any] = {}
-    torso_mesh, torso_meta = arm_excluded_torso_mesh(body.mesh)
+    torso_mesh, torso_meta = arm_excluded_torso_mesh(body.mesh, body.joints)
     height = float(np.ptp(np.asarray(body.mesh.vertices)[:, 2]))
     if torso_mesh is None or height <= 0:
         for name in ("bust", "waist", "stomach", "hip", "inseam", "side_neck_to_waist"):
@@ -1107,9 +1230,37 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             closed = np.vstack([points, points[:1]])
             return float(np.linalg.norm(np.diff(closed, axis=0), axis=1).sum()), 1, float(x_extent)
 
-    def select_max(name: str, low: float, high: float, extent: float, *, prefer_full_centered: bool = False) -> tuple[float, float, dict[str, Any], str]:
+    def centered_arm_excluded_torso_circumference(z: float) -> tuple[float, int]:
+        """Measure only centred torso fragments; never recombine arm remnants."""
+        parts = [
+            points for points, x_extent, x_center in slicer.contours_at_z(float(z))
+            if x_extent >= 0.12 and abs(x_center) <= 0.08
+        ]
+        if not parts:
+            return 0.0, 0
+        points = np.vstack(parts)
+        try:
+            from scipy.spatial import ConvexHull
+            return float(ConvexHull(points).area), len(parts)
+        except Exception:
+            ordered = points[np.argsort(np.arctan2(points[:, 1] - points[:, 1].mean(), points[:, 0] - points[:, 0].mean()))]
+            return float(np.linalg.norm(np.diff(np.vstack([ordered, ordered[:1]]), axis=0), axis=1).sum()), len(parts)
+
+    def select_max(name: str, low: float, high: float, extent: float, *, prefer_full_centered: bool = False, arm_excluded_only: bool = False) -> tuple[float, float, dict[str, Any], str]:
         zs = np.arange(low, high, 0.002)
-        if prefer_full_centered:
+        if arm_excluded_only:
+            # Garment bust circumference must never traverse arm geometry.
+            # The arm-chain cut may leave axilla fragments, so combine only
+            # centred torso fragments and never inspect the intact full mesh.
+            values = [centered_arm_excluded_torso_circumference(float(z)) for z in zs]
+            circs = np.asarray([value[0] for value in values])
+            components = np.asarray([value[1] for value in values])
+            component_widths = np.zeros_like(circs)
+            used_full = np.zeros_like(circs, dtype=bool)
+            torso_width_baseline = 0.0
+            torso_extent_limit = float(extent)
+            baseline_source = "arm_excluded_torso_only"
+        elif prefer_full_centered:
             # First pass: get the protected arm-excluded torso width through
             # the lower part of this person's bust range.  This is the
             # baseline; the intact full-mesh loop is allowed to be only a
@@ -1149,13 +1300,11 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             circs = np.asarray([value[0] for value in values])
             components = np.asarray([value[1] for value in values])
             component_widths = np.asarray([value[2] for value in values])
-            fallback_circs = np.asarray([
-                slicer.circumference_at_z(float(z), max_x_extent=extent, combine_fragments=True)
-                for z in zs
-            ])
+            fallback_values = [centered_arm_excluded_torso_circumference(float(z)) for z in zs]
+            fallback_circs = np.asarray([value[0] for value in fallback_values])
             used_full = circs > 0.30
             circs = np.where(used_full, circs, fallback_circs)
-            components = np.where(used_full, components, np.asarray([len(slicer.contours_at_z(float(z))) for z in zs]))
+            components = np.where(used_full, components, np.asarray([value[1] for value in fallback_values]))
         else:
             circs = np.asarray([
                 slicer.circumference_at_z(float(z), max_x_extent=extent, combine_fragments=True)
@@ -1191,8 +1340,35 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         }
         return float(circs[index]), z, _quality(confidence, *reasons), source, details
 
-    bust_m, bust_z, bust_q, bust_source, bust_details = select_max("bust", 0.68 * height, 0.76 * height, 0.85, prefer_full_centered=True)
-    hip_m, hip_z, hip_q, _, _ = select_max("hip", 0.46 * height, 0.54 * height, 0.95)
+    def centered_hip_circumference(low: float, high: float) -> tuple[float, float, dict[str, Any]]:
+        """Find the widest centred pelvis loop, never the two leg loops."""
+        candidates: list[tuple[float, float]] = []
+        for z in np.arange(low, high, 0.002):
+            parts = [
+                points for points, x_extent, x_center in slicer.contours_at_z(float(z))
+                if x_extent >= 0.12 and abs(x_center) <= 0.08
+            ]
+            if not parts:
+                continue
+            points = np.vstack(parts)
+            try:
+                from scipy.spatial import ConvexHull
+                circumference = float(ConvexHull(points).area)
+            except Exception:
+                ordered = points[np.argsort(np.arctan2(points[:, 1] - points[:, 1].mean(), points[:, 0] - points[:, 0].mean()))]
+                circumference = float(np.linalg.norm(np.diff(np.vstack([ordered, ordered[:1]]), axis=0), axis=1).sum())
+            if circumference > 0.30:
+                candidates.append((circumference, float(z)))
+        if not candidates:
+            return 0.0, 0.0, _quality("low", "no_centered_pelvis_contour")
+        circumference, z = max(candidates, key=lambda item: item[0])
+        edge = z <= low + 0.004 or z >= high - 0.004
+        return circumference, z, _quality("medium" if edge else "high", "selected_search_boundary" if edge else "centred_pelvis_component")
+
+    bust_m, bust_z, bust_q, bust_source, bust_details = select_max(
+        "bust", 0.68 * height, 0.76 * height, 0.85, arm_excluded_only=True,
+    )
+    hip_m, hip_z, hip_q = centered_hip_circumference(0.40 * height, 0.60 * height)
     if bust_m:
         measurements.update({
             "bust_cm": bust_m * 100.0,
@@ -1320,7 +1496,8 @@ def main() -> None:
     only = [key.strip() for key in args.only.split(",") if key.strip()] or None
     body, fused_transform, front_transform = fused_body(source, args.height_cm or None)
     measurements = measure(body, preset=None if only else args.preset, only=only, render_path=None)
-    apply_surface_shoulder_width(measurements, body)
+    # Keep the upstream CLAD definition: acromion → posterior C7 → acromion.
+    # In particular, do not substitute the garment seam anchor for C7.
     apply_surface_sleeve_length(measurements, body)
     apply_distinct_stomach_measurement(measurements, body)
     apply_surface_crotch_length(measurements, body)
@@ -1328,13 +1505,6 @@ def main() -> None:
     joint_meta = body.sam3d_params.get("_fused_joint_transfer", {})
     surface_meta = body.sam3d_params.get("_fused_joint_landmarks", {})
     suppressed = suppress_measurements_for_invalid_joints(measurements, joint_meta, surface_meta)
-    # Render the shoulder-neck anchor as the white dot.  The true C7 remains
-    # in the saved fused joint set; this is explicitly a garment seam anchor.
-    debug_joints = measurements.get("_debug_joints")
-    if isinstance(debug_joints, dict):
-        shoulder_neck_anchor = measurements.get("_shoulder_neck_anchor_m")
-        if shoulder_neck_anchor is not None:
-            debug_joints["c7"] = np.asarray(shoulder_neck_anchor, dtype=np.float32)
     measurements.setdefault("_shirt_length_source", "regular_fit_90pct_hps_front_surface_trace")
     measurements.update({
         "_measurement_engine": "datar-psa/clad-body@a2140a7",
@@ -1357,10 +1527,9 @@ def main() -> None:
     out_json.write_text(json.dumps(jsonable(measurements), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if render_path is not None:
         render_path.parent.mkdir(parents=True, exist_ok=True)
-        # The bust is intentionally taken from the intact full-mesh torso
-        # component, so render from that same mesh rather than the arm-cut
-        # mesh that created the visible undercut.
-        render_4view(body.mesh, measurements, str(render_path), title=source.stem, model_label="Fused SDF / upstream CLAD", torso_mesh=None)
+        # Render the contour from the same arm-excluded torso mesh used for
+        # the value, so the front panel cannot show a bust loop on an arm.
+        render_4view(body.mesh, measurements, str(render_path), title=source.stem, model_label="Fused SDF / upstream CLAD", torso_mesh=torso_mesh)
     print(f"Saved measurements: {out_json}")
     if render_path is not None:
         print(f"Saved render      : {render_path}")

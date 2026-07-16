@@ -1,7 +1,10 @@
 # Only packages imported by the front/side body-measurement launch path.
 # Model weights are downloaded at instance start, never during Docker build.
+# pymomentum-cpu's Python 3.12 wheel requires Torch 2.8+. Keep all Torch
+# components aligned; a mixed 2.6/2.8 stack can destabilize native bindings.
 torch==2.8.0
 torchvision==0.23.0
+torchaudio==2.8.0
 numpy
 pymomentum-cpu==0.1.108.post0
 mhr==1.0.1
@@ -23,6 +26,7 @@ scipy
 transformers
 safetensors
 accelerate
+termcolor
 git+https://github.com/microsoft/MoGe.git
 iopath
 tqdm

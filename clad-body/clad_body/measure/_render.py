@@ -403,7 +403,7 @@ def render_4view(mesh, measurements, output_path, title="", model_label="",
         # No depth testing on 2D overlay → only show each line from views
         # where it's naturally visible (not occluded by the body).
         _linear_cfg = {
-            "shoulder_width": ("cyan", {"Front", "Back", "Side (R)", "3/4 View"}),
+            "shoulder_width": ("cyan", {"Front", "Side (R)", "Back", "3/4 View"}),
             "sleeve_length": ("magenta", {"Back", "Side (R)"}),
             "inseam": ("yellow", {"Side (R)", "3/4 View"}),
             "front_rise": ("lime", {"Side (R)", "Front"}),
@@ -427,6 +427,8 @@ def render_4view(mesh, measurements, output_path, title="", model_label="",
             "c7": "white",
         }
         for jname, jpos in measurements.get("_debug_joints", {}).items():
+            if jname == "c7" and view_title != "Back":
+                continue
             color = _joint_colors.get(jname)
             if color is None:
                 continue

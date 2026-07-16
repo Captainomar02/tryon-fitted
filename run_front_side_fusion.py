@@ -2399,65 +2399,51 @@ def scale_result_params(result, scale_factor):
     scaled["scaled_param_keys"] = np.array(applied_keys, dtype=object)
     return scaled
 
-
-
-_CLAD_MEASUREMENT_API = None
-
-
-def _load_clad_measurement_api():
-    """Load the shared fused-mesh-first CLAD measurement adapter."""
-    global _CLAD_MEASUREMENT_API
-    if _CLAD_MEASUREMENT_API is not None:
-        return _CLAD_MEASUREMENT_API
-
-    repo_root = Path(__file__).resolve().parent
-    clad_root = repo_root / "clad-body"
-    for import_root in (repo_root, clad_root):
-        if import_root.exists() and str(import_root) not in sys.path:
-            sys.path.insert(0, str(import_root))
-
-    from scripts.measure_fused_mesh_clad import (
-        apply_arm_excluded_torso_measurements,
-        fused_body,
-        jsonable,
-        measure,
-        render_4view,
-    )
-
-    _CLAD_MEASUREMENT_API = {
-        "measure": measure,
-        "render_4view": render_4view,
-        "jsonable": jsonable,
-        "fused_body": fused_body,
-        "apply_arm_excluded_torso_measurements": apply_arm_excluded_torso_measurements,
-    }
-    return _CLAD_MEASUREMENT_API
-
-
-def save_measurements_json(measurements, output_json_path):
-    convert = _load_clad_measurement_api()["jsonable"]
-    with open(output_json_path, "w") as f:
-        json.dump(convert(measurements), f, indent=2, sort_keys=True)
-    return output_json_path
-
-
-def load_mhr_body_preferring_fusion_mesh(params_json):
-    """Compatibility wrapper around the fresh fused-mesh measurement loader."""
-    body, _ = _load_clad_measurement_api()["fused_body"](Path(params_json), None)
-    return body
-
-
 def save_clad_render_from_params(params_json, render_path, title):
-    api = _load_clad_measurement_api()
-    body, _ = api["fused_body"](Path(params_json), None)
-    measurements = api["measure"](body, preset="all", render_path=None)
-    torso_mesh = api["apply_arm_excluded_torso_measurements"](measurements, body)
-    api["render_4view"](
+    """Render through the upstream fused-mesh CLAD measurement pipeline.
+
+    This is the sole CLAD measurement/render pipeline. It contains garment
+    and surface-trace overrides (including the regular T-shirt's 90%-of-HPS-
+    to-crotch line) and publishes their polylines for the renderer.
+    """
+    from scripts import measure_fused_mesh_clad_upstream as upstream
+
+    body, fused_transform, front_transform = upstream.fused_body(Path(params_json), None)
+    measurements = upstream.measure(body, preset="all", render_path=None)
+    # Keep CLAD's repository shoulder construction unchanged: its acromion →
+    # posterior-C7 → acromion surface arc is the definition rendered here.
+    # Do not replace it with a fusion-specific seam anchor.
+    upstream.apply_surface_sleeve_length(measurements, body)
+    upstream.apply_distinct_stomach_measurement(measurements, body)
+    upstream.apply_surface_crotch_length(measurements, body)
+    torso_mesh = upstream.apply_production_core_measurements(measurements, body)
+
+    joint_meta = body.sam3d_params.get("_fused_joint_transfer", {})
+    surface_meta = body.sam3d_params.get("_fused_joint_landmarks", {})
+    measurements["_suppressed_measurements"] = upstream.suppress_measurements_for_invalid_joints(
+        measurements, joint_meta, surface_meta
+    )
+    measurements.update({
+        "_measurement_engine": "upstream_clad_fused_mesh_pipeline",
+        "_measurement_mesh_source": "fused_sdf_mesh",
+        "_fused_mesh_transform": fused_transform,
+        "_front_mhr_joint_transform": front_transform,
+        "_fused_joint_transfer": joint_meta,
+        "_fused_joint_landmarks": surface_meta,
+    })
+
+    # Preserve the values and surface polylines used by the image beside the
+    # render, so a rendered garment line always has an auditable measurement.
+    measurements_path = os.path.splitext(render_path)[0] + "_measurements.json"
+    with open(measurements_path, "w") as f:
+        json.dump(upstream.jsonable(measurements), f, indent=2, sort_keys=True)
+
+    upstream.render_4view(
         body.mesh,
         measurements,
         render_path,
         title=title,
-        model_label="Fused SDF",
+        model_label="Fused SDF / upstream CLAD",
         torso_mesh=torso_mesh,
     )
     return render_path
@@ -2465,6 +2451,7 @@ def save_clad_render_from_params(params_json, render_path, title):
 
 def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target_height_m, output_dir):
     """Use CLAD on the un-SDF-ed side mesh to locate bust and butt height bands."""
+    os.makedirs(output_dir, exist_ok=True)
     meta = {
         "enabled": np.array(False),
         "reason": np.array("not_run", dtype=object),
@@ -2517,11 +2504,13 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         save_result_json(side_anchor_params, paths["params_json"])
         save_mesh_obj(side_clad_vertices, faces, paths["clad_obj"])
 
-        api = _load_clad_measurement_api()
-        body, _ = api["fused_body"](Path(paths["params_json"]), None, pose_arms=False)
-        measurements = api["measure"](body, only=["bust_cm", "hip_cm", "underbust_cm"])
+        from scripts import measure_fused_mesh_clad_upstream as upstream
+        body, _, _ = upstream.fused_body(Path(paths["params_json"]), None)
+        measurements = upstream.measure(body, only=["bust_cm", "hip_cm", "underbust_cm"])
+        upstream.apply_production_core_measurements(measurements, body)
         paths["measurements_json"] = os.path.join(output_dir, "side_untouched_clad_anchor_measurements.json")
-        save_measurements_json(measurements, paths["measurements_json"])
+        with open(paths["measurements_json"], "w") as f:
+            json.dump(upstream.jsonable(measurements), f, indent=2, sort_keys=True)
 
         anchors = {}
         try:
@@ -2557,6 +2546,25 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         except Exception:
             pass
 
+        # The upstream side-anchor body intentionally has no transferred front
+        # joints, so its debug-joint overlay is absent. Derive the required
+        # upper chest boundary directly from SAM-3D's side shoulder landmarks
+        # in the same upright, target-height coordinate system as the mesh.
+        try:
+            keypoints = _to_numpy(side_result.get("pred_keypoints_3d")).astype(np.float64)
+            if keypoints.ndim == 2 and keypoints.shape[0] > 6 and keypoints.shape[1] == 3:
+                upright_keypoints = (keypoints - side_oriented["centroid"]) @ side_oriented["rotation_matrix"].T
+                upright_keypoints *= float(side_scale_factor)
+                shoulder_y = float(np.mean(upright_keypoints[[5, 6], 1]))
+                shoulder_line_pct = (shoulder_y - float(side_scaled[:, 1].min())) / target_height_m * 100.0
+                if 0.0 < shoulder_line_pct < 100.0:
+                    anchors["chest_upper"] = shoulder_line_pct / 100.0
+                    meta["shoulder_line_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
+                    meta["chest_full_high_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
+                    meta["shoulder_line_source"] = np.array("sam3d_side_shoulders_5_6", dtype=object)
+        except Exception:
+            pass
+
         try:
             joints = measurements.get("_debug_joints") or {}
             shoulder_zs = []
@@ -2566,7 +2574,7 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
                     shoulder_zs.append(float(joint[2]))
             height_cm = float(measurements.get("height_cm", target_height_m * 100.0))
             height_m = height_cm / 100.0 if height_cm > 0 else target_height_m
-            if shoulder_zs and height_m > 1e-8:
+            if "chest_upper" not in anchors and shoulder_zs and height_m > 1e-8:
                 shoulder_line_pct = float(np.mean(shoulder_zs) / height_m * 100.0)
                 if 0.0 < shoulder_line_pct < 100.0:
                     anchors["chest_upper"] = shoulder_line_pct / 100.0
@@ -2575,6 +2583,19 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
                     meta["shoulder_line_source"] = np.array("debug_joints_l_r_shoulder_mean", dtype=object)
         except Exception:
             pass
+
+        if "chest_upper" not in anchors:
+            # Last-resort semantic bound when a source does not retain usable
+            # shoulder landmarks (for example an older saved anchor params
+            # file). Keep the upper chest above the measured bust rather than
+            # rejecting an otherwise valid front/side pair.
+            bust_pct = float(meta["bust_pct"])
+            shoulder_line_pct = min(95.0, bust_pct + 12.0)
+            if 0.0 < shoulder_line_pct < 100.0:
+                anchors["chest_upper"] = shoulder_line_pct / 100.0
+                meta["shoulder_line_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
+                meta["chest_full_high_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
+                meta["shoulder_line_source"] = np.array("bust_plus_12pct_height_fallback", dtype=object)
 
         missing = [name for name in ("chest", "butt", "chest_lower", "chest_upper") if name not in anchors]
         if missing:

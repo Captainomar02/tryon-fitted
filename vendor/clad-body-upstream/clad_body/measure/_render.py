@@ -251,6 +251,27 @@ def _extract_thigh_contours_3d(mesh, z):
     return []
 
 
+def _round_closed_contour(points, iterations=4):
+    """Round only a rendered closed contour; never use it for its value.
+
+    Arm removal can split a torso cross-section at both axillae.  The
+    measurement code closes those short gaps to evaluate the circumference,
+    but a polygonal closure looks like two sharp spikes in a 2-D overlay.
+    Chaikin corner-cutting makes that *display-only* closure read as a smooth
+    underarm transition while retaining the original measured contour.
+    """
+    rounded = np.asarray(points, dtype=np.float64)
+    if len(rounded) < 4:
+        return rounded
+    for _ in range(iterations):
+        nxt = np.roll(rounded, -1, axis=0)
+        rounded = np.empty((len(rounded) * 2, 3), dtype=np.float64)
+        rounded[0::2] = 0.75 * points + 0.25 * nxt
+        rounded[1::2] = 0.25 * points + 0.75 * nxt
+        points = rounded
+    return rounded.astype(np.float32)
+
+
 def extract_measurement_contours(mesh, measurements, torso_mesh=None):
     """Extract 3D measurement contour polylines from a body mesh.
 
@@ -287,6 +308,8 @@ def extract_measurement_contours(mesh, measurements, torso_mesh=None):
                 cmesh, z, max_x_extent=max_x, return_contour=True,
                 combine_fragments=combine)
             if pts_3d is not None:
+                if name == "bust" and torso_mesh is not None:
+                    pts_3d = _round_closed_contour(pts_3d)
                 contours[name] = [pts_3d]
 
     # Thigh contours (two legs) via perpendicular plane slicing
@@ -401,7 +424,9 @@ def render_4view(mesh, measurements, output_path, title="", model_label="",
         # No depth testing on 2D overlay → only show each line from views
         # where it's naturally visible (not occluded by the body).
         _linear_cfg = {
-            "shoulder_width": ("cyan", {"Front", "Back", "Side (R)", "3/4 View"}),
+            # This is a posterior shoulder seam. With 2D overlays there is no
+            # depth test, so displaying it on the front view is misleading.
+            "shoulder_width": ("cyan", {"Front", "Side (R)", "Back", "3/4 View"}),
             "sleeve_length": ("magenta", {"Back", "Side (R)"}),
             "inseam": ("yellow", {"Side (R)", "3/4 View"}),
             "front_rise": ("lime", {"Side (R)", "Front"}),
@@ -425,6 +450,8 @@ def render_4view(mesh, measurements, output_path, title="", model_label="",
             "c7": "white",
         }
         for jname, jpos in measurements.get("_debug_joints", {}).items():
+            if jname == "c7" and view_title != "Back":
+                continue
             color = _joint_colors.get(jname)
             if color is None:
                 continue

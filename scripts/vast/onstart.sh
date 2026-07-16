@@ -78,3 +78,33 @@ RTDetrForObjectDetection.from_pretrained('PekingU/rtdetr_r50vd_coco_o365')
 MoGeModel.from_pretrained('Ruicheng/moge-2-vitl-normal')
 print('[bootstrap] Required runtime models are ready.')
 PY
+
+echo '[bootstrap] Prefetching the DINOv3 Torch Hub source used by SAM-3D...'
+python - <<'PY'
+import torch
+
+# SAM-3D loads this exact backbone with pretrained=False, then applies its own
+# checkpoint.  Loading it once here caches the GitHub source in TORCH_HOME and
+# verifies transitive Hub dependencies (including termcolor) before use.
+torch.hub.load(
+    'facebookresearch/dinov3',
+    'dinov3_vith16plus',
+    source='github',
+    pretrained=False,
+)
+print('[bootstrap] DINOv3 Torch Hub source is ready.')
+PY
+
+echo '[bootstrap] Verifying the fusion runtime imports...'
+python - <<'PY'
+import cv2
+import numpy
+import torch
+import trimesh
+from sam_3d_body import load_sam_3d_body
+from tools.build_detector import HumanDetector
+from tools.build_fov_estimator import FOVEstimator
+from tools.build_sam import HumanSegmentor
+
+print('[bootstrap] Fusion runtime imports are ready.')
+PY
