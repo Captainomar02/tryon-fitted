@@ -292,12 +292,6 @@ def extract_measurement_contours(mesh, measurements, torso_mesh=None):
 
     # Plane-sweep contours for bust, underbust, waist, stomach, hip
     for name in ["bust", "underbust", "waist", "stomach", "hip"]:
-        if name == "bust" and measurements.get("_bust_render_pts") is not None:
-            # The fused measurement pipeline supplies a shoulder-root-clipped
-            # torso contour.  Draw exactly that contour rather than rebuilding
-            # a hull from the full body and reintroducing an armhole fragment.
-            contours[name] = [_round_closed_contour(measurements["_bust_render_pts"])]
-            continue
         z = measurements.get(f"_{name}_z", 0)
         if z > 0:
             if name == "hip":

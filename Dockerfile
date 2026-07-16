@@ -44,6 +44,11 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && python -m pip install --no-cache-dir -r /tmp/requirements-vast.txt \
     && rm /tmp/requirements-vast.txt
 
+# The FBX reader is kept in its own small environment.  Its native wheel is
+# stable with NumPy 2.3 but not with the main runtime's newer NumPy build.
+RUN python -m venv /opt/mhr-fbx-venv \
+    && /opt/mhr-fbx-venv/bin/python -m pip install --no-cache-dir numpy==2.3.3 ufbx==0.0.5
+
 RUN python -c 'import torch, torchvision; import pymomentum.geometry; import mhr; print(f"CLAD deps ok: torch {torch.__version__}, torchvision {torchvision.__version__}")'
 
 RUN mkdir -p \

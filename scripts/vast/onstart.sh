@@ -42,6 +42,62 @@ if [[ ! -s "${MHR_ASSETS_DIR}/corrective_blendshapes_lod1.npz" ]]; then
   trap - EXIT
 fi
 
+echo '[bootstrap] Building the exact MHR arm/hand skinning cache...'
+if [[ ! -s "${MHR_ASSETS_DIR}/arm_skinning_masks.npz" ]]; then
+  MHR_FBX_PYTHON="${MHR_FBX_PYTHON:-/opt/mhr-fbx-venv/bin/python}"
+  if [[ ! -x "${MHR_FBX_PYTHON}" ]]; then
+    # Compatibility fallback for an existing image built before this helper
+    # environment was added to the Dockerfile.
+    MHR_FBX_ENV="${APP_DIR}/.cache/mhr-fbx-venv"
+    if [[ ! -x "${MHR_FBX_ENV}/bin/python" ]]; then
+      python -m venv "${MHR_FBX_ENV}"
+      "${MHR_FBX_ENV}/bin/python" -m pip install --no-cache-dir numpy==2.3.3 ufbx==0.0.5
+    fi
+    MHR_FBX_PYTHON="${MHR_FBX_ENV}/bin/python"
+  fi
+  "${MHR_FBX_PYTHON}" - "${MHR_ASSETS_DIR}/lod1.fbx" "${MHR_ASSETS_DIR}/arm_skinning_masks.npz" <<'PY'
+import gc
+import os
+import sys
+
+# ufbx's native scene destructor is unstable during cyclic GC in this image.
+# Disable cyclic GC and exit directly after the fully-written cache is closed.
+gc.disable()
+import numpy as np
+import ufbx
+
+fbx_path, output_path = sys.argv[1:]
+scene = ufbx.load_file(fbx_path)
+mesh = scene.meshes[0]
+vertex_count = mesh.num_vertices
+tokens = ("uparm", "lowarm", "wrist", "pinky", "ring", "middle", "index", "thumb")
+wrist_tokens = ("wrist", "pinky", "ring", "middle", "index", "thumb")
+
+def score(prefix, selected_tokens):
+    values = np.zeros(vertex_count, dtype=np.float32)
+    for cluster in mesh.skin_deformers[0].clusters:
+        name = str(cluster.bone_node.name).lower()
+        if name.startswith(prefix) and any(token in name for token in selected_tokens):
+            indices = np.asarray(list(cluster.vertices), dtype=np.int64)
+            weights = np.asarray(list(cluster.weights), dtype=np.float32)
+            values[indices] += weights
+    return values
+
+groups = {
+    "l_upper": score("l_", ("uparm",)), "l_lower": score("l_", ("lowarm",)),
+    "l_wrist": score("l_", wrist_tokens), "r_upper": score("r_", ("uparm",)),
+    "r_lower": score("r_", ("lowarm",)), "r_wrist": score("r_", wrist_tokens),
+}
+l_score, r_score = score("l_", tokens), score("r_", tokens)
+np.savez_compressed(
+    output_path, l_mask=l_score >= 0.05, r_mask=r_score >= 0.05,
+    l_score=l_score, r_score=r_score, **groups,
+)
+print(f"[bootstrap] Cached MHR arm/hand masks for {vertex_count} vertices.", flush=True)
+os._exit(0)
+PY
+fi
+
 # MHR.from_files() defaults to an assets directory beside the installed mhr package.
 MHR_PACKAGE_ASSETS="$(python - <<'PY'
 from pathlib import Path

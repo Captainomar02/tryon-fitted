@@ -37,6 +37,10 @@ _ARM_SKINNING_CACHE: tuple[dict[str, np.ndarray], dict[str, np.ndarray]] | None 
 _ARM_SKINNING_GROUP_CACHE: dict[str, np.ndarray] | None = None
 BUST_FULL_TORSO_WIDTH_FACTOR = float(os.environ.get("FUSION_BUST_FULL_TORSO_WIDTH_FACTOR", "1.15"))
 ARM_MASK_CACHE_PATH = REPO_ROOT / "checkpoints" / "mhr-assets" / "assets" / "arm_skinning_masks.npz"
+# A vertex with a small blending contribution from an arm bone still belongs
+# to the torso near the axilla.  Remove only vertices substantially owned by
+# an arm/hand, rather than every vertex with any (>=5%) arm influence.
+ARM_SKINNING_EXCLUSION_THRESHOLD = float(os.environ.get("FUSION_ARM_SKINNING_EXCLUSION_THRESHOLD", "0.10"))
 
 
 def _mhr_subprocess_env() -> dict[str, str]:
@@ -172,65 +176,37 @@ def mhr_arm_skinning_groups(n_vertices: int) -> dict[str, np.ndarray] | None:
 
 
 def arm_excluded_torso_mesh(mesh: trimesh.Trimesh, joints: dict[str, np.ndarray] | None = None) -> tuple[trimesh.Trimesh | None, dict[str, Any]]:
-    """Remove arm faces from transferred shoulder/elbow/wrist landmarks.
+    """Remove faces assigned to either MHR arm or hand by skinning weights.
 
-    This stays in the fused mesh's coordinate system and avoids the unstable
-    native Momentum skinning extractor that previously disabled chest loops.
+    The fused mesh has MHR LOD1 topology, so the FBX skinning mask is an exact
+    per-vertex classification.  This deliberately replaces the former joint
+    capsule approximation, which could cut through torso vertices or leave an
+    upper-arm spike in a bust slice.
     """
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
-    meta: dict[str, Any] = {"enabled": False, "method": "joint_chain_arm_face_removal"}
-    arm_mask = np.zeros(len(vertices), dtype=bool)
-    height = float(np.ptp(vertices[:, 2]))
-    # A forearm can be much thinner than the upper arm adjacent to the bust.
-    # The floor is height-relative (not body-specific) and prevents that
-    # forearm estimate from leaking upper-arm vertices into a chest slice.
-    min_radius, max_radius = 0.045 * height, 0.090 * height
-
-    def point_to_segment_distance(start: np.ndarray, end: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        direction = end - start
-        length_sq = float(direction @ direction)
-        if length_sq <= 1e-10:
-            return np.full(len(vertices), np.inf), np.zeros(len(vertices))
-        fraction = np.clip(((vertices - start) @ direction) / length_sq, 0.0, 1.0)
-        closest = start + fraction[:, None] * direction
-        return np.linalg.norm(vertices - closest, axis=1), fraction
-
-    side_radii: dict[str, float] = {}
-    if joints:
-        for side in ("l", "r"):
-            chain = [joints.get(f"{side}_shoulder"), joints.get(f"{side}_elbow"), joints.get(f"{side}_wrist")]
-            if any(point is None for point in chain):
-                continue
-            chain = [np.asarray(point, dtype=np.float64) for point in chain]
-            # Measure this person's forearm radius away from the torso, then
-            # use a modest margin so the entire arm surface is excluded.
-            forearm_distance, forearm_fraction = point_to_segment_distance(chain[1], chain[2])
-            midpoint_x = float((chain[1][0] + chain[2][0]) * 0.5)
-            outward = 1.0 if side == "l" else -1.0
-            samples = forearm_distance[
-                (forearm_fraction >= 0.15) & (forearm_fraction <= 0.85)
-                & (outward * (vertices[:, 0] - midpoint_x) >= -0.015 * height)
-                & (forearm_distance >= 0.010 * height) & (forearm_distance <= 0.160 * height)
-            ]
-            if len(samples) >= 30:
-                radius = float(np.clip(np.percentile(samples, 75) * 1.15, min_radius, max_radius))
-                source = "mesh_adaptive_forearm_radius"
-            else:
-                radius = float(np.clip(0.060 * height, min_radius, max_radius))
-                source = "height_scaled_radius_fallback"
-            side_radii[side] = radius
-            for start, end in zip(chain, chain[1:]):
-                distance, _ = point_to_segment_distance(start, end)
-                arm_mask |= distance <= radius
-            meta[f"{side}_arm_radius_m"] = radius
-            meta[f"{side}_arm_radius_source"] = source
+    meta: dict[str, Any] = {"enabled": False, "method": "mhr_lod1_arm_hand_skinning_face_removal"}
+    skinning = mhr_arm_skinning_masks(len(vertices))
+    if skinning is None:
+        meta["reason"] = "mhr_lod1_arm_skinning_mask_unavailable"
+        return None, meta
+    masks, scores = skinning
+    arm_score = np.maximum(scores["l"], scores["r"])
+    arm_mask = np.asarray(arm_score >= ARM_SKINNING_EXCLUSION_THRESHOLD, dtype=bool)
     if not arm_mask.any():
-        meta.update({"reason": "missing_arm_joint_chains_full_mesh_fallback", "fallback": True})
-        return mesh.copy(), meta
+        meta["reason"] = "mhr_lod1_arm_skinning_mask_empty"
+        return None, meta
     faces = np.asarray(mesh.faces, dtype=np.int32)
     keep_faces = ~arm_mask[faces].any(axis=1)
     kept = int(np.count_nonzero(keep_faces))
-    meta.update({"enabled": kept > 0, "removed_vertices": int(np.count_nonzero(arm_mask)), "kept_faces": kept, "removed_faces": int(len(faces) - kept)})
+    meta.update({
+        "enabled": kept > 0,
+        "removed_vertices": int(np.count_nonzero(arm_mask)),
+        "left_arm_vertices": int(np.count_nonzero(scores["l"] >= ARM_SKINNING_EXCLUSION_THRESHOLD)),
+        "right_arm_vertices": int(np.count_nonzero(scores["r"] >= ARM_SKINNING_EXCLUSION_THRESHOLD)),
+        "kept_faces": kept,
+        "removed_faces": int(len(faces) - kept),
+        "weight_threshold": ARM_SKINNING_EXCLUSION_THRESHOLD,
+    })
     if kept <= 0:
         meta["reason"] = "all_faces_removed"
         return None, meta
@@ -1206,33 +1182,14 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
 
     slicer = MeshSlicer(torso_mesh)
     full_slicer = MeshSlicer(body.mesh)
-    # The shoulder roots plus the removal radii define a person-specific
-    # torso envelope.  Points outside it belong to the axilla/upper-arm side
-    # of a cut, even when their remaining mesh fragment is still centred.
-    left_root = body.joints.get("l_shoulder") if body.joints else None
-    right_root = body.joints.get("r_shoulder") if body.joints else None
-    left_limit = None
-    right_limit = None
-    if left_root is not None:
-        left_limit = float(np.asarray(left_root)[0]) - float(torso_meta.get("l_arm_radius_m", 0.0))
-    if right_root is not None:
-        right_limit = float(np.asarray(right_root)[0]) + float(torso_meta.get("r_arm_radius_m", 0.0))
 
     def arm_safe_torso_points(z: float) -> list[np.ndarray]:
-        """Return only torso cross-section points inside both shoulder roots."""
-        parts: list[np.ndarray] = []
-        for points, x_extent, x_center in slicer.contours_at_z(float(z)):
-            if x_extent < 0.12 or abs(x_center) > 0.08:
-                continue
-            keep = np.ones(len(points), dtype=bool)
-            if left_limit is not None:
-                keep &= points[:, 0] <= left_limit
-            if right_limit is not None:
-                keep &= points[:, 0] >= right_limit
-            clipped = points[keep]
-            if len(clipped) >= 3:
-                parts.append(clipped)
-        return parts
+        """Return every remaining torso contour after exact skinning removal.
+
+        No joint capsule, shoulder-root limit, or lateral clipping is applied
+        here.  The only arm exclusion is in ``arm_excluded_torso_mesh()``.
+        """
+        return [points for points, _, _ in slicer.contours_at_z(float(z)) if len(points) >= 3]
 
     def centered_full_torso_circumference(z: float, extent: float, torso_extent_limit: float) -> tuple[float, int, float]:
         """Use the intact, centred torso loop when arms are separate slices.
@@ -1258,7 +1215,7 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             return float(np.linalg.norm(np.diff(closed, axis=0), axis=1).sum()), 1, float(x_extent)
 
     def centered_arm_excluded_torso_circumference(z: float) -> tuple[float, int]:
-        """Measure only centred torso points inside the shoulder-root envelope."""
+        """Measure the contours remaining after MHR arm/hand face removal."""
         parts = arm_safe_torso_points(z)
         if not parts:
             return 0.0, 0
@@ -1405,15 +1362,6 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         "bust", bust_low, bust_high, 0.85, arm_excluded_only=True,
     )
     bust_source = "waist_to_bilateral_shoulder_line_max_on_arm_shoulder_excluded_torso"
-    bust_render_pts = None
-    render_parts = arm_safe_torso_points(bust_z) if bust_z > 0 else []
-    if render_parts:
-        try:
-            from scipy.spatial import ConvexHull
-            hull_pts = np.vstack(render_parts)[ConvexHull(np.vstack(render_parts)).vertices]
-            bust_render_pts = np.column_stack([hull_pts, np.full(len(hull_pts), bust_z)]).astype(np.float32)
-        except Exception:
-            pass
     bust_details = {
         **bust_details,
         "waist_z_m": upstream_waist_z,
@@ -1421,8 +1369,7 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         "search_low_pct": bust_low / height * 100.0,
         "search_high_pct": bust_high / height * 100.0,
         "arm_shoulder_excluded": True,
-        "left_torso_limit_m": left_limit,
-        "right_torso_limit_m": right_limit,
+        "arm_exclusion_method": torso_meta.get("method"),
     }
     hip_m, hip_z, hip_q = centered_hip_circumference(0.40 * height, 0.60 * height)
     if bust_m:
@@ -1435,8 +1382,6 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             "_bust_search_high_pct": bust_details["search_high_pct"],
             "_bust_search_high_source": "bilateral_shoulder_line",
         })
-        if bust_render_pts is not None:
-            measurements["_bust_render_pts"] = bust_render_pts
     if hip_m:
         measurements.update({"hip_cm": hip_m * 100.0, "_hip_z": hip_z, "_hip_pct": hip_z / height * 100.0})
 
