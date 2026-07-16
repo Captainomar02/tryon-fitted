@@ -1346,25 +1346,50 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         edge = z <= low + 0.004 or z >= high - 0.004
         return circumference, z, _quality("medium" if edge else "high", "selected_search_boundary" if edge else "centred_pelvis_component")
 
-    # Select the maximum arm/shoulder-free torso circumference between this
-    # person's waist landmark and bilateral shoulder line.  This replaces a
-    # fixed-percent chest band with anatomical endpoints.
-    upstream_waist_z = float(measurements.get("_waist_z", 0.61 * height) or 0.61 * height)
+    # Bound the bust search at the lower rib cage rather than the waist.  A
+    # waist-to-shoulder maximum can incorrectly report a prominent abdomen as
+    # the chest/bust.  The existing bilateral ISO landmark search supplies
+    # each person's lowest-rib level; a small physical offset keeps the
+    # under-rib/upper-abdomen transition out of the search.
+    waist_landmarks, waist_reasons = find_iso_waist_landmarks(torso_mesh, height)
+    bust_lower_rib_buffer_m = float(os.environ.get("FUSION_BUST_LOWEST_RIB_BUFFER_M", "0.020"))
+    bust_lower_rib_buffer_m = max(0.0, bust_lower_rib_buffer_m)
+    if waist_landmarks is not None:
+        lowest_rib_zs = [
+            float(np.asarray(waist_landmarks[side]["lowest_rib"], dtype=np.float64)[2])
+            for side in ("left", "right")
+        ]
+        bust_low = float(np.mean(lowest_rib_zs)) + bust_lower_rib_buffer_m
+        bust_low_source = "bilateral_lowest_rib_plus_buffer"
+        bust_low_details = {
+            "left_lowest_rib_z_m": lowest_rib_zs[0],
+            "right_lowest_rib_z_m": lowest_rib_zs[1],
+            "lowest_rib_buffer_m": bust_lower_rib_buffer_m,
+        }
+    else:
+        # The fallback is deliberately above the old 61%-height waist bound,
+        # so a failed landmark search still cannot turn the abdomen into bust.
+        bust_low = 0.67 * height
+        bust_low_source = "conservative_67pct_height_fallback"
+        bust_low_details = {"lowest_rib_landmark_reasons": waist_reasons}
+
     shoulder_zs = [
         float(np.asarray(body.joints[key], dtype=np.float64)[2])
         for key in ("l_shoulder", "r_shoulder")
         if body.joints and key in body.joints
     ]
     shoulder_line_z = float(np.mean(shoulder_zs)) if shoulder_zs else 0.80 * height
-    bust_low = min(upstream_waist_z, shoulder_line_z - 0.010)
+    bust_low = min(bust_low, shoulder_line_z - 0.010)
     bust_high = max(shoulder_line_z, bust_low + 0.010)
     bust_m, bust_z, bust_q, bust_source, bust_details = select_max(
         "bust", bust_low, bust_high, 0.85, arm_excluded_only=True,
     )
-    bust_source = "waist_to_bilateral_shoulder_line_max_on_arm_shoulder_excluded_torso"
+    bust_source = "lowest_rib_to_bilateral_shoulder_line_max_on_arm_shoulder_excluded_torso"
     bust_details = {
         **bust_details,
-        "waist_z_m": upstream_waist_z,
+        "lower_boundary_source": bust_low_source,
+        **bust_low_details,
+        "lower_boundary_z_m": bust_low,
         "shoulder_line_z_m": shoulder_line_z,
         "search_low_pct": bust_low / height * 100.0,
         "search_high_pct": bust_high / height * 100.0,
@@ -1386,7 +1411,6 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         measurements.update({"hip_cm": hip_m * 100.0, "_hip_z": hip_z, "_hip_pct": hip_z / height * 100.0})
 
     _clear_waist_dependent_measurements(measurements)
-    waist_landmarks, waist_reasons = find_iso_waist_landmarks(torso_mesh, height)
     waist_z: float | None = None
     if waist_landmarks is None:
         waist_q = _quality("low", "anatomical_anchors_not_found", *waist_reasons)

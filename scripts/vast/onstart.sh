@@ -44,44 +44,34 @@ fi
 
 echo '[bootstrap] Building the exact MHR arm/hand skinning cache...'
 if [[ ! -s "${MHR_ASSETS_DIR}/arm_skinning_masks.npz" ]]; then
-  MHR_FBX_PYTHON="${MHR_FBX_PYTHON:-/opt/mhr-fbx-venv/bin/python}"
-  if [[ ! -x "${MHR_FBX_PYTHON}" ]]; then
-    # Compatibility fallback for an existing image built before this helper
-    # environment was added to the Dockerfile.
-    MHR_FBX_ENV="${APP_DIR}/.cache/mhr-fbx-venv"
-    if [[ ! -x "${MHR_FBX_ENV}/bin/python" ]]; then
-      python -m venv "${MHR_FBX_ENV}"
-      "${MHR_FBX_ENV}/bin/python" -m pip install --no-cache-dir numpy==2.3.3 ufbx==0.0.5
-    fi
-    MHR_FBX_PYTHON="${MHR_FBX_ENV}/bin/python"
-  fi
-  "${MHR_FBX_PYTHON}" - "${MHR_ASSETS_DIR}/lod1.fbx" "${MHR_ASSETS_DIR}/arm_skinning_masks.npz" <<'PY'
-import gc
-import os
+  # The TorchScript MHR checkpoint contains the exact LOD1 skinning weights
+  # and joint names.  Reading it avoids the native FBX readers, which can
+  # segfault on this asset in the runtime image.
+  python - "${CHECKPOINT_DIR}/assets/mhr_model.pt" "${MHR_ASSETS_DIR}/arm_skinning_masks.npz" <<'PY'
 import sys
 
-# ufbx's native scene destructor is unstable during cyclic GC in this image.
-# Disable cyclic GC and exit directly after the fully-written cache is closed.
-gc.disable()
 import numpy as np
-import ufbx
+import torch
 
-fbx_path, output_path = sys.argv[1:]
-scene = ufbx.load_file(fbx_path)
-mesh = scene.meshes[0]
-vertex_count = mesh.num_vertices
+checkpoint_path, output_path = sys.argv[1:]
 tokens = ("uparm", "lowarm", "wrist", "pinky", "ring", "middle", "index", "thumb")
 wrist_tokens = ("wrist", "pinky", "ring", "middle", "index", "thumb")
 
+model = torch.jit.load(checkpoint_path, map_location="cpu")
+state = model.state_dict()
+names = list(model.character_torch.skeleton.joint_names)
+vi = state["character_torch.linear_blend_skinning.vert_indices_flattened"].cpu().numpy()
+ji = state["character_torch.linear_blend_skinning.skin_indices_flattened"].cpu().numpy()
+weights = state["character_torch.linear_blend_skinning.skin_weights_flattened"].cpu().numpy()
+vertex_count = int(vi.max()) + 1
+
 def score(prefix, selected_tokens):
-    values = np.zeros(vertex_count, dtype=np.float32)
-    for cluster in mesh.skin_deformers[0].clusters:
-        name = str(cluster.bone_node.name).lower()
-        if name.startswith(prefix) and any(token in name for token in selected_tokens):
-            indices = np.asarray(list(cluster.vertices), dtype=np.int64)
-            weights = np.asarray(list(cluster.weights), dtype=np.float32)
-            values[indices] += weights
-    return values
+    bone_ids = [
+        i for i, name in enumerate(names)
+        if name.lower().startswith(prefix) and any(token in name.lower() for token in selected_tokens)
+    ]
+    selected = np.isin(ji, np.asarray(bone_ids, dtype=ji.dtype))
+    return np.bincount(vi[selected], weights=weights[selected], minlength=vertex_count).astype(np.float32)
 
 groups = {
     "l_upper": score("l_", ("uparm",)), "l_lower": score("l_", ("lowarm",)),
@@ -93,8 +83,8 @@ np.savez_compressed(
     output_path, l_mask=l_score >= 0.05, r_mask=r_score >= 0.05,
     l_score=l_score, r_score=r_score, **groups,
 )
+
 print(f"[bootstrap] Cached MHR arm/hand masks for {vertex_count} vertices.", flush=True)
-os._exit(0)
 PY
 fi
 
@@ -108,20 +98,9 @@ PY
 rm -rf "${MHR_PACKAGE_ASSETS}"
 ln -s "${MHR_ASSETS_DIR}" "${MHR_PACKAGE_ASSETS}"
 
-echo '[bootstrap] Checking out only SAM2 runtime source and its required checkpoint...'
-if [[ ! -f "${SAM2_DIR}/sam2/build_sam.py" ]]; then
-  rm -rf "${SAM2_DIR}"
-  git clone --depth 1 --filter=blob:none --sparse --branch "${SAM2_REF}" \
-    https://github.com/facebookresearch/sam2.git "${SAM2_DIR}"
-  git -C "${SAM2_DIR}" sparse-checkout set sam2 setup.py pyproject.toml
-fi
-mkdir -p "${SAM2_DIR}/checkpoints"
-if [[ ! -s "${SAM2_DIR}/checkpoints/sam2.1_hiera_large.pt" ]]; then
-  curl --fail --location --retry 3 \
-    --output "${SAM2_DIR}/checkpoints/sam2.1_hiera_large.pt" \
-    https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
-fi
-python -m pip install --no-cache-dir --no-deps -e "${SAM2_DIR}"
+echo '[bootstrap] Installing the SAM2 runtime source and checkpoint...'
+APP_DIR="${APP_DIR}" SAM2_DIR="${SAM2_DIR}" SAM2_REF="${SAM2_REF}" \
+  "${APP_DIR}/scripts/vast/setup_sam2.sh"
 
 echo '[bootstrap] Prefetching the exact RT-DETR and MoGe2 runtime models...'
 python - <<'PY'
