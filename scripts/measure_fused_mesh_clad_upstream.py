@@ -1206,6 +1206,33 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
 
     slicer = MeshSlicer(torso_mesh)
     full_slicer = MeshSlicer(body.mesh)
+    # The shoulder roots plus the removal radii define a person-specific
+    # torso envelope.  Points outside it belong to the axilla/upper-arm side
+    # of a cut, even when their remaining mesh fragment is still centred.
+    left_root = body.joints.get("l_shoulder") if body.joints else None
+    right_root = body.joints.get("r_shoulder") if body.joints else None
+    left_limit = None
+    right_limit = None
+    if left_root is not None:
+        left_limit = float(np.asarray(left_root)[0]) - float(torso_meta.get("l_arm_radius_m", 0.0))
+    if right_root is not None:
+        right_limit = float(np.asarray(right_root)[0]) + float(torso_meta.get("r_arm_radius_m", 0.0))
+
+    def arm_safe_torso_points(z: float) -> list[np.ndarray]:
+        """Return only torso cross-section points inside both shoulder roots."""
+        parts: list[np.ndarray] = []
+        for points, x_extent, x_center in slicer.contours_at_z(float(z)):
+            if x_extent < 0.12 or abs(x_center) > 0.08:
+                continue
+            keep = np.ones(len(points), dtype=bool)
+            if left_limit is not None:
+                keep &= points[:, 0] <= left_limit
+            if right_limit is not None:
+                keep &= points[:, 0] >= right_limit
+            clipped = points[keep]
+            if len(clipped) >= 3:
+                parts.append(clipped)
+        return parts
 
     def centered_full_torso_circumference(z: float, extent: float, torso_extent_limit: float) -> tuple[float, int, float]:
         """Use the intact, centred torso loop when arms are separate slices.
@@ -1231,11 +1258,8 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             return float(np.linalg.norm(np.diff(closed, axis=0), axis=1).sum()), 1, float(x_extent)
 
     def centered_arm_excluded_torso_circumference(z: float) -> tuple[float, int]:
-        """Measure only centred torso fragments; never recombine arm remnants."""
-        parts = [
-            points for points, x_extent, x_center in slicer.contours_at_z(float(z))
-            if x_extent >= 0.12 and abs(x_center) <= 0.08
-        ]
+        """Measure only centred torso points inside the shoulder-root envelope."""
+        parts = arm_safe_torso_points(z)
         if not parts:
             return 0.0, 0
         points = np.vstack(parts)
@@ -1381,6 +1405,15 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         "bust", bust_low, bust_high, 0.85, arm_excluded_only=True,
     )
     bust_source = "waist_to_bilateral_shoulder_line_max_on_arm_shoulder_excluded_torso"
+    bust_render_pts = None
+    render_parts = arm_safe_torso_points(bust_z) if bust_z > 0 else []
+    if render_parts:
+        try:
+            from scipy.spatial import ConvexHull
+            hull_pts = np.vstack(render_parts)[ConvexHull(np.vstack(render_parts)).vertices]
+            bust_render_pts = np.column_stack([hull_pts, np.full(len(hull_pts), bust_z)]).astype(np.float32)
+        except Exception:
+            pass
     bust_details = {
         **bust_details,
         "waist_z_m": upstream_waist_z,
@@ -1388,6 +1421,8 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
         "search_low_pct": bust_low / height * 100.0,
         "search_high_pct": bust_high / height * 100.0,
         "arm_shoulder_excluded": True,
+        "left_torso_limit_m": left_limit,
+        "right_torso_limit_m": right_limit,
     }
     hip_m, hip_z, hip_q = centered_hip_circumference(0.40 * height, 0.60 * height)
     if bust_m:
@@ -1400,6 +1435,8 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             "_bust_search_high_pct": bust_details["search_high_pct"],
             "_bust_search_high_source": "bilateral_shoulder_line",
         })
+        if bust_render_pts is not None:
+            measurements["_bust_render_pts"] = bust_render_pts
     if hip_m:
         measurements.update({"hip_cm": hip_m * 100.0, "_hip_z": hip_z, "_hip_pct": hip_z / height * 100.0})
 
