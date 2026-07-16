@@ -1379,25 +1379,53 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
     bust_low = max(upstream_waist_z, 0.68 * height)
     bust_high = shoulder_line_z - 0.020 if shoulder_line_z > 0 else 0.80 * height
     bust_high = max(bust_high, bust_low + 0.010)
-    bust_zs = np.arange(bust_low, bust_high, 0.002)
-    bust_circs = np.asarray([
-        slicer.circumference_at_z(float(z), combine_fragments=True)
-        for z in bust_zs
-    ]) if len(bust_zs) else np.asarray([])
-    bust_valid = bust_circs > 0.30
-    if bust_valid.any():
-        index = int(np.argmax(np.where(bust_valid, bust_circs, -1.0)))
-        bust_m, bust_z = float(bust_circs[index]), float(bust_zs[index])
+    # Bust is a prominence landmark, not the largest upper-torso loop.  Scan
+    # the central anterior surface in the chest portion of the waist→shoulder
+    # span and select its most-forward (minimum-Y) level.  This lands on the
+    # breast/pectoral prominence instead of the armpit/shoulder shelf.
+    chest_span = bust_high - upstream_waist_z
+    prominence_low = max(bust_low, upstream_waist_z + 0.25 * chest_span)
+    prominence_high = bust_high - 0.20 * chest_span
+    prominence_zs = np.arange(prominence_low, prominence_high, 0.002)
+    torso_vertices = np.asarray(torso_mesh.vertices, dtype=np.float64)
+    torso_width = float(np.ptp(torso_vertices[:, 0]))
+    central_half_width = max(0.06 * height, 0.35 * torso_width)
+    anterior_profile = []
+    for z in prominence_zs:
+        band = torso_vertices[
+            (np.abs(torso_vertices[:, 2] - z) <= 0.012)
+            & (np.abs(torso_vertices[:, 0]) <= central_half_width)
+        ]
+        anterior_profile.append(float(np.quantile(band[:, 1], 0.03)) if len(band) >= 8 else np.nan)
+    anterior_profile = np.asarray(anterior_profile, dtype=np.float64)
+    valid_profile = np.isfinite(anterior_profile)
+    if valid_profile.any():
+        # 1 cm moving average prevents a single mesh vertex from moving the
+        # anatomical landmark.  The first minimum wins on a flat breast apex.
+        filled = np.interp(prominence_zs, prominence_zs[valid_profile], anterior_profile[valid_profile])
+        smoothed = np.convolve(filled, np.full(5, 0.2), mode="same")
+        index = int(np.argmin(smoothed))
+        bust_z = float(prominence_zs[index])
+        bust_m = float(slicer.circumference_at_z(bust_z, combine_fragments=True))
     else:
-        bust_m, bust_z = 0.0, 0.0
-    bust_q = _quality("high" if bust_m > 0.30 else "low", "waist_to_shoulder_line_arm_excluded_sweep")
-    bust_source = "waist_to_shoulder_line_arm_excluded_sweep"
+        # Safety fallback when a fused mesh has insufficient central surface.
+        bust_zs = np.arange(bust_low, bust_high, 0.002)
+        bust_circs = np.asarray([slicer.circumference_at_z(float(z), combine_fragments=True) for z in bust_zs])
+        valid = bust_circs > 0.30
+        index = int(np.argmax(np.where(valid, bust_circs, -1.0))) if valid.any() else 0
+        bust_z = float(bust_zs[index]) if len(bust_zs) else 0.0
+        bust_m = float(bust_circs[index]) if valid.any() else 0.0
+    bust_q = _quality("high" if bust_m > 0.30 else "low", "central_anterior_bust_prominence_arm_excluded")
+    bust_source = "central_anterior_bust_prominence_arm_excluded"
     bust_details = {
         "waist_z_m": upstream_waist_z,
         "shoulder_line_z_m": shoulder_line_z,
         "shoulder_buffer_m": 0.020,
         "search_low_pct": bust_low / height * 100.0,
         "search_high_pct": bust_high / height * 100.0,
+        "prominence_search_low_pct": prominence_low / height * 100.0,
+        "prominence_search_high_pct": prominence_high / height * 100.0,
+        "central_half_width_m": central_half_width,
     }
     hip_m, hip_z, hip_q = centered_hip_circumference(0.40 * height, 0.60 * height)
     if bust_m:
@@ -1408,7 +1436,7 @@ def apply_production_core_measurements(measurements: dict[str, Any], body: MhrBo
             "_bust_measurement_source": bust_source,
             "_bust_full_torso_component": bust_details,
             "_bust_search_high_pct": bust_details["search_high_pct"],
-            "_bust_search_high_source": "bilateral_shoulder_line_minus_2cm",
+            "_bust_search_high_source": "central_anterior_bust_prominence_within_waist_to_shoulder_span",
         })
     if hip_m:
         measurements.update({"hip_cm": hip_m * 100.0, "_hip_z": hip_z, "_hip_pct": hip_z / height * 100.0})
