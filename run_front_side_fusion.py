@@ -4,6 +4,7 @@ import os
 import argparse
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -17,8 +18,8 @@ from fusion_quality import (
     make_quality_report,
     projected_silhouette,
     silhouette_report,
-    similarity_align,
     torso_mask_from_landmarks,
+    upright_similarity_align,
     validate_result,
 )
 
@@ -402,6 +403,13 @@ SIDE_SDF_ROW_UNDERFIT_PEAK_PRESERVE = True
 SIDE_SDF_SOLVE_EDGE_DATA_FLOOR = 0.20
 SIDE_SDF_SOLVE_EDGE_DATA_POWER = 2.0
 SIDE_SDF_CHEST_FEATHER_PCT = float(os.environ.get("FUSION_SIDE_SDF_CHEST_FEATHER_PCT", "0.010"))
+# A side-only anchor can occasionally lack a recoverable perineum. This is
+# the observed regular-fit hem height for that fallback, not a substitute for
+# the CLAD surface-trace result when it is available.
+SIDE_SDF_SHIRT_HEM_FALLBACK_PCT = float(os.environ.get("FUSION_SIDE_SDF_SHIRT_HEM_FALLBACK_PCT", "0.465"))
+# The butt mask must not alter the separate-leg region used for CLAD's thigh
+# circumference.  This is a vertical clearance above that measured plane.
+SIDE_SDF_BUTT_ABOVE_THIGH_PCT = float(os.environ.get("FUSION_SIDE_SDF_BUTT_ABOVE_THIGH_PCT", "0.015"))
 
 
 def _flat_band_with_feather(height_pct, center, half_width, feather_width, falloff_power=1.0):
@@ -471,12 +479,7 @@ def _range_band_with_feather(height_pct, low, high, feather_width, falloff_power
 
 
 def chest_band_bounds_from_anchors(anchor_pcts):
-    """Return the anterior torso SDF range: hip through shoulder line.
-
-    The historical name remains for compatibility with the solver metadata,
-    but this is deliberately no longer chest-only: it covers chest, stomach,
-    and lower stomach down to the hip landmark.
-    """
+    """Return the chest/abdomen SDF interval: T-shirt hem through shoulder."""
     lower = required_anchor_pct(anchor_pcts, "chest_lower")
     upper = required_anchor_pct(anchor_pcts, "chest_upper")
     if upper < lower:
@@ -487,14 +490,62 @@ def chest_band_bounds_from_anchors(anchor_pcts):
 
 
 def chest_band_weight_from_anchors(height_pct, anchor_pcts):
+    """Chest/abdomen SDF weight confined to the CLAD regular-shirt interval.
+
+    The edge fade is inside the interval, never outside it: the mask reaches
+    the regular T-shirt hem to capture a prominent abdomen, but cannot edit
+    below that garment boundary or into the shoulder/arm area.
+    """
     low, high = chest_band_bounds_from_anchors(anchor_pcts)
-    return _range_band_with_feather(
-        height_pct,
+    values = np.asarray(height_pct, dtype=np.float64)
+    weight = _range_band_with_feather(
+        values,
         low,
         high,
         SIDE_SDF_CHEST_FEATHER_PCT,
         SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
     )
+    weight[(values < low) | (values > high)] = 0.0
+    feather = min(SIDE_SDF_CHEST_FEATHER_PCT, max(0.0, (high - low) / 2.0))
+    if feather > 0.0:
+        lower = (values >= low) & (values < low + feather)
+        upper = (values > high - feather) & (values <= high)
+        t_lower = (values[lower] - low) / feather
+        t_upper = (high - values[upper]) / feather
+        weight[lower] *= (t_lower * t_lower * (3.0 - 2.0 * t_lower)) ** SIDE_SDF_BAND_EDGE_FALLOFF_POWER
+        weight[upper] *= (t_upper * t_upper * (3.0 - 2.0 * t_upper)) ** SIDE_SDF_BAND_EDGE_FALLOFF_POWER
+    return weight
+
+
+def butt_band_bounds_from_anchors(anchor_pcts):
+    """Return the posterior butt range, capped above CLAD's thigh plane."""
+    lower = required_anchor_pct(anchor_pcts, "butt_lower")
+    upper = required_anchor_pct(anchor_pcts, "butt_upper")
+    if upper < lower:
+        lower, upper = upper, lower
+    if (upper - lower) < 0.01:
+        raise ValueError(f"Invalid butt SDF band: lower={lower}, upper={upper}")
+    return lower, upper
+
+
+def butt_band_weight_from_anchors(height_pct, anchor_pcts, feather_width=SIDE_SDF_TARGET_FEATHER_WIDTH):
+    """Butt mask with a hard lower limit above the CLAD thigh plane.
+
+    Unlike the chest, its lower feather is placed *inside* the valid range.
+    This guarantees that no butt SDF displacement leaks down into the thigh
+    measurement clearance.
+    """
+    low, high = butt_band_bounds_from_anchors(anchor_pcts)
+    values = np.asarray(height_pct, dtype=np.float64)
+    weight = _range_band_with_feather(
+        values, low, high, feather_width, SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
+    )
+    weight[values < low] = 0.0
+    if feather_width > 0.0:
+        inside_lower = (values >= low) & (values < low + feather_width)
+        t = (values[inside_lower] - low) / feather_width
+        weight[inside_lower] *= (t * t * (3.0 - 2.0 * t)) ** SIDE_SDF_BAND_EDGE_FALLOFF_POWER
+    return weight
 
 
 def _band_extent(vertices, height_pct, low_pct, high_pct):
@@ -822,9 +873,11 @@ def save_side_anchor_debug_mask(
     chest_center = required_anchor_pct(anchor_pcts, "chest")
     butt_center = required_anchor_pct(anchor_pcts, "butt")
     chest_low, chest_high = chest_band_bounds_from_anchors(anchor_pcts)
-    draw_anchor_range("front torso (hip to shoulder)", chest_low, chest_high, (0, 80, 255), -8)
+    butt_low, butt_high = butt_band_bounds_from_anchors(anchor_pcts)
+    draw_anchor_range("chest + abdomen (shirt hem to shoulder)", chest_low, chest_high, (0, 80, 255), -8)
+    draw_anchor_range("butt (above thigh)", butt_low, butt_high, (255, 80, 0), 20)
     draw_anchor("bust", chest_center, 0.0, (0, 180, 255), 18)
-    draw_anchor("butt", butt_center, SIDE_SDF_TARGET_CORE_HALF_WIDTH, (255, 80, 0), 20)
+    draw_anchor("hip", butt_center, 0.0, (255, 80, 0), 42)
 
     out_path = os.path.join(output_dir, out_name)
     cv2.imwrite(out_path, overlay)
@@ -1136,15 +1189,14 @@ def save_side_sdf_row_debug(
 
     try:
         chest_center = required_anchor_pct(anchor_pcts, "chest")
-        butt_center = required_anchor_pct(anchor_pcts, "butt")
         chest_low, chest_high = chest_band_bounds_from_anchors(anchor_pcts)
+        butt_low, butt_high = butt_band_bounds_from_anchors(anchor_pcts)
     except Exception:
         return None
 
     torso_core, _ = compute_torso_core_mask(v, side_result)
-    debug_band_half_width = SIDE_SDF_TARGET_CORE_HALF_WIDTH
     chest_height_weight = chest_band_weight_from_anchors(pct, anchor_pcts)
-    butt_height_weight = (np.abs(pct - butt_center) <= debug_band_half_width).astype(np.float64)
+    butt_height_weight = butt_band_weight_from_anchors(pct, anchor_pcts, feather_width=0.0)
     selected = in_image & torso_core & ((chest_height_weight > 1e-4) | (butt_height_weight > 1e-4))
     if not selected.any():
         return None
@@ -1206,7 +1258,7 @@ def save_side_sdf_row_debug(
 
     debug_bands = (
         (((pct >= chest_low) & (pct <= chest_high)), (0, 120, 255)),
-        ((np.abs(pct - butt_center) <= debug_band_half_width), (255, 120, 0)),
+        (((pct >= butt_low) & (pct <= butt_high)), (255, 120, 0)),
     )
     for band_mask, color in debug_bands:
         br = band_rows_from_mask(band_mask)
@@ -1379,24 +1431,11 @@ def deform_side_mesh_to_mask_profile(
     chest_center = required_anchor_pct(anchor_pcts, "chest")
     butt_center = required_anchor_pct(anchor_pcts, "butt")
     chest_full_low_pct, chest_full_high_pct = chest_band_bounds_from_anchors(anchor_pcts)
-    butt_outer_smooth_width = SIDE_SDF_OUTER_SMOOTH_WIDTH
+    butt_full_low_pct, butt_full_high_pct = butt_band_bounds_from_anchors(anchor_pcts)
     chest_target_weight = chest_band_weight_from_anchors(pct, anchor_pcts)
     chest_outer_weight = np.zeros_like(chest_target_weight, dtype=np.float64)
-    butt_outer_weight = _outside_band_smooth_weight(
-        pct,
-        butt_center,
-        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
-        0.0,
-        butt_outer_smooth_width,
-        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
-    )
-    butt_target_weight = _flat_band_with_feather(
-        pct,
-        butt_center,
-        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
-        SIDE_SDF_TARGET_FEATHER_WIDTH,
-        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
-    )
+    butt_outer_weight = np.zeros_like(chest_target_weight, dtype=np.float64)
+    butt_target_weight = butt_band_weight_from_anchors(pct, anchor_pcts)
     torso_core, torso_core_meta = compute_torso_core_mask(v, side_result)
     selected = in_image & torso_core & ((chest_target_weight > 1e-4) | (butt_target_weight > 1e-4))
     if not selected.any():
@@ -1408,16 +1447,11 @@ def deform_side_mesh_to_mask_profile(
     mask_left, mask_right = row_bounds_from_mask(side_mask, row_radius=row_radius)
 
     max_push_m = max(0.0, float(max_push_cm)) / 100.0
-    profile_fit_half_width = SIDE_SDF_TARGET_CORE_HALF_WIDTH + SIDE_SDF_TARGET_FEATHER_WIDTH
     chest_height_weight = chest_target_weight
     butt_height_weight = butt_target_weight
     chest_support_weight = chest_target_weight.copy()
-    butt_support_weight = _flat_band_with_feather(
-        pct,
-        butt_center,
-        SIDE_SDF_TARGET_CORE_HALF_WIDTH,
-        SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH,
-        SIDE_SDF_BAND_EDGE_FALLOFF_POWER,
+    butt_support_weight = butt_band_weight_from_anchors(
+        pct, anchor_pcts, feather_width=SIDE_SDF_SOLVE_OUTSIDE_SMOOTH_WIDTH,
     )
 
     def build_neighbor_lists(mesh_faces, vertex_count):
@@ -1443,11 +1477,17 @@ def deform_side_mesh_to_mask_profile(
     mesh_neighbors = build_neighbor_lists(faces, v.shape[0])
     solve_reason = "ok"
 
-    def solve_weighted_displacement(target_dx, height_weight, support_weight, side_strength):
+    def solve_weighted_displacement(target_dx, height_weight, support_weight, side_strength, allowed_mask=None):
         nonlocal solve_reason
         target_dx = np.asarray(target_dx, dtype=np.float64)
-        target_mask = np.abs(target_dx) > 1e-8
-        solve_gate = torso_core.astype(np.float64)
+        allowed = np.ones(v.shape[0], dtype=bool) if allowed_mask is None else np.asarray(allowed_mask, dtype=bool)
+        if allowed.shape != (v.shape[0],):
+            raise ValueError("invalid_side_edit_gate")
+        # Mesh-neighbour smoothing can otherwise diffuse a posterior butt
+        # target through the closed torso topology to the anterior surface.
+        target_mask = (np.abs(target_dx) > 1e-8) & allowed
+        solve_gate = (torso_core & allowed).astype(np.float64)
+        target_dx = target_dx * solve_gate
         if target_mask.sum() < 8 or mesh_neighbors is None:
             solve_reason = "fallback_no_targets_or_faces"
             dx_fallback = np.clip(target_dx, -max_push_m, max_push_m) * solve_gate
@@ -1734,6 +1774,17 @@ def deform_side_mesh_to_mask_profile(
     residual_butt_applied_mean_abs_cm_by_pass = []
     residual_butt_applied_max_abs_cm_by_pass = []
 
+    # Freeze both side classifications before any profile edits. A later edit
+    # must not make a vertex eligible for the opposite profile correction just
+    # because the row-centre estimate changed.
+    initial_profile_state = compute_profile_state(v)
+    chest_authorized_mask = (
+        initial_profile_state["chest_side_mask"] & (chest_height_weight > 1e-4)
+    )
+    butt_authorized_mask = (
+        initial_profile_state["butt_side_mask"] & (butt_height_weight > 1e-4)
+    )
+
     for pass_idx in range(max(1, int(SIDE_SDF_RESIDUAL_SOLVE_PASSES))):
         profile_state = compute_profile_state(v)
         chest_side_mask_pass = profile_state["chest_side_mask"]
@@ -1742,8 +1793,12 @@ def deform_side_mesh_to_mask_profile(
         chest_side_strength_pass = np.clip((anterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
         butt_side_strength_pass = np.clip((posterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
 
-        chest_region_mask_pass = chest_side_mask_pass & (chest_height_weight > 1e-4)
-        butt_region_mask_pass = butt_side_mask_pass & (butt_height_weight > 1e-4)
+        chest_region_mask_pass = (
+            chest_side_mask_pass & (chest_height_weight > 1e-4) & chest_authorized_mask
+        )
+        butt_region_mask_pass = (
+            butt_side_mask_pass & (butt_height_weight > 1e-4) & butt_authorized_mask
+        )
         chest_shift_row_pass, chest_valid_row_pass, chest_raw_shift_row_pass, chest_shift_sign_flip_row_pass = target_shift_by_row(
             profile_state,
             anterior_sign,
@@ -1810,12 +1865,14 @@ def deform_side_mesh_to_mask_profile(
             chest_height_weight,
             chest_support_weight,
             chest_side_strength_pass,
+            chest_region_mask_pass,
         )
         dx_butt_pass, butt_solve_changed_pass = solve_weighted_displacement(
             target_dx_butt_pass,
             butt_height_weight,
             butt_support_weight,
             butt_side_strength_pass,
+            butt_region_mask_pass,
         )
         if pass_idx == 0:
             solved_dx_chest_initial = dx_chest_pass.copy()
@@ -1848,6 +1905,8 @@ def deform_side_mesh_to_mask_profile(
     final_pre_containment_state = compute_profile_state(v)
     chest_side_mask = final_pre_containment_state["chest_side_mask"]
     butt_side_mask = final_pre_containment_state["butt_side_mask"]
+    chest_edit_gate = chest_side_mask & (chest_height_weight > 1e-4) & chest_authorized_mask
+    butt_edit_gate = butt_side_mask & (butt_height_weight > 1e-4) & butt_authorized_mask
     signed_side_all = final_pre_containment_state["signed_side_all"]
     chest_side_strength = np.clip((anterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
     butt_side_strength = np.clip((posterior_sign * signed_side_all - 0.02) / 0.55, 0.0, 1.0)
@@ -1963,7 +2022,7 @@ def deform_side_mesh_to_mask_profile(
             proj_cur,
             depth_cur,
             sdf_cur,
-            chest_side_mask,
+            chest_edit_gate,
             containment_weight_chest,
             anterior_sign,
         )
@@ -1971,7 +2030,7 @@ def deform_side_mesh_to_mask_profile(
             proj_cur,
             depth_cur,
             sdf_cur,
-            butt_side_mask,
+            butt_edit_gate,
             containment_weight_butt,
             posterior_sign,
         )
@@ -2007,29 +2066,33 @@ def deform_side_mesh_to_mask_profile(
     pre_smooth_dx_butt = dx_butt.copy()
     dx_chest_smoothed, chest_smooth_changed = smooth_displacement_over_mesh(
         dx_chest,
-        chest_side_mask,
+        chest_edit_gate,
         containment_weight_chest,
         chest_outer_weight,
     )
     dx_chest_smoothed, chest_edge_smooth_changed = smooth_displacement_over_height(
         dx_chest_smoothed,
-        chest_side_mask,
+        chest_edit_gate,
         containment_weight_chest,
         chest_outer_weight,
     )
     chest_smooth_changed = chest_smooth_changed | chest_edge_smooth_changed
+    dx_chest_smoothed[~chest_edit_gate] = 0.0
     dx_butt_smoothed, butt_smooth_changed = smooth_displacement_over_mesh(
         dx_butt,
-        butt_side_mask,
+        butt_edit_gate,
         containment_weight_butt,
         butt_outer_weight,
     )
     dx_butt_smoothed, butt_edge_smooth_changed = smooth_displacement_over_height(
         dx_butt_smoothed,
-        butt_side_mask,
+        butt_edit_gate,
         containment_weight_butt,
         butt_outer_weight,
     )
+    # Defence in depth: a butt correction may only survive on the posterior
+    # half selected for this band, even after either smoothing stage.
+    dx_butt_smoothed[~butt_edit_gate] = 0.0
     butt_smooth_changed = butt_smooth_changed | butt_edge_smooth_changed
     smooth_delta_chest = dx_chest_smoothed - dx_chest
     smooth_delta_butt = dx_butt_smoothed - dx_butt
@@ -2058,7 +2121,7 @@ def deform_side_mesh_to_mask_profile(
                 proj_cur,
                 depth_cur,
                 sdf_cur,
-                chest_side_mask,
+                chest_edit_gate,
                 containment_weight_chest,
                 anterior_sign,
             )
@@ -2066,7 +2129,7 @@ def deform_side_mesh_to_mask_profile(
                 proj_cur,
                 depth_cur,
                 sdf_cur,
-                butt_side_mask,
+                butt_edit_gate,
                 containment_weight_butt,
                 posterior_sign,
             )
@@ -2115,8 +2178,12 @@ def deform_side_mesh_to_mask_profile(
     final_butt_dx_stats = displacement_stats(dx_butt)
 
     final_profile_state = compute_profile_state(v)
-    final_chest_region_mask = final_profile_state["chest_side_mask"] & (chest_height_weight > 1e-4)
-    final_butt_region_mask = final_profile_state["butt_side_mask"] & (butt_height_weight > 1e-4)
+    final_chest_region_mask = (
+        final_profile_state["chest_side_mask"] & (chest_height_weight > 1e-4) & chest_authorized_mask
+    )
+    final_butt_region_mask = (
+        final_profile_state["butt_side_mask"] & (butt_height_weight > 1e-4) & butt_authorized_mask
+    )
     final_chest_shift_row, final_chest_valid_row, final_chest_raw_shift_row, _ = target_shift_by_row(
         final_profile_state,
         anterior_sign,
@@ -2149,13 +2216,18 @@ def deform_side_mesh_to_mask_profile(
         "torso_core_shoulder_width_m": torso_core_meta.get("shoulder_width_m", np.array(0.0, dtype=np.float64)),
         "torso_core_vertex_count": torso_core_meta.get("vertex_count", np.array(int(torso_core.sum()), dtype=np.int64)),
         "profile_method": np.array(profile_method, dtype=object),
-        "profile_fit_half_width_pct": np.array(float(profile_fit_half_width * 100.0), dtype=np.float64),
-        "target_core_half_width_pct": np.array(float(SIDE_SDF_TARGET_CORE_HALF_WIDTH * 100.0), dtype=np.float64),
-        "target_feather_width_pct": np.array(float(SIDE_SDF_TARGET_FEATHER_WIDTH * 100.0), dtype=np.float64),
         "chest_full_low_pct": np.array(float(chest_full_low_pct * 100.0), dtype=np.float64),
         "chest_full_high_pct": np.array(float(chest_full_high_pct * 100.0), dtype=np.float64),
+        "butt_full_low_pct": np.array(float(butt_full_low_pct * 100.0), dtype=np.float64),
+        "butt_full_high_pct": np.array(float(butt_full_high_pct * 100.0), dtype=np.float64),
+        "chest_anterior_gate_vertex_count": np.array(int(np.count_nonzero(chest_edit_gate)), dtype=np.int64),
+        "chest_posterior_edit_vertex_count": np.array(int(np.count_nonzero((np.abs(dx_chest) > 1e-7) & ~chest_edit_gate)), dtype=np.int64),
+        "butt_posterior_gate_vertex_count": np.array(int(np.count_nonzero(butt_edit_gate)), dtype=np.int64),
+        "butt_anterior_edit_vertex_count": np.array(int(np.count_nonzero((np.abs(dx_butt) > 1e-7) & ~butt_edit_gate)), dtype=np.int64),
         "chest_feather_width_pct": np.array(float(SIDE_SDF_CHEST_FEATHER_PCT * 100.0), dtype=np.float64),
-        "chest_band_source": np.array("clad_hip_to_shoulder_line_anterior_torso", dtype=object),
+        "butt_above_thigh_clearance_pct": np.array(float(SIDE_SDF_BUTT_ABOVE_THIGH_PCT * 100.0), dtype=np.float64),
+        "chest_band_source": np.array("clad_regular_tshirt_hem_to_shoulder_line", dtype=object),
+        "butt_band_source": np.array("clad_hip_band_capped_above_thigh_measurement", dtype=object),
         "profile_fit_matches_anchor_debug_band": np.array(True, dtype=bool),
         "solve_reason": np.array(solve_reason, dtype=object),
         "solve_data_weight": np.array(float(SIDE_SDF_SOLVE_DATA_WEIGHT), dtype=np.float64),
@@ -2449,7 +2521,53 @@ def save_clad_render_from_params(params_json, render_path, title):
     return render_path
 
 
-def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target_height_m, output_dir):
+def measure_regular_tshirt_hem_pct(result, vertices, faces, target_height_m):
+    """Measure CLAD's regular T-shirt hem on a posed source reconstruction."""
+    try:
+        oriented = center_and_orient_mesh(vertices)
+        scaled, scale_factor, _, _ = scale_mesh_to_target_height(oriented["vertices_oriented"], target_height_m)
+        clad_vertices = sam_upright_vertices_to_clad_canonical(scaled)
+        pose = _to_numpy(result.get("pred_joint_coords")).astype(np.float64)
+        if pose.ndim != 2 or pose.shape[1] != 3:
+            raise ValueError("pred_joint_coords_unavailable")
+        pose_upright = (pose - oriented["centroid"]) @ oriented["rotation_matrix"].T
+        pose_upright *= float(scale_factor)
+        indices, weights, _ = bind_posed_joints_to_topology(pose_upright, scaled)
+        params = scale_result_params(_copy_result_dict(result), float(scale_factor))
+        params.update({
+            "pred_vertices": scaled.astype(np.float32),
+            "fusion_target_height": np.array(float(target_height_m * 100.0), dtype=np.float64),
+            "fusion_target_height_cm": np.array(float(target_height_m * 100.0), dtype=np.float64),
+            "fusion_prefer_vertices_for_clad": np.array(True),
+            "fusion_allow_pose_space_vertex_override": np.array(True),
+            "fusion_vertices_clad": clad_vertices.astype(np.float32),
+            "fusion_front_reference_vertices_clad": clad_vertices.astype(np.float32),
+            "fusion_joint_coords_clad": sam_upright_points_to_clad_canonical(pose_upright, scaled),
+            "fusion_joint_bind_indices": indices,
+            "fusion_joint_bind_weights": weights,
+            "fusion_faces_clad": np.asarray(faces, dtype=np.int32),
+            "fusion_vertices_clad_coordinate_system": np.array("x_lateral_y_profile_z_up_meters", dtype=object),
+        })
+        from scripts import measure_fused_mesh_clad_upstream as upstream
+        with tempfile.TemporaryDirectory(prefix="clad-front-shirt-") as temp_dir:
+            params_path = os.path.join(temp_dir, "front_shirt_anchor.json")
+            save_result_json(params, params_path)
+            body, _, _ = upstream.fused_body(Path(params_path), target_height_m * 100.0)
+            measurements = upstream.measure(body, preset="all", render_path=None)
+            upstream.apply_surface_crotch_length(measurements, body)
+            upstream.apply_production_core_measurements(measurements, body)
+        points = np.asarray(measurements.get("_regular_tshirt_length_pts"), dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] < 3 or not len(points):
+            raise ValueError("regular_tshirt_hem_unavailable")
+        pct = float(points[-1, 2] / target_height_m)
+        if not 0.0 < pct < 1.0:
+            raise ValueError("regular_tshirt_hem_out_of_range")
+        return pct, "clad_front_regular_fit_90pct_hps_to_crotch_surface_trace"
+    except Exception as exc:
+        return None, f"unavailable:{exc}"
+
+
+def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target_height_m, output_dir, shirt_hem_pct=None, shirt_hem_source=""):
     """Use CLAD on the un-SDF-ed side mesh to locate bust and butt height bands."""
     os.makedirs(output_dir, exist_ok=True)
     meta = {
@@ -2460,11 +2578,18 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         "bust_anchor_pct": np.array(0.0, dtype=np.float64),
         "hip_anchor_pct": np.array(0.0, dtype=np.float64),
         "lower_chest_pct": np.array(0.0, dtype=np.float64),
+        "lowest_rib_pct": np.array(0.0, dtype=np.float64),
+        "shirt_end_pct": np.array(0.0, dtype=np.float64),
         "torso_lower_pct": np.array(0.0, dtype=np.float64),
         "shoulder_line_pct": np.array(0.0, dtype=np.float64),
         "chest_full_low_pct": np.array(0.0, dtype=np.float64),
         "chest_full_high_pct": np.array(0.0, dtype=np.float64),
+        "thigh_pct": np.array(0.0, dtype=np.float64),
+        "butt_full_low_pct": np.array(0.0, dtype=np.float64),
+        "butt_full_high_pct": np.array(0.0, dtype=np.float64),
         "lower_chest_source": np.array("missing", dtype=object),
+        "lowest_rib_source": np.array("missing", dtype=object),
+        "shirt_end_source": np.array("missing", dtype=object),
         "torso_lower_source": np.array("missing", dtype=object),
         "shoulder_line_source": np.array("missing", dtype=object),
     }
@@ -2499,6 +2624,22 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
             dtype=object,
         )
 
+        # Give the side anchor body the posed SAM3D joints as well as its
+        # geometry.  This lets CLAD calculate the exact regular T-shirt hem
+        # (90% of its HPS-to-crotch surface trace) before profile editing.
+        pose_joints = _to_numpy(side_result.get("pred_joint_coords")).astype(np.float64)
+        if pose_joints.ndim != 2 or pose_joints.shape[1] != 3:
+            raise ValueError("side_pred_joint_coords_unavailable")
+        side_pose_upright = (pose_joints - side_oriented["centroid"]) @ side_oriented["rotation_matrix"].T
+        side_pose_upright *= float(side_scale_factor)
+        joint_indices, joint_weights, _ = bind_posed_joints_to_topology(side_pose_upright, side_scaled)
+        side_anchor_params["fusion_front_reference_vertices_clad"] = side_clad_vertices.astype(np.float32)
+        side_anchor_params["fusion_joint_coords_clad"] = sam_upright_points_to_clad_canonical(
+            side_pose_upright, side_scaled,
+        )
+        side_anchor_params["fusion_joint_bind_indices"] = joint_indices
+        side_anchor_params["fusion_joint_bind_weights"] = joint_weights
+
         paths["params_json"] = os.path.join(output_dir, "side_untouched_clad_anchor_params.json")
         paths["clad_obj"] = os.path.join(output_dir, "side_untouched_clad_anchor.obj")
         save_result_json(side_anchor_params, paths["params_json"])
@@ -2506,13 +2647,20 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
 
         from scripts import measure_fused_mesh_clad_upstream as upstream
         body, _, _ = upstream.fused_body(Path(paths["params_json"]), None)
-        measurements = upstream.measure(body, only=["bust_cm", "hip_cm", "underbust_cm"])
+        measurements = upstream.measure(body, only=["bust_cm", "hip_cm", "thigh_cm", "underbust_cm"])
         upstream.apply_production_core_measurements(measurements, body)
         paths["measurements_json"] = os.path.join(output_dir, "side_untouched_clad_anchor_measurements.json")
         with open(paths["measurements_json"], "w") as f:
             json.dump(upstream.jsonable(measurements), f, indent=2, sort_keys=True)
 
         anchors = {}
+        if shirt_hem_pct is not None and 0.0 < float(shirt_hem_pct) < 1.0:
+            anchors["chest_lower"] = float(shirt_hem_pct)
+            meta["shirt_end_pct"] = np.array(float(shirt_hem_pct) * 100.0, dtype=np.float64)
+            meta["shirt_end_source"] = np.array(str(shirt_hem_source), dtype=object)
+            meta["lower_chest_pct"] = np.array(float(shirt_hem_pct) * 100.0, dtype=np.float64)
+            meta["lower_chest_source"] = np.array(str(shirt_hem_source), dtype=object)
+            meta["chest_full_low_pct"] = np.array(float(shirt_hem_pct) * 100.0, dtype=np.float64)
         try:
             bust_pct = float(measurements.get("_bust_pct", 0.0))
             if 0.0 < bust_pct < 100.0:
@@ -2527,22 +2675,34 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
             if 0.0 < hip_pct < 100.0:
                 butt_pct = hip_pct / 100.0
                 anchors["butt"] = butt_pct
-                # Extend the anterior SDF/profile region through the stomach
-                # and lower stomach to the hip. torso_core excludes the legs.
-                anchors["chest_lower"] = butt_pct
                 meta["hip_pct"] = np.array(hip_pct, dtype=np.float64)
                 meta["hip_anchor_pct"] = np.array(butt_pct * 100.0, dtype=np.float64)
-                meta["torso_lower_pct"] = np.array(hip_pct, dtype=np.float64)
-                meta["torso_lower_source"] = np.array("hip_pct", dtype=object)
-                meta["chest_full_low_pct"] = np.array(hip_pct, dtype=np.float64)
         except Exception:
             pass
 
+        # Reuse CLAD's regular-fit T-shirt hem: 90% of the HPS-to-crotch
+        # surface trace. The SDF can then correct the complete garment-covered
+        # front torso, including a large abdomen, rather than stopping at the
+        # lowest-rib bust-search boundary.
         try:
-            lower_chest_pct = float(measurements.get("_underbust_pct", 0.0))
-            if 0.0 < lower_chest_pct < 100.0:
-                meta["lower_chest_pct"] = np.array(lower_chest_pct, dtype=np.float64)
-                meta["lower_chest_source"] = np.array("underbust_pct", dtype=object)
+            bust_details = measurements.get("_bust_full_torso_component") or {}
+            bust_low_pct = float(bust_details.get("search_low_pct", 0.0))
+            shoulder_line_pct = float(bust_details.get("search_high_pct", 0.0))
+            shirt_points = np.asarray(measurements.get("_regular_tshirt_length_pts"), dtype=np.float64)
+            shirt_end_pct = float(shirt_points[-1, 2] / target_height_m * 100.0) if shirt_points.ndim == 2 and shirt_points.shape[1] >= 3 and len(shirt_points) else 0.0
+            if "chest_lower" not in anchors and 0.0 < shirt_end_pct < shoulder_line_pct < 100.0:
+                anchors["chest_lower"] = shirt_end_pct / 100.0
+                anchors["chest_upper"] = shoulder_line_pct / 100.0
+                meta["shirt_end_pct"] = np.array(shirt_end_pct, dtype=np.float64)
+                meta["shirt_end_source"] = np.array("clad_regular_fit_90pct_hps_to_crotch_surface_trace", dtype=object)
+                meta["lowest_rib_pct"] = np.array(bust_low_pct, dtype=np.float64)
+                meta["lowest_rib_source"] = np.array(str(bust_details.get("lower_boundary_source", "clad_bust_search")), dtype=object)
+                meta["lower_chest_pct"] = np.array(shirt_end_pct, dtype=np.float64)
+                meta["lower_chest_source"] = np.array("clad_regular_tshirt_hem", dtype=object)
+                meta["shoulder_line_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
+                meta["shoulder_line_source"] = np.array("clad_bust_search_shoulder_line", dtype=object)
+                meta["chest_full_low_pct"] = np.array(shirt_end_pct, dtype=np.float64)
+                meta["chest_full_high_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
         except Exception:
             pass
 
@@ -2557,7 +2717,7 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
                 upright_keypoints *= float(side_scale_factor)
                 shoulder_y = float(np.mean(upright_keypoints[[5, 6], 1]))
                 shoulder_line_pct = (shoulder_y - float(side_scaled[:, 1].min())) / target_height_m * 100.0
-                if 0.0 < shoulder_line_pct < 100.0:
+                if "chest_upper" not in anchors and 0.0 < shoulder_line_pct < 100.0:
                     anchors["chest_upper"] = shoulder_line_pct / 100.0
                     meta["shoulder_line_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
                     meta["chest_full_high_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
@@ -2597,7 +2757,40 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
                 meta["chest_full_high_pct"] = np.array(shoulder_line_pct, dtype=np.float64)
                 meta["shoulder_line_source"] = np.array("bust_plus_12pct_height_fallback", dtype=object)
 
-        missing = [name for name in ("chest", "butt", "chest_lower", "chest_upper") if name not in anchors]
+        if "chest_lower" not in anchors:
+            # The normal source above is the exact CLAD surface trace. Keep
+            # the side-only profile correction available when that trace
+            # cannot find a perineum, using the regular-fit hem level rather
+            # than reverting to the old rib/hip-limited mask.
+            shirt_end_pct = float(SIDE_SDF_SHIRT_HEM_FALLBACK_PCT * 100.0)
+            anchors["chest_lower"] = float(SIDE_SDF_SHIRT_HEM_FALLBACK_PCT)
+            meta["shirt_end_pct"] = np.array(shirt_end_pct, dtype=np.float64)
+            meta["shirt_end_source"] = np.array("regular_fit_shirt_hem_height_fallback", dtype=object)
+            meta["lower_chest_pct"] = np.array(shirt_end_pct, dtype=np.float64)
+            meta["lower_chest_source"] = np.array("regular_fit_shirt_hem_height_fallback", dtype=object)
+            meta["chest_full_low_pct"] = np.array(shirt_end_pct, dtype=np.float64)
+
+        try:
+            thigh_pct = float(measurements.get("_thigh_pct", 0.0))
+            butt_pct = float(meta["hip_pct"])
+            if 0.0 < thigh_pct < butt_pct < 100.0:
+                # Preserve the butt band's existing upper extent, but cap its
+                # lower edge above CLAD's actual thigh circumference plane.
+                lower = max(
+                    butt_pct / 100.0 - SIDE_SDF_TARGET_CORE_HALF_WIDTH,
+                    thigh_pct / 100.0 + SIDE_SDF_BUTT_ABOVE_THIGH_PCT,
+                )
+                upper = butt_pct / 100.0 + SIDE_SDF_TARGET_CORE_HALF_WIDTH
+                if lower < upper:
+                    anchors["butt_lower"] = lower
+                    anchors["butt_upper"] = upper
+                    meta["thigh_pct"] = np.array(thigh_pct, dtype=np.float64)
+                    meta["butt_full_low_pct"] = np.array(lower * 100.0, dtype=np.float64)
+                    meta["butt_full_high_pct"] = np.array(upper * 100.0, dtype=np.float64)
+        except Exception:
+            pass
+
+        missing = [name for name in ("chest", "butt", "chest_lower", "chest_upper", "butt_lower", "butt_upper") if name not in anchors]
         if missing:
             meta["reason"] = np.array(f"missing_anchor_pct:{','.join(missing)}", dtype=object)
             return {}, meta, paths
@@ -2923,15 +3116,23 @@ def main():
     side_result_no_sdf = _copy_result_dict(side_result)
     side_result_no_sdf["pred_vertices"] = side_vertices_no_sdf.astype(np.float32)
 
+    front_shirt_hem_pct, front_shirt_hem_source = measure_regular_tshirt_hem_pct(
+        front_result, front_vertices, estimator.faces, target_height_m,
+    )
     side_anchor_pcts, side_anchor_meta, side_anchor_paths = measure_untouched_side_anchor_pcts(
         side_result,
         side_vertices,
         estimator.faces,
         target_height_m,
         output_dir,
+        shirt_hem_pct=front_shirt_hem_pct,
+        shirt_hem_source=front_shirt_hem_source,
     )
     measurement_anchor_pcts = dict(side_anchor_pcts)
-    missing_anchor_names = [name for name in ("chest", "butt", "chest_lower", "chest_upper") if name not in measurement_anchor_pcts]
+    missing_anchor_names = [
+        name for name in ("chest", "butt", "chest_lower", "chest_upper", "butt_lower", "butt_upper")
+        if name not in measurement_anchor_pcts
+    ]
     if missing_anchor_names:
         reason = np.asarray(side_anchor_meta.get("reason", "unknown")).item()
         raise RuntimeError(
@@ -2946,9 +3147,10 @@ def main():
     print(f"  hip pct      : {float(np.asarray(side_anchor_meta.get('hip_pct', 0.0)).item()):.4f} (CLAD)")
     print(f"  bust anchor  : {float(np.asarray(side_anchor_meta.get('bust_anchor_pct', 0.0)).item()):.4f} (SDF)")
     print(f"  hip anchor   : {float(np.asarray(side_anchor_meta.get('hip_anchor_pct', 0.0)).item()):.4f} (SDF)")
-    print(f"  lower chest  : {float(np.asarray(side_anchor_meta.get('lower_chest_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('lower_chest_source', 'unknown')).item()})")
-    print(f"  torso lower  : {float(np.asarray(side_anchor_meta.get('torso_lower_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('torso_lower_source', 'unknown')).item()})")
+    print(f"  shirt hem    : {float(np.asarray(side_anchor_meta.get('shirt_end_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('shirt_end_source', 'unknown')).item()})")
     print(f"  shoulder line: {float(np.asarray(side_anchor_meta.get('shoulder_line_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('shoulder_line_source', 'unknown')).item()})")
+    print(f"  thigh pct    : {float(np.asarray(side_anchor_meta.get('thigh_pct', 0.0)).item()):.4f} (CLAD)")
+    print(f"  butt range   : {float(np.asarray(side_anchor_meta.get('butt_full_low_pct', 0.0)).item()):.4f}-{float(np.asarray(side_anchor_meta.get('butt_full_high_pct', 0.0)).item()):.4f} (above thigh)")
 
     side_anchor_debug_mask_path = save_side_anchor_debug_mask(
         side_mask,
@@ -3093,8 +3295,11 @@ def main():
         if args.validation_policy == "strict":
             raise RuntimeError(f"Fusion alignment validation failed: {quality_error[0]}. See {quality_report_path}")
         torso_mask = np.ones(len(front_upright), dtype=bool)
-    side_no_sdf_aligned, align_transform_no_sdf = similarity_align(side_no_sdf_upright, front_upright, torso_mask)
-    side_aligned, align_transform = similarity_align(side_upright, front_upright, torso_mask)
+    # Both meshes have already been made upright.  Do not let registration add
+    # pitch/roll: fusion takes profile depth from this side mesh, so a full 3-D
+    # Kabsch rotation can turn an upright side capture into a forward lean.
+    side_no_sdf_aligned, align_transform_no_sdf = upright_similarity_align(side_no_sdf_upright, front_upright, torso_mask)
+    side_aligned, align_transform = upright_similarity_align(side_upright, front_upright, torso_mask)
     alignment_quality = alignment_report(
         front_upright,
         side_aligned,

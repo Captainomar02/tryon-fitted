@@ -120,12 +120,76 @@ def similarity_align(source: np.ndarray, target: np.ndarray, mask: np.ndarray, t
     }
 
 
+def upright_similarity_align(source: np.ndarray, target: np.ndarray, mask: np.ndarray, trim_fraction: float = 0.12) -> tuple[np.ndarray, dict[str, Any]]:
+    """Align same-topology bodies without changing their upright posture.
+
+    Inputs have already been put in fusion space where X is lateral, Y is
+    vertical, and Z is profile depth.  A full 3-D Kabsch solve can still add a
+    pitch or roll at this stage.  That is particularly damaging here because
+    fusion copies the aligned side mesh's Z coordinate into the result.  Fit
+    only a yaw about Y, plus uniform scale and translation, so registration
+    cannot manufacture a forward/backward lean.
+    """
+    src = np.asarray(source, dtype=np.float64)
+    dst = np.asarray(target, dtype=np.float64)
+    active = np.asarray(mask, dtype=bool).copy()
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 3 or active.sum() < 20:
+        raise ValueError("insufficient_torso_correspondences")
+
+    R = np.eye(3, dtype=np.float64)
+    scale = 1.0
+    src_center = src[active].mean(axis=0)
+    dst_center = dst[active].mean(axis=0)
+    for _ in range(3):
+        x = src[active]
+        y = dst[active]
+        src_center = x.mean(axis=0)
+        dst_center = y.mean(axis=0)
+        xc = x - src_center
+        yc = y - dst_center
+
+        # Solve the best 2-D rotation in the horizontal X/Z plane.  This is
+        # the only remaining rigid degree of freedom after upright alignment.
+        H = xc[:, [0, 2]].T @ yc[:, [0, 2]]
+        U, singular, Vt = np.linalg.svd(H)
+        R2 = Vt.T @ U.T
+        if np.linalg.det(R2) < 0:
+            Vt[-1] *= -1
+            R2 = Vt.T @ U.T
+        R = np.array(
+            [[R2[0, 0], 0.0, R2[0, 1]], [0.0, 1.0, 0.0], [R2[1, 0], 0.0, R2[1, 1]]],
+            dtype=np.float64,
+        )
+        rotated = xc @ R.T
+        denom = float(np.sum(xc * xc))
+        scale = float(np.sum(rotated * yc) / denom) if denom > 1e-10 else 1.0
+        aligned = scale * ((src - src_center) @ R.T) + dst_center
+        residual = np.linalg.norm(aligned - dst, axis=1)
+        candidates = np.flatnonzero(mask)
+        keep_count = max(20, int(round(len(candidates) * (1.0 - trim_fraction))))
+        kept = candidates[np.argsort(residual[candidates])[:keep_count]]
+        active[:] = False
+        active[kept] = True
+
+    aligned = scale * ((src - src_center) @ R.T) + dst_center
+    return aligned.astype(np.float32), {
+        "scale": scale,
+        "rotation": R,
+        "source_center": src_center,
+        "target_center": dst_center,
+        "inlier_count": int(active.sum()),
+        "inlier_mask": active,
+        "rotation_constraint": "yaw_only_preserve_upright",
+    }
+
+
 def alignment_report(front: np.ndarray, aligned_side: np.ndarray, torso_mask: np.ndarray, height: float, transform: dict[str, Any], thresholds: QualityThresholds = DEFAULT_THRESHOLDS) -> dict[str, Any]:
     residual = np.linalg.norm(np.asarray(front) - np.asarray(aligned_side), axis=1)
     h = max(float(height), 1e-6)
     torso = residual[np.asarray(torso_mask, dtype=bool)]
     report = {
         "scale": float(transform["scale"]),
+        "rotation_constraint": str(transform.get("rotation_constraint", "unconstrained_3d")),
         "torso_mean_m": float(np.mean(torso)) if torso.size else float("inf"),
         "torso_p95_m": float(np.percentile(torso, 95)) if torso.size else float("inf"),
         "full_p95_m": float(np.percentile(residual, 95)),
