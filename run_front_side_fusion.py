@@ -403,6 +403,9 @@ SIDE_SDF_ROW_UNDERFIT_PEAK_PRESERVE = True
 SIDE_SDF_SOLVE_EDGE_DATA_FLOOR = 0.20
 SIDE_SDF_SOLVE_EDGE_DATA_POWER = 2.0
 SIDE_SDF_CHEST_FEATHER_PCT = float(os.environ.get("FUSION_SIDE_SDF_CHEST_FEATHER_PCT", "0.010"))
+# Keep the lower chest-SDF boundary safely above the measured hip. The fade is
+# internal to the band, so this entire clearance remains SDF-free.
+SIDE_SDF_CHEST_ABOVE_HIP_PCT = float(os.environ.get("FUSION_SIDE_SDF_CHEST_ABOVE_HIP_PCT", "0.050"))
 # A side-only anchor can occasionally lack a recoverable perineum. This is
 # the observed regular-fit hem height for that fallback, not a substitute for
 # the CLAD surface-trace result when it is available.
@@ -479,7 +482,7 @@ def _range_band_with_feather(height_pct, low, high, feather_width, falloff_power
 
 
 def chest_band_bounds_from_anchors(anchor_pcts):
-    """Return the chest/abdomen SDF interval: T-shirt hem through shoulder."""
+    """Return the chest/abdomen SDF interval: above-hip boundary through shoulder."""
     lower = required_anchor_pct(anchor_pcts, "chest_lower")
     upper = required_anchor_pct(anchor_pcts, "chest_upper")
     if upper < lower:
@@ -490,11 +493,11 @@ def chest_band_bounds_from_anchors(anchor_pcts):
 
 
 def chest_band_weight_from_anchors(height_pct, anchor_pcts):
-    """Chest/abdomen SDF weight confined to the CLAD regular-shirt interval.
+    """Chest/abdomen SDF weight confined to the above-hip-to-shoulder interval.
 
-    The edge fade is inside the interval, never outside it: the mask reaches
-    the regular T-shirt hem to capture a prominent abdomen, but cannot edit
-    below that garment boundary or into the shoulder/arm area.
+    The lower edge fade is inside the interval, never below it. Therefore the
+    hip and its configured above-hip clearance remain outside the chest SDF
+    correction.
     """
     low, high = chest_band_bounds_from_anchors(anchor_pcts)
     values = np.asarray(height_pct, dtype=np.float64)
@@ -874,7 +877,7 @@ def save_side_anchor_debug_mask(
     butt_center = required_anchor_pct(anchor_pcts, "butt")
     chest_low, chest_high = chest_band_bounds_from_anchors(anchor_pcts)
     butt_low, butt_high = butt_band_bounds_from_anchors(anchor_pcts)
-    draw_anchor_range("chest + abdomen (shirt hem to shoulder)", chest_low, chest_high, (0, 80, 255), -8)
+    draw_anchor_range("chest + abdomen (above hip to shoulder)", chest_low, chest_high, (0, 80, 255), -8)
     draw_anchor_range("butt (above thigh)", butt_low, butt_high, (255, 80, 0), 20)
     draw_anchor("bust", chest_center, 0.0, (0, 180, 255), 18)
     draw_anchor("hip", butt_center, 0.0, (255, 80, 0), 42)
@@ -2226,7 +2229,7 @@ def deform_side_mesh_to_mask_profile(
         "butt_anterior_edit_vertex_count": np.array(int(np.count_nonzero((np.abs(dx_butt) > 1e-7) & ~butt_edit_gate)), dtype=np.int64),
         "chest_feather_width_pct": np.array(float(SIDE_SDF_CHEST_FEATHER_PCT * 100.0), dtype=np.float64),
         "butt_above_thigh_clearance_pct": np.array(float(SIDE_SDF_BUTT_ABOVE_THIGH_PCT * 100.0), dtype=np.float64),
-        "chest_band_source": np.array("clad_regular_tshirt_hem_to_shoulder_line", dtype=object),
+        "chest_band_source": np.array("clad_measured_hip_plus_clearance_to_shoulder_line", dtype=object),
         "butt_band_source": np.array("clad_hip_band_capped_above_thigh_measurement", dtype=object),
         "profile_fit_matches_anchor_debug_band": np.array(True, dtype=bool),
         "solve_reason": np.array(solve_reason, dtype=object),
@@ -2584,6 +2587,7 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         "shoulder_line_pct": np.array(0.0, dtype=np.float64),
         "chest_full_low_pct": np.array(0.0, dtype=np.float64),
         "chest_full_high_pct": np.array(0.0, dtype=np.float64),
+        "chest_above_hip_clearance_pct": np.array(float(SIDE_SDF_CHEST_ABOVE_HIP_PCT * 100.0), dtype=np.float64),
         "thigh_pct": np.array(0.0, dtype=np.float64),
         "butt_full_low_pct": np.array(0.0, dtype=np.float64),
         "butt_full_high_pct": np.array(0.0, dtype=np.float64),
@@ -2655,12 +2659,8 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
 
         anchors = {}
         if shirt_hem_pct is not None and 0.0 < float(shirt_hem_pct) < 1.0:
-            anchors["chest_lower"] = float(shirt_hem_pct)
             meta["shirt_end_pct"] = np.array(float(shirt_hem_pct) * 100.0, dtype=np.float64)
             meta["shirt_end_source"] = np.array(str(shirt_hem_source), dtype=object)
-            meta["lower_chest_pct"] = np.array(float(shirt_hem_pct) * 100.0, dtype=np.float64)
-            meta["lower_chest_source"] = np.array(str(shirt_hem_source), dtype=object)
-            meta["chest_full_low_pct"] = np.array(float(shirt_hem_pct) * 100.0, dtype=np.float64)
         try:
             bust_pct = float(measurements.get("_bust_pct", 0.0))
             if 0.0 < bust_pct < 100.0:
@@ -2680,17 +2680,17 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
         except Exception:
             pass
 
-        # Reuse CLAD's regular-fit T-shirt hem: 90% of the HPS-to-crotch
-        # surface trace. The SDF can then correct the complete garment-covered
-        # front torso, including a large abdomen, rather than stopping at the
-        # lowest-rib bust-search boundary.
+        # Retain CLAD's regular-fit T-shirt hem for diagnostics, and use its
+        # shoulder line for the upper chest boundary. The lower boundary is
+        # replaced with the measured hip plane below, so the chest SDF's fade
+        # completes before it can affect the hip measurement.
         try:
             bust_details = measurements.get("_bust_full_torso_component") or {}
             bust_low_pct = float(bust_details.get("search_low_pct", 0.0))
             shoulder_line_pct = float(bust_details.get("search_high_pct", 0.0))
             shirt_points = np.asarray(measurements.get("_regular_tshirt_length_pts"), dtype=np.float64)
             shirt_end_pct = float(shirt_points[-1, 2] / target_height_m * 100.0) if shirt_points.ndim == 2 and shirt_points.shape[1] >= 3 and len(shirt_points) else 0.0
-            if "chest_lower" not in anchors and 0.0 < shirt_end_pct < shoulder_line_pct < 100.0:
+            if 0.0 < shirt_end_pct < shoulder_line_pct < 100.0:
                 anchors["chest_lower"] = shirt_end_pct / 100.0
                 anchors["chest_upper"] = shoulder_line_pct / 100.0
                 meta["shirt_end_pct"] = np.array(shirt_end_pct, dtype=np.float64)
@@ -2758,10 +2758,10 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
                 meta["shoulder_line_source"] = np.array("bust_plus_12pct_height_fallback", dtype=object)
 
         if "chest_lower" not in anchors:
-            # The normal source above is the exact CLAD surface trace. Keep
-            # the side-only profile correction available when that trace
-            # cannot find a perineum, using the regular-fit hem level rather
-            # than reverting to the old rib/hip-limited mask.
+            # This is temporary: the measured hip anchor below becomes the
+            # actual lower SDF boundary. Keep a valid provisional value so
+            # older inputs without the CLAD surface trace can still recover
+            # their shoulder line through the normal fallback path.
             shirt_end_pct = float(SIDE_SDF_SHIRT_HEM_FALLBACK_PCT * 100.0)
             anchors["chest_lower"] = float(SIDE_SDF_SHIRT_HEM_FALLBACK_PCT)
             meta["shirt_end_pct"] = np.array(shirt_end_pct, dtype=np.float64)
@@ -2769,6 +2769,22 @@ def measure_untouched_side_anchor_pcts(side_result, side_vertices, faces, target
             meta["lower_chest_pct"] = np.array(shirt_end_pct, dtype=np.float64)
             meta["lower_chest_source"] = np.array("regular_fit_shirt_hem_height_fallback", dtype=object)
             meta["chest_full_low_pct"] = np.array(shirt_end_pct, dtype=np.float64)
+
+        # Keep the whole lower chest-SDF edge above the hip. Its feather is
+        # applied *inside* this interval, so neither the clearance nor the
+        # hip plane receives chest-SDF displacement.
+        hip_boundary_pct = required_anchor_pct(anchors, "butt")
+        chest_lower_pct = hip_boundary_pct + float(SIDE_SDF_CHEST_ABOVE_HIP_PCT)
+        chest_upper_pct = required_anchor_pct(anchors, "chest_upper")
+        if chest_lower_pct >= chest_upper_pct:
+            raise ValueError(
+                "chest_above_hip_clearance_reaches_shoulder: "
+                f"lower={chest_lower_pct}, upper={chest_upper_pct}"
+            )
+        anchors["chest_lower"] = chest_lower_pct
+        meta["lower_chest_pct"] = np.array(chest_lower_pct * 100.0, dtype=np.float64)
+        meta["lower_chest_source"] = np.array("clad_measured_hip_plus_sdf_clearance", dtype=object)
+        meta["chest_full_low_pct"] = np.array(chest_lower_pct * 100.0, dtype=np.float64)
 
         try:
             thigh_pct = float(measurements.get("_thigh_pct", 0.0))
@@ -3148,6 +3164,7 @@ def main():
     print(f"  bust anchor  : {float(np.asarray(side_anchor_meta.get('bust_anchor_pct', 0.0)).item()):.4f} (SDF)")
     print(f"  hip anchor   : {float(np.asarray(side_anchor_meta.get('hip_anchor_pct', 0.0)).item()):.4f} (SDF)")
     print(f"  shirt hem    : {float(np.asarray(side_anchor_meta.get('shirt_end_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('shirt_end_source', 'unknown')).item()})")
+    print(f"  chest low    : {float(np.asarray(side_anchor_meta.get('chest_full_low_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('lower_chest_source', 'unknown')).item()})")
     print(f"  shoulder line: {float(np.asarray(side_anchor_meta.get('shoulder_line_pct', 0.0)).item()):.4f} ({np.asarray(side_anchor_meta.get('shoulder_line_source', 'unknown')).item()})")
     print(f"  thigh pct    : {float(np.asarray(side_anchor_meta.get('thigh_pct', 0.0)).item()):.4f} (CLAD)")
     print(f"  butt range   : {float(np.asarray(side_anchor_meta.get('butt_full_low_pct', 0.0)).item()):.4f}-{float(np.asarray(side_anchor_meta.get('butt_full_high_pct', 0.0)).item()):.4f} (above thigh)")
